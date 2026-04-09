@@ -1,0 +1,472 @@
+/// 简介
+
+结构型模式解决了"如何组装"，本节进入**行为型模式（Behavioral Patterns）**——关注对象之间的**通信与职责分配**。在游戏引擎中，事件系统驱动几乎所有交互（Observer），输入映射依赖命令封装（Command），角色 AI 通过状态机管理（State），伤害计算策略可热替换（Strategy），渲染管线的骨架固定但步骤可定制（Template Method）。本节以游戏系统为主线，覆盖八种常用行为型模式。
+
+/// 知识点列表
+
+\list{
+- 观察者（Observer）— 事件系统的基石
+- 策略（Strategy）— 可插拔的算法
+- 命令（Command）— 操作对象化，支持撤销/重做
+- 状态（State）— 有限状态机
+- 模板方法（Template Method）— 算法骨架 + 可替换步骤
+- 迭代器（Iterator）— 统一遍历接口
+- 访问者（Visitor）— 对类型层次添加新操作
+- 责任链（Chain of Responsibility）— 请求逐级传递
+}
+
+/// 知识点详解
+
+// 观察者 / 事件系统
+
+当一个对象状态变化需要通知多个其他对象时，硬编码调用会产生紧耦合。**观察者模式（Observer）** 定义一对多依赖，被观察者维护一个监听者列表，状态变更时遍历通知。现代 C++ 通常用 `std::function` + 事件总线（Event Bus）替代经典的 `Observer` 接口继承。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <vector>
+#include <string>
+#include <unordered_map>
+
+class EventBus {
+    using Callback = std::function<void(const std::string&)>;
+    std::unordered_map<std::string, std::vector<Callback>> listeners_;
+public:
+    size_t on(const std::string& event, Callback cb) {
+        auto& vec = listeners_[event];
+        vec.push_back(std::move(cb));
+        return vec.size() - 1;  // 返回 ID 用于取消订阅
+    }
+
+    void emit(const std::string& event, const std::string& data = "") {
+        auto it = listeners_.find(event);
+        if (it == listeners_.end()) return;
+        for (auto& cb : it->second) cb(data);
+    }
+};
+
+int main() {
+    EventBus bus;
+
+    bus.on("damage", [](const std::string& d) {
+        std::cout << "UI: show damage number " << d << "\n";
+    });
+    bus.on("damage", [](const std::string& d) {
+        std::cout << "Sound: play hit effect\n";
+    });
+    bus.on("death", [](const std::string& d) {
+        std::cout << "Spawner: schedule respawn for " << d << "\n";
+    });
+
+    bus.emit("damage", "42");
+    bus.emit("death", "Goblin");
+}
+}
+
+\danger{**观察者的生命周期陷阱：** 如果监听者被销毁但未取消订阅，事件触发时调用已析构对象的回调→**未定义行为（UB）**。解决方案：1）RAII 自动取消订阅（析构时移除回调）；2）用 `weak_ptr` 持有观察者；3）订阅返回 guard 对象。}
+
+// 策略
+
+**策略（Strategy）** 将算法封装到独立对象中，使其可在运行时替换。与直接用 `if-else` 分支选择算法不同，策略模式让新算法的增加不需要修改调用方代码。
+
+\tabs{
+\tab[运行时策略（std::function）]{
+\code[cpp]{
+class PathFinder {
+    using Algorithm = std::function<void(int, int)>;
+    Algorithm algo_;
+public:
+    void setAlgorithm(Algorithm a) { algo_ = std::move(a); }
+    void find(int from, int to) { algo_(from, to); }
+};
+// 运行时可切换，有 std::function 间接调用开销
+}
+}
+\tab[编译期策略（模板）]{
+\code[cpp]{
+template<typename Algo>
+class StaticPathFinder {
+    Algo algo_;
+public:
+    explicit StaticPathFinder(Algo a) : algo_(std::move(a)) {}
+    void find(int from, int to) { algo_(from, to); }
+};
+// 零虚函数开销，但策略在编译期确定
+}
+}
+}
+
+\tip{**何时选哪种？** 如果策略需要在运行时切换（如 AI 根据血量切换攻击/防守策略），用 `std::function`。如果策略在编译期确定且性能敏感（如排序比较器），用模板参数。}
+
+// 命令
+
+**命令模式（Command）** 将操作封装为对象——不仅可以执行，还可以存储、排队、撤销。游戏中的输入系统、回放系统和撤销/重做都依赖命令模式。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <memory>
+#include <string>
+
+struct Position { int x, y; };
+
+class ICommand {
+public:
+    virtual void execute() = 0;
+    virtual void undo() = 0;
+    virtual std::string desc() const = 0;
+    virtual ~ICommand() = default;
+};
+
+class MoveCommand : public ICommand {
+    Position& pos_;
+    int dx_, dy_;
+    int prevX_, prevY_;
+public:
+    MoveCommand(Position& p, int dx, int dy) : pos_(p), dx_(dx), dy_(dy) {}
+    void execute() override {
+        prevX_ = pos_.x; prevY_ = pos_.y;  // 保存旧状态
+        pos_.x += dx_; pos_.y += dy_;
+    }
+    void undo() override { pos_.x = prevX_; pos_.y = prevY_; }
+    std::string desc() const override {
+        return "Move(" + std::to_string(dx_) + "," + std::to_string(dy_) + ")";
+    }
+};
+
+class CommandHistory {
+    std::vector<std::unique_ptr<ICommand>> history_;
+    int current_ = -1;
+public:
+    void execute(std::unique_ptr<ICommand> cmd) {
+        history_.resize(current_ + 1);  // 丢弃 redo 栈
+        cmd->execute();
+        history_.push_back(std::move(cmd));
+        ++current_;
+    }
+    void undo() {
+        if (current_ >= 0) { history_[current_]->undo(); --current_; }
+    }
+    void redo() {
+        if (current_ + 1 < (int)history_.size()) {
+            ++current_; history_[current_]->execute();
+        }
+    }
+    void replay() const {
+        for (int i = 0; i <= current_; ++i)
+            std::cout << "  " << (i+1) << ". " << history_[i]->desc() << "\n";
+    }
+};
+
+int main() {
+    Position player{0, 0};
+    CommandHistory history;
+
+    history.execute(std::make_unique<MoveCommand>(player, 1, 0));
+    history.execute(std::make_unique<MoveCommand>(player, 0, 2));
+    history.execute(std::make_unique<MoveCommand>(player, -1, 1));
+
+    std::cout << "Position: (" << player.x << "," << player.y << ")\n";
+    std::cout << "Replay:\n"; history.replay();
+
+    history.undo();
+    std::cout << "After undo: (" << player.x << "," << player.y << ")\n";
+
+    history.redo();
+    std::cout << "After redo: (" << player.x << "," << player.y << ")\n";
+}
+}
+
+// 状态
+
+角色的行为取决于当前状态：Idle 时可以移动或跳跃，Jump 时只能下落，Attack 时不能移动。用 `if-else` 管理这些条件会变成难以维护的意面代码。**状态模式（State）** 将每个状态封装为独立类，状态转换逻辑内聚到各状态内部。
+
+\code[cpp]{
+class Player;  // 前向声明
+
+class IState {
+public:
+    virtual void enter(Player& p) = 0;
+    virtual void update(Player& p, float dt) = 0;
+    virtual void handleInput(Player& p, char input) = 0;
+    virtual void exit(Player& p) = 0;
+    virtual ~IState() = default;
+};
+
+class Player {
+    std::unique_ptr<IState> state_;
+    std::string name_;
+public:
+    explicit Player(std::string n) : name_(std::move(n)) {}
+
+    void changeState(std::unique_ptr<IState> newState) {
+        if (state_) state_->exit(*this);
+        state_ = std::move(newState);
+        state_->enter(*this);
+    }
+
+    void update(float dt) { if (state_) state_->update(*this, dt); }
+    void handleInput(char c) { if (state_) state_->handleInput(*this, c); }
+    const std::string& name() const { return name_; }
+};
+}
+
+\warning{**状态切换时序问题：** 在 `update()` 中触发 `changeState()` 后，旧状态已被 `std::move` 走——不能再访问旧状态的成员。安全做法是让状态转换函数返回"下一个状态"，在外部完成切换。}
+
+\diagram[flow]{
+Idle --[移动键]--> Running --[松开键]--> Idle
+Idle --[跳跃键]--> Jumping --[落地]--> Idle
+Running --[跳跃键]--> Jumping
+Jumping --[攻击键]--> AirAttack --[动画结束]--> Jumping
+}
+
+// 模板方法
+
+**模板方法（Template Method）** 在基类中定义算法骨架，将可变步骤延迟到子类实现。与策略模式用组合不同，模板方法用**继承**实现定制。游戏中的渲染管线（初始化→阴影 Pass→主 Pass→后处理→呈现）是典型应用。
+
+\code[cpp]{
+class RenderPipeline {
+public:
+    // 模板方法——骨架固定
+    void render() {
+        beginFrame();
+        shadowPass();    // 子类可定制
+        mainPass();      // 子类可定制
+        postProcess();   // 子类可定制
+        endFrame();
+    }
+    virtual ~RenderPipeline() = default;
+protected:
+    virtual void beginFrame() { /* 通用初始化 */ }
+    virtual void shadowPass() = 0;     // 必须实现
+    virtual void mainPass() = 0;       // 必须实现
+    virtual void postProcess() {}      // 可选覆写
+    virtual void endFrame() { /* 通用收尾 */ }
+};
+
+class ForwardRenderer : public RenderPipeline {
+protected:
+    void shadowPass() override { /* 前向渲染阴影 */ }
+    void mainPass() override { /* 逐光源逐物体渲染 */ }
+};
+
+class DeferredRenderer : public RenderPipeline {
+protected:
+    void shadowPass() override { /* 延迟渲染阴影 */ }
+    void mainPass() override { /* G-Buffer→光照 Pass */ }
+    void postProcess() override { /* SSAO + Bloom */ }
+};
+}
+
+\note{**Template Method vs Strategy：** Template Method 靠**继承**，子类重写步骤；Strategy 靠**组合**，注入不同策略对象。前者骨架固定、步骤可定制；后者策略可在运行时自由切换。在 C++ 中，NVI（Non-Virtual Interface）是 Template Method 的现代变体——见现代 C++ 模式章节。}
+
+// 迭代器
+
+STL 的迭代器是最常用的行为模式。在游戏中，自定义容器（如空间分区网格、ECS 的组件数组）需要提供迭代器接口以兼容范围 for 和 STL 算法。
+
+\code[cpp]{
+// 简化示例：为固定大小的环形缓冲区提供迭代器
+template<typename T, size_t N>
+class RingBuffer {
+    T data_[N]{};
+    size_t head_ = 0, size_ = 0;
+public:
+    void push(T val) {
+        data_[(head_ + size_) % N] = std::move(val);
+        if (size_ < N) ++size_; else head_ = (head_ + 1) % N;
+    }
+
+    struct Iterator {
+        const RingBuffer* buf; size_t idx;
+        const T& operator*() const { return buf->data_[(buf->head_ + idx) % N]; }
+        Iterator& operator++() { ++idx; return *this; }
+        bool operator!=(const Iterator& o) const { return idx != o.idx; }
+    };
+
+    Iterator begin() const { return {this, 0}; }
+    Iterator end() const { return {this, size_}; }
+};
+// 现在可以：for (auto& x : ringBuffer) { ... }
+}
+
+// 访问者
+
+在不修改类层次的前提下添加新操作。经典 Visitor 用双重分派（double dispatch），现代 C++ 用 **`std::variant` + `std::visit`** 替代——类型集合在编译期确定时，后者更简洁且零虚函数开销。
+
+\run[cpp]{
+#include <iostream>
+#include <variant>
+#include <vector>
+#include <string>
+
+struct Circle    { float radius; };
+struct Rectangle { float w, h; };
+struct Triangle  { float base, height; };
+
+using Shape = std::variant<Circle, Rectangle, Triangle>;
+
+// overloaded 辅助（C++17）
+template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
+double area(const Shape& s) {
+    return std::visit(overloaded{
+        [](const Circle& c)    { return 3.14159 * c.radius * c.radius; },
+        [](const Rectangle& r) { return r.w * r.h; },
+        [](const Triangle& t)  { return 0.5 * t.base * t.height; },
+    }, s);
+}
+
+std::string describe(const Shape& s) {
+    return std::visit(overloaded{
+        [](const Circle& c)    { return "Circle(r=" + std::to_string(c.radius) + ")"; },
+        [](const Rectangle& r) { return "Rect(" + std::to_string(r.w) + "x" + std::to_string(r.h) + ")"; },
+        [](const Triangle& t)  { return "Tri(b=" + std::to_string(t.base) + ")"; },
+    }, s);
+}
+
+int main() {
+    std::vector<Shape> shapes = { Circle{5}, Rectangle{3,4}, Triangle{6,8} };
+    for (auto& s : shapes) {
+        std::cout << describe(s) << " area=" << area(s) << "\n";
+    }
+    // 新增 describe() 操作不需要修改 Shape 类型定义
+}
+}
+
+\tip{**variant + visit vs 经典 Visitor：** 当类型集合在编译期已知且不常变化时，`variant` 更优（值语义、连续内存、无虚函数开销）。当类型层次需要运行时扩展（如插件系统新增类型）时，经典 Visitor 接口仍有价值。}
+
+// 责任链
+
+**责任链（Chain of Responsibility）** 将请求沿链条传递，每个处理器决定自行处理或传递给下一个。游戏中的输入处理（全局快捷键→UI 层→游戏逻辑层→默认处理）就是典型责任链。
+
+\code[cpp]{
+class InputHandler {
+    std::unique_ptr<InputHandler> next_;
+public:
+    void setNext(std::unique_ptr<InputHandler> n) { next_ = std::move(n); }
+    virtual bool handle(char key) {
+        if (next_) return next_->handle(key);  // 传递给下一个
+        return false;  // 链末尾，未处理
+    }
+    virtual ~InputHandler() = default;
+};
+
+class UIHandler : public InputHandler {
+public:
+    bool handle(char key) override {
+        if (key == 'e') { /* 打开/关闭背包 */ return true; }
+        return InputHandler::handle(key);  // 不处理，传下去
+    }
+};
+
+class GameplayHandler : public InputHandler {
+public:
+    bool handle(char key) override {
+        if (key == 'w') { /* 角色移动 */ return true; }
+        return InputHandler::handle(key);
+    }
+};
+// 链条：UI → Gameplay → Debug → 默认丢弃
+}
+
+/// 新版特性（C++17/20/23）
+
+\list{
+- C++17 `std::variant` + `std::visit` — 替代经典 Visitor 的双重分派
+- C++17 `std::function` 性能改善 — 小对象优化使策略模式的 `std::function` 更实用
+- C++20 Concepts — 约束策略类型、命令接口（编译期检查而非运行时失败）
+- C++20 `std::format` — 命令的 `desc()` 可用格式化字符串
+- C++23 `std::expected` — 命令执行返回成功/失败而非抛异常
+}
+
+/// 工程实践
+
+\list{
+- Observer 订阅返回的 guard 对象（RAII 取消订阅）是防止悬空回调的最佳方案
+- Command 的 `undo()` 需要在 `execute()` 前保存足够的旧状态——开销可能大于预期
+- State 转换图应在设计阶段画出并固化——运行时新增状态转换是 bug 的温床
+- Strategy 如果只有一个方法，直接用 `std::function`；多方法组合时用接口类
+- 责任链的链长度应有限——无限传递会导致调试困难
+}
+
+/// 难点易错点分析
+
+\danger{**Command 的 undo 状态膨胀：** 如果命令修改了大量数据（如"全选并移动 1000 个对象"），每个命令保存完整旧状态会消耗大量内存。解决方案：差异快照（Memento 模式）或只记录操作参数+逆操作。}
+
+\danger{**Observer 的通知风暴：** 一个事件触发另一个事件，形成链式通知——极端情况下可能无限递归。解决方案：延迟事件队列（下一帧批量处理）或递归深度限制。}
+
+\quiz[choice]{
+Q: 在游戏输入系统中，以下哪种模式最适合实现"按键先由 UI 处理，未消费则传递给游戏逻辑层"？
+A: Observer
+B: Strategy
+C: Chain of Responsibility
+D: State
+ANS: C
+EXP: 责任链让请求沿链条逐级传递，每个节点可以选择处理或传递。这正是分层输入处理的需求。Observer 用于一对多通知，Strategy 用于算法替换，State 管理对象自身状态。
+}
+
+\quiz[choice]{
+Q: 以下关于现代 C++ 中 `std::variant + visit` 替代 Visitor 模式的说法，哪项是**错误的**？
+A: variant 版本具有值语义，可以放在 vector 中连续存储
+B: variant 版本无虚函数开销，编译器可优化为跳转表
+C: variant 版本可以在运行时通过插件动态添加新类型
+D: variant 版本在编译期就能检查是否覆盖了所有类型
+ANS: C
+EXP: `std::variant` 的类型列表在编译期固定，无法运行时扩展。需要运行时添加新类型时，仍需经典 Visitor 的虚函数接口。
+}
+
+/// 实战作业
+
+// 🟢 基础：事件系统
+
+实现简单的 `EventBus`，支持 `on(event, callback)` 和 `emit(event, data)`。完成下面代码中的 TODO。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <vector>
+#include <string>
+#include <unordered_map>
+
+class EventBus {
+    using Callback = std::function<void(const std::string&)>;
+    std::unordered_map<std::string, std::vector<Callback>> listeners_;
+public:
+    /* TODO: 实现 on(event, callback) —— 将 callback 添加到 event 的监听列表 */
+
+    /* TODO: 实现 emit(event, data) —— 遍历 event 的所有 callback 并调用 */
+};
+
+int main() {
+    EventBus bus;
+    bus.on("hit", [](const std::string& d) { std::cout << "Damage: " << d << "\n"; });
+    bus.on("hit", [](const std::string& d) { std::cout << "Sound: impact\n"; });
+    bus.on("heal", [](const std::string& d) { std::cout << "Heal: " << d << "\n"; });
+
+    bus.emit("hit", "25");
+    bus.emit("heal", "10");
+    bus.emit("miss", "");  // 无监听者，不输出
+}
+}
+
+// 🟡 进阶：命令系统 + 回放
+
+扩展上方的 `CommandHistory`，增加 `serialize()` 方法将整个命令历史导出为字符串（如 `"Move(1,0);Move(0,2);Move(-1,1)"`），并实现 `deserialize()` 从字符串重建命令序列用于回放。
+
+// 🟡 进阶：FSM 框架
+
+实现通用的有限状态机框架 `StateMachine<Context>`——模板化状态机，状态通过 `addState` / `addTransition` 注册，`trigger(event)` 触发转换，`update(dt)` 更新当前状态。
+
+// 🔴 挑战：类型安全事件总线
+
+使用 C++ 模板实现类型安全的事件总线：每种事件类型（struct）对应独立的回调列表，`emit<DamageEvent>(event)` 只通知订阅了 `DamageEvent` 的监听者。提示：用 `std::type_index` 或 `std::tuple` 索引。
+
+\collapse[🔴 参考思路]{
+方案一：用 `std::unordered_map<std::type_index, std::any>` 存储每种事件的 `vector<function<void(const Event&)>>`。
+方案二：模板参数列表 `EventBus<DamageEvent, DeathEvent, ...>` + `std::tuple` 索引——编译期确定全部事件类型，零运行时开销。emit 时用 `std::get<vector<function<void(const E&)>>>` 获取对应列表。
+}
+
+// 🔴 挑战：AI 行为框架
+
+综合 State + Strategy + Observer，实现一个 AI 行为框架：AI 角色有状态机（Patrol/Chase/Attack/Flee），每个状态内部的决策逻辑用策略模式（如 Chase 状态的寻路策略可切换 A*/Greedy），状态切换时通过事件总线通知 UI 更新。

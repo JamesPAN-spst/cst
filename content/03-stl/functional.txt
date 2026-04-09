@@ -1,0 +1,474 @@
+/// 简介
+
+上一节我们用 STL 算法处理数据时，反复给 `std::sort`、`std::count_if` 传入 lambda 和 `std::greater{}`——它们统称为**可调用对象（Callable）**。这一节系统讲清楚 C++ 的各种 callable 类型，以及标准库 `<functional>` 提供的包装、组合、传递工具。
+
+为什么重要？游戏开发中**回调（Callback）**无处不在——输入事件触发回调、碰撞触发回调、UI 点击触发回调。你需要一种灵活机制来"把一段逻辑储存起来，以后再调用"。函数指针太原始，模板不能存进容器——`std::function` 加 lambda 是目前最实用的组合。
+
+/// 知识点列表
+
+\list{
+- 函数指针回顾 — C 风格回调的局限性
+- 函数对象/仿函数（Functor） — 重载 operator() 的类
+- Lambda 表达式完整语法 — 捕获列表、mutable、泛型、模板参数
+- std::function — 通用可调用包装器（类型擦除）
+- std::bind 与 std::placeholders — 参数绑定及其被 lambda 替代
+- std::invoke / std::apply — 统一调用接口
+- std::ref / std::cref — 引用包装器
+- 回调模式在游戏中的应用 — 事件系统、命令队列
+}
+
+/// 知识点详解
+
+// 函数指针回顾
+
+**动机：** 在 C 和早期 C++ 中，把"一段逻辑"传给另一个函数的唯一方式是**函数指针（Function Pointer）**。声明语法：`返回类型 (*指针名)(参数列表)`。它只能指向普通函数或静态成员函数，无法携带额外状态。
+
+\code[cpp]{
+using MathFunc = double(*)(double, double);  // 类型别名简化声明
+double add(double a, double b) { return a + b; }
+double mul(double a, double b) { return a * b; }
+
+MathFunc op = add;
+op(3, 4);   // 7
+op = mul;
+op(3, 4);   // 12
+}
+
+函数指针三大痛点：**无法携带状态**（想按外部阈值过滤？签名固定没法传额外参数）、**语法晦涩**（`void (*signal(int,void(*)(int)))(int)` 谁看得懂？）、**无法内联**（编译器不知道指针指向谁，无法优化）。
+
+\tip{现代 C++ 中函数指针几乎只在和 C API 交互时才需要。其他场景请用 lambda 或 `std::function`。}
+
+// 函数对象 / 仿函数（Functor）
+
+**动机：** 函数指针不能携带状态——那用一个**类**包装逻辑，把状态存为成员变量，再重载 `operator()` 让它"像函数调用"呢？这就是**函数对象（Function Object）**，又叫**仿函数（Functor）**。
+
+\code[cpp]{
+struct ThresholdFilter {
+    int threshold;  // 携带状态！
+    bool operator()(int value) const { return value > threshold; }
+};
+// 用法：std::count_if(v.begin(), v.end(), ThresholdFilter{70});
+}
+
+仿函数比函数指针好在：**能携带状态**，且编译器能看到 `operator()` 定义，可以**内联优化**。STL 自带常用仿函数（在 `<functional>` 中）：
+
+\table{
+仿函数 | 等价操作 | 典型用途
+---
+`std::plus<>` | `a + b` | `accumulate` 累加
+`std::greater<>` | `a > b` | `sort` 降序排列
+`std::less<>` | `a < b` | `sort` 升序（默认）
+`std::multiplies<>` | `a * b` | `accumulate` 累乘
+}
+
+\note{`std::greater<>` 中的空 `<>` 是 C++14 引入的**透明比较器（Transparent Comparator）**，让编译器自动推导类型。C++11 需要写 `std::greater<int>`。}
+
+但仿函数也有问题——每个简单逻辑都要定义一个 struct，太啰嗦。于是 C++11 带来了 lambda。
+
+// Lambda 表达式完整语法
+
+**动机：** 写一个"大于 70"过滤器就要定义整个 struct？C++11 的 **Lambda 表达式**让你**就地定义**匿名函数对象——本质就是编译器帮你生成的仿函数。
+
+完整语法：`[捕获列表](参数列表) mutable noexcept -> 返回类型 { 函数体 }`
+
+
+**捕获列表（Capture List）**决定 lambda 能"看到"外面的什么：
+
+\code[cpp]{
+int x = 10, y = 20;
+auto f1 = [x]()     { return x; };       // 值捕获（拷贝）
+auto f2 = [&x]()    { x += 1; };         // 引用捕获
+auto f3 = [=]()      { return x + y; };   // 值捕获所有用到的变量
+auto f4 = [&]()      { x += y; };         // 引用捕获所有
+auto f5 = [=, &x]()  { x += y; };        // 默认值捕获，x 用引用
+}
+
+\danger{**引用捕获的生命周期陷阱：** lambda 比被捕获变量活得更久时，引用悬空。返回 lambda、存入容器、异步回调时尤其危险：}
+
+\code[cpp]{
+// ❌ 返回的 lambda 引用了已销毁的局部变量
+auto makeCounter_BAD() {
+    int count = 0;
+    return [&count]() { return ++count; };  // count 已销毁！
+}
+// ✅ 值捕获 + mutable
+auto makeCounter_OK() {
+    int count = 0;
+    return [count]() mutable { return ++count; };
+}
+}
+
+\collapse[C++14/20/23 Lambda 新特性]{
+**C++14 初始化捕获：** 捕获列表中创建新变量，最重要用途是**移动捕获**：`[p = std::move(ptr)]() { return *p; }`
+
+**C++14 泛型 Lambda：** 参数用 `auto`：`[](const auto& val) { std::cout << val; }`
+
+**C++20 模板 Lambda：** 显式模板参数 + `requires` 约束：`[]<typename T>(T x) requires std::integral<T> { return x*2; }`
+
+**C++23 Deducing This：** 递归 lambda 不再需 `std::function`：`[](this auto self, int n) -> int { return n<=1 ? 1 : n*self(n-1); }`
+}
+
+// std::function — 通用可调用包装器
+
+**动机：** 每个 lambda 都有**独一无二的类型**。要把不同 lambda 存进同一个容器或做类成员，需要**类型擦除（Type Erasure）**——这就是 `std::function<返回类型(参数类型)>` 的作用。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <vector>
+#include <string>
+
+void greetEN(const std::string& name) { std::cout << "Hello, " << name << "!\n"; }
+
+int main() {
+    std::function<void(const std::string&)> greeter;
+
+    greeter = greetEN;                                    // 函数指针
+    greeter("Alice");
+    greeter = [](const std::string& n) {                  // lambda
+        std::cout << "你好, " << n << "!\n";
+    };
+    greeter("Bob");
+
+    // 存进容器 —— std::function 最核心用途
+    std::vector<std::function<void(const std::string&)>> cbs;
+    cbs.push_back(greetEN);
+    cbs.push_back([](const std::string& n) { std::cout << "Bonjour, " << n << "!\n"; });
+    for (auto& cb : cbs) cb("World");
+    return 0;
+}
+}
+
+\warning{**`std::function` 有性能开销**（类型擦除、可能堆分配、虚函数调用）。不需要运行时存储不同类型 callable 时，用 `auto` 或模板参数接收 lambda，零开销内联。}
+
+\tabs{
+\tab[用 auto/模板（零开销）]{
+\code[cpp]{
+// 传给算法：直接用 lambda，编译器内联
+auto cmp = [](int a, int b) { return a > b; };
+std::sort(v.begin(), v.end(), cmp);
+
+template<typename Func>
+void applyToAll(std::vector<int>& v, Func f) {
+    for (auto& x : v) f(x);
+}
+}
+}
+\tab[用 std::function（类型擦除）]{
+\code[cpp]{
+// 存容器/做成员：必须 std::function
+class Button {
+    std::function<void()> onClick;
+public:
+    void setCallback(std::function<void()> cb) { onClick = std::move(cb); }
+    void click() { if (onClick) onClick(); }
+};
+}
+}
+}
+
+// std::bind 与 std::placeholders
+
+**动机：** 想"固定"函数的部分参数？C++11 的 `std::bind` 做**参数绑定（Partial Application）**，但现代 C++ 中 lambda 已完全替代它——你只需能读懂老代码即可。
+
+\code[cpp]{
+#include <functional>
+using namespace std::placeholders;
+int subtract(int a, int b) { return a - b; }
+
+auto sub10 = std::bind(subtract, 10, _1);  // sub10(3) = subtract(10,3) = 7
+// lambda 替代：auto sub10 = [](int b) { return subtract(10, b); };
+}
+
+\compare{
+old: `std::bind` + `_1, _2` 占位符。可读性差，嵌套时是噩梦，编译错误信息极长，无法内联优化。
+
+new: Lambda 完全替代，清晰高效。C++20 `std::bind_front` 是简化版：`auto add5 = std::bind_front(std::plus{}, 5);`，但 lambda 仍是首选。
+}
+
+// std::invoke / std::apply
+
+**动机：** C++ 的 callable 种类多，调用语法各异：普通函数 `f()`、成员函数 `obj.f()`、成员指针 `(ptr->*f)()`。**`std::invoke`**（C++17）提供**统一调用入口（Uniform Call Wrapper）**——一种语法调用一切。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <string>
+
+struct Player {
+    std::string name;
+    int hp;
+    void takeDamage(int d) { hp -= d; }
+};
+
+int freeFunc(int a, int b) { return a + b; }
+
+int main() {
+    std::cout << std::invoke(freeFunc, 3, 4) << "\n";    // 7（普通函数）
+
+    auto lam = [](int x) { return x * x; };
+    std::cout << std::invoke(lam, 5) << "\n";             // 25（lambda）
+
+    Player p{"Hero", 100};
+    std::invoke(&Player::takeDamage, p, 30);               // 成员函数
+    std::cout << p.hp << "\n";                             // 70
+    std::cout << std::invoke(&Player::name, p) << "\n";   // 成员变量
+    return 0;
+}
+}
+
+**`std::apply`**（C++17）将 `std::tuple` 展开为函数参数：`std::apply(add, std::make_tuple(1,2,3));` 等价于 `add(1,2,3)`。两者在编写泛型框架代码时极有用——不确定用户传的 callable 类型时，统一处理。
+
+// std::ref / std::cref
+
+**动机：** `std::bind`、`std::thread` 等工具接收参数时**默认拷贝**。要按引用传递，必须用 **`std::ref`（引用包装器，Reference Wrapper）** 显式包装；`std::cref` 是 const 版本。
+
+\code[cpp]{
+void increment(int& x) { ++x; }
+
+int value = 10;
+auto bad = std::bind(increment, value);        // 拷贝！
+bad();   // value 仍为 10（修改的是副本）
+
+auto good = std::bind(increment, std::ref(value));  // 真正的引用
+good();  // value 变为 11
+}
+
+\warning{`std::ref`/`std::cref` 不拥有对象生命周期——被引用对象必须在回调执行期间存活。}
+
+// 回调模式在游戏中的应用
+
+**动机：** 游戏引擎核心架构之一是**事件系统（Event System）**——"玩家受伤""敌人死亡"等事件发生时分发给所有注册的监听者。`std::function` + lambda 正是实现手段。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <vector>
+#include <string>
+#include <unordered_map>
+
+class EventBus {
+    std::unordered_map<std::string,
+        std::vector<std::function<void(int)>>> listeners;
+public:
+    void subscribe(const std::string& event, std::function<void(int)> cb) {
+        listeners[event].push_back(std::move(cb));
+    }
+    void emit(const std::string& event, int data) {
+        if (auto it = listeners.find(event); it != listeners.end())
+            for (auto& cb : it->second) cb(data);
+    }
+};
+
+int main() {
+    EventBus bus;
+    int totalDmg = 0;
+    bus.subscribe("hit", [&totalDmg](int d) { totalDmg += d; std::cout << "受伤 " << d << "\n"; });
+    bus.subscribe("hit", [](int d) { if (d > 50) std::cout << "暴击！\n"; });
+    bus.subscribe("kill", [](int xp) { std::cout << "+" << xp << " 经验\n"; });
+
+    bus.emit("hit", 30);
+    bus.emit("hit", 75);
+    bus.emit("kill", 100);
+    std::cout << "总伤害: " << totalDmg << "\n";  // 105
+    return 0;
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+\table{
+标准 | 特性 | 说明
+---
+C++14 | 泛型 Lambda / 初始化捕获 | `auto` 参数；`[p = std::move(ptr)]` 移动捕获
+C++17 | `constexpr` Lambda | Lambda 可在编译期求值
+C++17 | `std::invoke` / `std::apply` | 统一调用接口；tuple 展开为参数
+C++20 | 模板 Lambda / `std::bind_front` | 显式模板参数；简化绑定前几个参数
+C++23 | Deducing This | `(this auto self, ...)` 递归 lambda
+C++23 | `std::move_only_function` | 只移动不拷贝的 function，开销更低
+}
+
+/// 工程实践
+
+\table{
+场景 | 推荐工具 | 原因
+---
+传给算法/短期使用 | lambda + `auto` | 零开销内联
+存进容器/做类成员 | `std::function` | 类型统一
+和 C API 交互 | 函数指针 | C 不认识 C++ callable
+泛型库/框架内部 | `std::invoke` + 模板 | 处理所有 callable 类型
+}
+
+\danger{**热循环（Hot Loop）中避免 `std::function`。** 每帧对数千对象调用时，类型擦除的间接开销会累积。用模板在编译期绑定逻辑。}
+
+\tip{事件系统应提供**取消订阅**机制（返回 ID 或 RAII 句柄），对象销毁时自动解除注册，避免悬空回调。}
+
+/// 难点易错点分析
+
+\danger{**陷阱 1：值捕获默认 const。** 忘记 `mutable` 导致编译错误：`auto f = [x]() { ++x; };` ❌，需要 `[x]() mutable { ++x; }` ✅。}
+
+\danger{**陷阱 2：空 `std::function` 调用抛异常。** `std::function<void()> f; f();` 会抛 `std::bad_function_call`。调用前先 `if (f) f();`。}
+
+\danger{**陷阱 3：循环中引用捕获。** 所有 lambda 共享同一个循环变量引用，循环结束后变量已超出作用域——用**值捕获** `[i]` 而非 `[&i]`。}
+
+\quiz[choice]{
+Q: `int x=10; auto f=[x]() mutable { x+=5; return x; };` 连续调用 `f()` 两次返回什么？外部 `x` 是？
+A: 15, 20, 外部 x=10
+B: 15, 20, 外部 x=20
+C: 15, 15, 外部 x=10
+D: 编译错误
+ANS: A
+EXP: `mutable` 让 lambda 修改值捕获的副本。第一次内部 x 从 10 变 15，第二次从 15 变 20。外部 x 始终为 10——值捕获是"拍快照"。
+}
+
+\quiz[choice]{
+Q: 以下哪种场景**不适合**用 `std::function`？
+A: 事件系统存储订阅者回调
+B: `std::sort` 第三个参数传比较逻辑
+C: 类成员变量存储外部注入策略
+D: `std::vector` 中存储多种回调
+ANS: B
+EXP: `std::sort` 是模板函数，直接传 lambda 零开销内联。`std::function` 的类型擦除在这里多余。A/C/D 需要运行时存储不同类型 callable，必须用 `std::function`。
+}
+
+\quiz[tf]{
+Q: `std::function<int(int)>` 可以存放捕获了局部变量的 lambda。
+ANS: T
+EXP: `std::function` 用类型擦除，可存放任何签名匹配的 callable，包括有状态 lambda。但引用捕获时需确保变量生命周期。
+}
+
+/// 实战作业
+
+// 🟢 基础题：自定义排序
+
+用 lambda 对游戏角色按不同规则排序。补全 `TODO`。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <string>
+
+struct Character {
+    std::string name;
+    int level;
+    int hp;
+};
+
+void printAll(const std::vector<Character>& chars) {
+    for (const auto& c : chars)
+        std::cout << c.name << " Lv." << c.level << " HP=" << c.hp << "\n";
+    std::cout << "---\n";
+}
+
+int main() {
+    std::vector<Character> team = {
+        {"Warrior", 15, 300}, {"Mage", 20, 150},
+        {"Archer", 15, 200}, {"Healer", 18, 180}
+    };
+
+    // TODO 1: 按等级降序（等级同则 HP 高的在前）
+    std::sort(team.begin(), team.end(), /* 你的 lambda */);
+    std::cout << "按等级降序:\n"; printAll(team);
+
+    // TODO 2: 按名字字母升序
+    std::sort(team.begin(), team.end(), /* 你的 lambda */);
+    std::cout << "按名字升序:\n"; printAll(team);
+    return 0;
+}
+}
+
+// 🟢 基础题：定时回调
+
+补全 `Timer` 类，用 `std::function` 存储回调，`tick()` 倒计时到 0 时触发。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+
+class Timer {
+    int remaining;
+    /* TODO: 添加 std::function<void()> 成员 */
+public:
+    Timer(int ticks) : remaining(ticks) {}
+    /* TODO: setCallback 方法 */
+    void tick() {
+        if (remaining > 0) {
+            --remaining;
+            std::cout << "剩余: " << remaining << "\n";
+            /* TODO: remaining==0 时调用回调 */
+        }
+    }
+};
+
+int main() {
+    Timer t(3);
+    t.setCallback([]() { std::cout << "时间到！发射技能！\n"; });
+    t.tick();  // 剩余: 2
+    t.tick();  // 剩余: 1
+    t.tick();  // 剩余: 0 → 时间到！发射技能！
+    t.tick();  // 不输出
+    return 0;
+}
+}
+
+// 🟡 进阶题：过滤链与命令队列
+
+实现 `FilterChain`（链式过滤）和 `CommandQueue`（命令队列）两个类。补全 `TODO`。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <vector>
+#include <string>
+
+struct Enemy { std::string name; int hp; bool isBoss; };
+
+class FilterChain {
+    /* TODO: 存储 vector<function<bool(const Enemy&)>> */
+public:
+    /* TODO: FilterChain& addFilter(...) 返回 *this 链式调用 */
+    /* TODO: vector<Enemy> apply(const vector<Enemy>&) 返回全部满足的 */
+};
+
+class CommandQueue {
+    /* TODO: vector<function<void()>> */
+public:
+    /* TODO: enqueue, executeAll, size */
+};
+
+int main() {
+    // 测试 FilterChain
+    std::vector<Enemy> enemies = {
+        {"Slime",10,false}, {"Goblin",50,false},
+        {"Dragon",500,true}, {"Orc",120,false}
+    };
+    FilterChain chain;
+    auto result = chain
+        .addFilter([](const Enemy& e) { return e.hp > 30; })
+        .addFilter([](const Enemy& e) { return !e.isBoss; })
+        .apply(enemies);
+    for (const auto& e : result)
+        std::cout << e.name << " HP=" << e.hp << "\n";
+    // 预期: Goblin HP=50, Orc HP=120
+
+    // 测试 CommandQueue
+    CommandQueue q;
+    int px = 0, py = 0;
+    q.enqueue([&px]() { px += 1; });
+    q.enqueue([&px]() { px += 1; });
+    q.enqueue([&py]() { py += 1; });
+    std::cout << "命令数: " << q.size() << "\n";  // 3
+    q.executeAll();
+    std::cout << "位置: (" << px << "," << py << ")\n";  // (2,1)
+    return 0;
+}
+}
+
+// 🔴 挑战题：类型安全事件系统
+
+设计**类型安全**的事件系统——用事件 struct 类型（而非字符串）做分发依据。支持 `subscribe<EventType>(callback)` 和 `emit<EventType>(event)`。
+
+\collapse[参考思路]{
+用 `std::unordered_map<std::type_index, std::any>` 做映射。`subscribe<T>` 将回调 push 到 `map[typeid(T)]` 对应的 `vector<function<void(const T&)>>`；`emit<T>` 用 `any_cast` 还原后逐个调用。验收：不同事件类型的回调互不干扰，传错签名编译报错。
+}

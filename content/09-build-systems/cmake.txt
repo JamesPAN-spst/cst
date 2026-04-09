@@ -1,0 +1,499 @@
+/// 简介
+
+手动敲 `g++ a.cpp b.cpp c.cpp -o app` 在三文件项目里还行；一旦项目增长到几十个源文件、依赖多个第三方库、需要跨平台编译——手动命令就无法维护了。**CMake** 是 C++ 生态事实上的标准构建系统生成器（Build System Generator）：你用 `CMakeLists.txt` 描述项目结构，CMake 生成平台原生的构建文件（Makefile、Ninja、Visual Studio Solution 等），再由这些工具完成实际编译。
+
+上一节理解了编译模型的四阶段流水线；本节学习如何用 CMake 把整条流水线自动化，同时掌握现代 CMake（Modern CMake）以**目标（Target）**为中心的思维方式。
+
+/// 知识点列表
+
+\list{
+- CMakeLists.txt 基础结构
+- target_link_libraries / target_include_directories（现代 CMake 核心）
+- add_executable / add_library（STATIC / SHARED / INTERFACE）
+- PUBLIC / PRIVATE / INTERFACE 属性传播
+- CMake 变量与缓存变量
+- find_package / FetchContent 依赖管理
+- Generator Expressions（生成器表达式）
+- CMake Presets（CMakePresets.json）
+- 多目标构建（Debug / Release / RelWithDebInfo）
+- 交叉编译概念
+}
+
+/// 知识点详解
+
+// CMakeLists.txt 基础结构
+
+一个最小化的 CMake 项目只需三行——但即使是最小项目，也应该从一开始就用现代风格：
+
+\code[cmake]{
+# 1. 指定最低 CMake 版本——决定了可用特性集
+cmake_minimum_required(VERSION 3.25)
+
+# 2. 声明项目——名称、版本、使用的语言
+project(MyGame VERSION 1.0.0 LANGUAGES CXX)
+
+# 3. 设置 C++ 标准（全局方式，适用于所有目标）
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)  # 如果编译器不支持 C++23 则报错
+set(CMAKE_CXX_EXTENSIONS OFF)        # 禁用 GNU 扩展，保持标准兼容
+
+# 4. 定义可执行目标——列出所有参与编译的源文件
+add_executable(game
+    src/main.cpp
+    src/engine.cpp
+    src/renderer.cpp
+)
+
+# 5. 为目标设置属性
+target_include_directories(game PRIVATE src/include)
+target_compile_options(game PRIVATE -Wall -Wextra -Wpedantic)
+}
+
+\run[bash]{
+# CMake 构建流程（out-of-source build）
+mkdir -p build && cd build
+cmake .. -G Ninja              # 配置：生成 Ninja 构建文件
+cmake --build .                # 编译
+cmake --build . --target test  # 运行测试（如果配置了 CTest）
+}
+
+\note{**始终使用 out-of-source build（源外构建）。** 把构建产物放在独立的 `build/` 目录中，不污染源码树。这是现代 CMake 的基本实践。}
+
+// add_executable 与 add_library
+
+CMake 的核心概念是**目标（Target）**——每个 `add_executable` 或 `add_library` 创建一个构建目标，它是属性（头文件路径、编译选项、链接依赖等）的载体。
+
+\code[cmake]{
+# 可执行目标
+add_executable(game src/main.cpp)
+
+# 静态库（Static Library）：编译时链接，合并进可执行文件
+add_library(engine STATIC
+    src/engine.cpp
+    src/physics.cpp
+    src/audio.cpp
+)
+
+# 动态库（Shared Library）：运行时加载
+add_library(renderer SHARED
+    src/renderer.cpp
+    src/shader.cpp
+)
+
+# 接口库（Interface Library）：无源文件，仅传播属性
+# 典型用途：header-only 库、编译选项集合
+add_library(project_options INTERFACE)
+target_compile_features(project_options INTERFACE cxx_std_23)
+target_compile_options(project_options INTERFACE -Wall -Wextra)
+}
+
+\tip{**INTERFACE 库是现代 CMake 的利器。** 可以把项目级别的编译选项、标准要求等打包为一个 INTERFACE 目标，所有真实目标通过 `target_link_libraries` 继承这些设置——干净且集中管理。}
+
+// PUBLIC / PRIVATE / INTERFACE 属性传播
+
+这是现代 CMake 最核心的思维模型。每个 `target_*` 命令都需要指定属性的**可见性（Visibility）**：
+
+\table{
+可见性 | 含义 | 类比
+---
+PRIVATE | 仅当前目标自身使用 | "我的内部实现细节"
+PUBLIC | 当前目标和所有依赖它的目标都使用 | "我的接口的一部分"
+INTERFACE | 当前目标不用，但依赖者要用 | "我对外的契约"（header-only 库常用）
+}
+
+\code[cmake]{
+add_library(engine STATIC src/engine.cpp)
+
+# 头文件路径
+target_include_directories(engine
+    PUBLIC  include           # engine 的使用者也需要这些头文件
+    PRIVATE src               # 只有 engine 自身编译时用
+)
+
+# 编译宏定义
+target_compile_definitions(engine
+    PUBLIC  ENGINE_VERSION=2  # 传播给使用者
+    PRIVATE INTERNAL_DEBUG    # 仅 engine 编译时有效
+)
+
+# 依赖链接
+target_link_libraries(engine
+    PUBLIC  fmt::fmt          # engine 的头文件暴露了 fmt 类型 → 使用者也需要
+    PRIVATE spdlog::spdlog    # engine 内部用 spdlog → 使用者不需要知道
+)
+
+# 可执行目标链接 engine
+add_executable(game src/main.cpp)
+target_link_libraries(game PRIVATE engine)
+# game 自动继承 engine 的 PUBLIC 属性：include 路径、fmt 链接、宏定义
+}
+
+\diagram[flow]{
+game (executable) -> PRIVATE 依赖 -> engine (static lib)
+engine -> PUBLIC 依赖 -> fmt::fmt
+engine -> PRIVATE 依赖 -> spdlog::spdlog
+game 自动获得 -> fmt::fmt (通过 engine 的 PUBLIC 传播)
+game 看不到 -> spdlog::spdlog (engine 的 PRIVATE 不传播)
+}
+
+\danger{**永远不要使用旧式全局命令。** `include_directories()`、`link_libraries()`、`add_definitions()` 是 CMake 2.x 遗留 API，它们影响当前目录下的**所有**目标，导致依赖泄漏和不可维护。只用 `target_include_directories()`、`target_link_libraries()`、`target_compile_definitions()` 等 `target_*` 版本。}
+
+// CMake 变量与缓存变量
+
+\code[cmake]{
+# 普通变量——作用域是当前 CMakeLists.txt 和子目录
+set(MY_SOURCES src/a.cpp src/b.cpp src/c.cpp)
+add_executable(app ${MY_SOURCES})
+
+# 列表操作
+list(APPEND MY_SOURCES src/d.cpp)
+
+# 缓存变量——持久化到 CMakeCache.txt，用户可在命令行覆盖
+set(ENABLE_TESTS ON CACHE BOOL "Build unit tests")
+
+# option() 是缓存布尔变量的快捷方式
+option(BUILD_TESTS "Build unit tests" ON)
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+}
+
+\code[bash]{
+# 命令行覆盖缓存变量
+cmake -B build -DBUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+}
+
+// find_package 与 FetchContent
+
+两种引入第三方依赖的方式，适用于不同场景：
+
+\tabs{
+\tab[find_package（查找已安装的库）]{
+\code[cmake]{
+# 在系统路径或 CMAKE_PREFIX_PATH 中查找已安装的库
+find_package(SDL2 REQUIRED)
+find_package(OpenGL REQUIRED)
+find_package(fmt CONFIG REQUIRED)  # CONFIG 模式：使用库提供的 CMake 配置文件
+
+target_link_libraries(game PRIVATE
+    SDL2::SDL2        # 现代 CMake 的导入目标（Imported Target）
+    OpenGL::GL
+    fmt::fmt
+)
+# 导入目标自动带上正确的头文件路径和链接标志
+}
+适用场景：库已通过系统包管理器（apt/brew）或 vcpkg 安装。
+}
+\tab[FetchContent（自动下载构建）]{
+\code[cmake]{
+include(FetchContent)
+
+# 声明依赖——CMake 在配置阶段自动下载
+FetchContent_Declare(
+    fmt
+    GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+    GIT_TAG        11.0.2
+)
+
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG        v1.15.2
+)
+
+# 一次性拉取并构建所有声明的依赖
+FetchContent_MakeAvailable(fmt googletest)
+
+target_link_libraries(game PRIVATE fmt::fmt)
+target_link_libraries(tests PRIVATE GTest::gtest_main)
+}
+适用场景：新项目快速搭建、CI 环境无预装库、需要锁定依赖版本。
+}
+}
+
+\warning{**`FetchContent` 在配置阶段下载——首次 `cmake` 可能很慢。** 后续只要不修改版本号，CMake 会复用已下载的内容。如果团队网络环境受限，考虑用 vcpkg 或 Conan 预缓存依赖。}
+
+// Generator Expressions
+
+**生成器表达式（Generator Expressions）**是在构建系统生成阶段求值的条件表达式，用 `$<...>` 语法。它们比 `if()` 更精准，因为 `if()` 在配置阶段求值，而 generator expressions 在生成阶段求值——能区分多配置构建（如 Visual Studio 中的 Debug/Release）。
+
+\code[cmake]{
+# 根据构建类型添加不同编译选项
+target_compile_options(engine PRIVATE
+    $<$<CONFIG:Debug>:-O0 -g -fsanitize=address,undefined>
+    $<$<CONFIG:Release>:-O2 -DNDEBUG>
+    $<$<CONFIG:RelWithDebInfo>:-O2 -g>
+)
+
+# 根据构建类型添加链接选项
+target_link_options(engine PRIVATE
+    $<$<CONFIG:Debug>:-fsanitize=address,undefined>
+)
+
+# 根据编译器添加不同选项
+target_compile_options(engine PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /permissive->
+)
+
+# 安装时区分 build 树和 install 树的头文件路径
+target_include_directories(engine PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+}
+
+\note{**Generator expressions 是多配置构建（Visual Studio、Xcode、Ninja Multi-Config）的关键。** 在这些构建系统中，`CMAKE_BUILD_TYPE` 在配置阶段是空的——只有 generator expressions 能正确区分 Debug/Release。}
+
+// CMake Presets
+
+**CMake Presets（预设）**是 CMake 3.19 引入的配置管理机制。通过项目根目录的 `CMakePresets.json` 文件，把常用的配置参数命名持久化，团队成员和 CI 可以用同一套配置。
+
+\code[text]{
+// CMakePresets.json（简化示例）
+{
+  "version": 6,
+  "configurePresets": [
+    { "name": "base", "hidden": true,
+      "binaryDir": "build/${presetName}",
+      "cacheVariables": { "CMAKE_CXX_STANDARD": "23", "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
+    },
+    { "name": "debug",   "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+    { "name": "release", "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+    { "name": "asan",    "inherits": "debug",
+      "cacheVariables": { "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",   "configurePreset": "debug" },
+    { "name": "release", "configurePreset": "release" }
+  ]
+}
+}
+
+\run[bash]{
+# 使用预设——一行命令完成配置和构建
+cmake --preset debug           # 配置 Debug 构建
+cmake --build --preset debug   # 编译
+
+cmake --preset release
+cmake --build --preset release
+
+cmake --preset asan            # ASan 构建
+cmake --build build/asan
+}
+
+\tip{**把 `CMakePresets.json` 提交到版本控制中。** 团队成员和 CI 都使用相同的预设，避免"在我机器上能编译"问题。个人覆盖选项放在 `CMakeUserPresets.json`（加入 `.gitignore`）。}
+
+// 多目标构建
+
+\table{
+构建类型 | 编译标志 | 用途
+---
+Debug | `-O0 -g` | 开发调试：无优化，完整调试信息
+Release | `-O2 -DNDEBUG` | 发布：优化，禁用 assert
+RelWithDebInfo | `-O2 -g` | 性能分析：优化但保留调试信息
+MinSizeRel | `-Os -DNDEBUG` | 嵌入式：最小化二进制体积
+}
+
+\code[cmake]{
+# 为不同构建类型设置默认值（单配置生成器用）
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    message(STATUS "No build type specified, defaulting to Debug")
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+}
+
+// 多目录项目结构
+
+实际项目用 `add_subdirectory()` 拆分为多个 `CMakeLists.txt`——每个目录管理自己的构建逻辑：
+
+\code[cmake]{
+# === 顶层 CMakeLists.txt ===
+cmake_minimum_required(VERSION 3.25)
+project(MyEngine VERSION 1.0 LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_subdirectory(src)     # 库
+add_subdirectory(app)     # 可执行文件
+option(BUILD_TESTS "Build tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+# === src/CMakeLists.txt ===
+add_library(engine engine.cpp)
+target_include_directories(engine PUBLIC include)
+
+# === app/CMakeLists.txt ===
+add_executable(game main.cpp)
+target_link_libraries(game PRIVATE engine)
+
+# === tests/CMakeLists.txt ===
+include(FetchContent)
+FetchContent_Declare(googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.15.2)
+FetchContent_MakeAvailable(googletest)
+add_executable(tests test_engine.cpp)
+target_link_libraries(tests PRIVATE engine GTest::gtest_main)
+add_test(NAME EngineTests COMMAND tests)
+}
+
+// 交叉编译概念
+
+**交叉编译（Cross-Compilation）**是在宿主机（Host）上为目标机（Target）构建二进制。通过**工具链文件（Toolchain File）**告诉 CMake 使用哪个编译器：
+
+\code[cmake]{
+# arm-toolchain.cmake
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+set(CMAKE_CXX_COMPILER arm-linux-gnueabihf-g++)
+# 使用：cmake -B build -DCMAKE_TOOLCHAIN_FILE=arm-toolchain.cmake
+}
+
+典型场景：游戏主机开发、Android NDK 编译、WebAssembly（Emscripten: `emcmake cmake ..`）。
+
+/// 工程实践
+
+// 现代 CMake 决策检查清单
+
+\list{
+- **所有 `target_*` 命令都必须指定 PUBLIC/PRIVATE/INTERFACE**——未指定意味着使用旧式行为
+- **优先使用 `FetchContent` 管理小型依赖**——版本锁定、可复现
+- **大型依赖（Qt、Boost）用 `find_package`**——避免 FetchContent 的编译开销
+- **始终启用 `CMAKE_EXPORT_COMPILE_COMMANDS`**——为 clang-tidy / LSP 提供编译数据库
+- **多人项目必须有 `CMakePresets.json`**——统一构建配置
+- **库的头文件路径用 `$<BUILD_INTERFACE>` / `$<INSTALL_INTERFACE>`**——区分构建树和安装树
+}
+
+/// 新版特性（CMake 3.x 演进）
+
+\table{
+版本 | 特性 | 意义
+---
+3.11 | FetchContent | 配置阶段自动下载依赖
+3.16 | target_precompile_headers | CMake 原生 PCH 支持
+3.19 | CMakePresets.json | 标准化构建配置
+3.21 | 更好的 MSVC 工具链检测 | Windows 开发体验改善
+3.25 | SYSTEM 关键字优化 | FetchContent 可抑制第三方库警告
+3.28 | C++20 Modules 支持 | `CXX_MODULE_DIRS`、模块依赖扫描
+}
+
+/// 难点易错点分析
+
+\danger{**旧式 CMake 代码比比皆是。** 网上教程、StackOverflow 答案大量使用 `include_directories()`、`link_libraries()`、`set(CMAKE_CXX_FLAGS ...)`——这些是 CMake 2.x 遗留风格。识别标志：凡是没有 `target_` 前缀的目录/链接/定义命令，都是旧式代码。}
+
+\warning{**`CMAKE_CXX_STANDARD` vs `target_compile_features`：** 全局 `set(CMAKE_CXX_STANDARD 23)` 影响所有目标。如果库和应用需要不同标准，用 `target_compile_features(mylib PUBLIC cxx_std_23)` 精确控制每个目标。}
+
+\warning{**FetchContent 与 find_package 优先级：** 如果系统已安装某个库（如 fmt），同时又用 FetchContent 下载了一份，可能出现版本冲突。使用 `FetchContent_Declare` 的 `FIND_PACKAGE_ARGS` 参数（CMake 3.24+）可以优先尝试 `find_package`，找不到再下载。}
+
+\quiz[choice|单选]{
+Q: 在 CMake 中，`target_link_libraries(game PRIVATE engine)` 的 `PRIVATE` 意味着什么？
+A: engine 库只在 Debug 模式下链接
+B: game 链接 engine，但 engine 的 PUBLIC 属性不会传播给依赖 game 的其他目标
+C: engine 库是可选依赖，找不到也不报错
+D: engine 的头文件路径不会添加到 game 的编译选项中
+ANS: B
+EXP: `PRIVATE` 表示依赖关系是"实现细节"——game 链接 engine 并继承 engine 的 PUBLIC 属性，但如果有其他目标依赖 game，engine 的属性不会再向上传播。如果 game 的头文件暴露了 engine 的类型，应该用 PUBLIC。
+}
+
+\quiz[choice|单选]{
+Q: 以下哪种方式是**现代 CMake** 推荐的引入头文件路径的方式？
+A: `include_directories(${PROJECT_SOURCE_DIR}/include)`
+B: `target_include_directories(mylib PUBLIC include)`
+C: `set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I${PROJECT_SOURCE_DIR}/include")`
+D: `link_directories(${PROJECT_SOURCE_DIR}/lib)`
+ANS: B
+EXP: `target_include_directories` 是现代 CMake 以目标为中心的 API，属性通过 PUBLIC/PRIVATE/INTERFACE 精确传播。A 是旧式全局命令，C 直接操作编译标志绕过了 CMake 的依赖管理，D 是链接路径而非头文件路径。
+}
+
+\quiz[tf|判断]{
+Q: `FetchContent_MakeAvailable()` 在 CMake 的构建阶段（build time）下载依赖。
+ANS: F
+EXP: `FetchContent` 在**配置阶段（configure time）**下载依赖——即执行 `cmake ..` 时，而非 `cmake --build` 时。这意味着首次配置可能较慢（网络下载），但后续配置会复用已缓存的内容。
+}
+
+/// 实战作业
+
+// 🟢 基础题：最小 CMake 项目
+
+\run[cmake]{
+# 练习：补全下面的 CMakeLists.txt
+# 项目结构：
+#   src/main.cpp
+#   src/math.cpp
+#   src/include/math.hpp
+
+cmake_minimum_required(VERSION 3.25)
+# TODO: 声明项目（名称 MathApp，语言 CXX）
+
+# TODO: 设置 C++17 标准
+
+# TODO: 创建可执行目标 app，包含 main.cpp 和 math.cpp
+
+# TODO: 为 app 添加头文件路径 src/include（PRIVATE）
+
+# TODO: 为 app 添加编译选项 -Wall -Wextra（PRIVATE）
+}
+
+\collapse[参考答案]{
+\code[cmake]{
+cmake_minimum_required(VERSION 3.25)
+project(MathApp LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(app src/main.cpp src/math.cpp)
+target_include_directories(app PRIVATE src/include)
+target_compile_options(app PRIVATE -Wall -Wextra)
+}
+}
+
+// 🟡 进阶题：多目标库 + 依赖传播 + Presets
+
+在 IDE 中完成：
+
+\list{
+- 创建两个 STATIC 库目标 `math_lib` 和 `engine_lib`（后者依赖前者），一个可执行目标 `app` 只链接 `engine_lib`
+- 思考 `engine_lib` 链接 `math_lib` 时用 PUBLIC 还是 PRIVATE（提示：头文件是否暴露了 `math_lib` 类型？）
+- 用 `FetchContent` 引入 fmt，在 `app` 中使用 `fmt::print`
+- 编写 `CMakePresets.json`（debug / release / asan），用 `cmake --preset debug` 验证
+}
+
+\collapse[参考思路]{
+\code[cmake]{
+add_library(math_lib STATIC src/math.cpp)
+target_include_directories(math_lib PUBLIC include)
+add_library(engine_lib STATIC src/engine.cpp)
+target_link_libraries(engine_lib PUBLIC math_lib)  # 头文件暴露类型 → PUBLIC
+add_executable(app src/main.cpp)
+target_link_libraries(app PRIVATE engine_lib)
+# app 通过 engine_lib 的 PUBLIC 自动获得 math_lib
+}
+}
+
+// 🔴 挑战题：完整多目录项目 + CI
+
+\list{
+- 从零搭建：顶层 CMakeLists.txt + src/（STATIC 库）+ app/（可执行）+ tests/（GoogleTest）
+- FetchContent 引入 GoogleTest，编写 3+ 单元测试，`ctest` 全部通过
+- 配置安装规则 `install(TARGETS/DIRECTORY/EXPORT ...)`
+- 用 generator expressions 适配 GCC/Clang 和 MSVC 两套编译选项
+- 编写 GitHub Actions CI：Linux(GCC) + Windows(MSVC) 双平台构建和测试
+}
+
+\collapse[参考思路]{
+\code[cmake]{
+install(TARGETS engine EXPORT MyTargets ARCHIVE DESTINATION lib)
+install(DIRECTORY src/include/ DESTINATION include)
+install(EXPORT MyTargets FILE MyTargets.cmake NAMESPACE My:: DESTINATION lib/cmake/My)
+}
+}
+
+CMake 掌握了项目的构建描述；但编译器的选择、优化选项的调配、调试器和分析器的使用同样至关重要。下一节我们进入工具链的世界——了解 GCC / Clang / MSVC 的差异与选择。

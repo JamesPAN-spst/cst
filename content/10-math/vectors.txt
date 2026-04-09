@@ -1,0 +1,331 @@
+/// 简介
+
+游戏世界中几乎所有空间量——位置、速度、加速度、方向、法线、力——都用**向量（Vector）**表示。向量是连接数学和游戏引擎的最基础桥梁：你写的每一个移动逻辑、每一次碰撞检测、每一帧摄像机跟随，底层都是向量运算。
+
+本节构建 `Vec2` / `Vec3` 类型，从代数运算推进到点积、叉积的几何直觉，最终落地到游戏中的实际应用场景。上一章我们掌握了构建工具链，这一章开始用 C++ 编写真正的游戏底层数学。
+
+/// 知识点列表
+
+\list{
+- 2D / 3D 向量的表示与存储（Vec2, Vec3）
+- 向量加减与标量乘除
+- 向量长度（Magnitude）与平方长度优化
+- 向量归一化（Normalize）与零向量防护
+- 点积（Dot Product）— 角度、投影、方向判断
+- 叉积（Cross Product）— 法线、面朝向、左右判断
+- 线性插值（Lerp）与距离计算
+}
+
+/// 知识点详解
+
+// 向量表示与基本运算
+
+向量在游戏中的最小单位是 `Vec2`（2D）和 `Vec3`（3D）。用 `struct` 存储分量，运算符重载实现代数运算：
+
+\code[cpp]{
+struct Vec2 {
+    float x = 0, y = 0;
+
+    Vec2 operator+(const Vec2& v) const { return {x + v.x, y + v.y}; }
+    Vec2 operator-(const Vec2& v) const { return {x - v.x, y - v.y}; }
+    Vec2 operator*(float s) const { return {x * s, y * s}; }
+    Vec2 operator/(float s) const { return {x / s, y / s}; }
+    Vec2 operator-() const { return {-x, -y}; }
+    bool operator==(const Vec2& v) const = default;
+};
+
+struct Vec3 {
+    float x = 0, y = 0, z = 0;
+
+    Vec3 operator+(const Vec3& v) const { return {x+v.x, y+v.y, z+v.z}; }
+    Vec3 operator-(const Vec3& v) const { return {x-v.x, y-v.y, z-v.z}; }
+    Vec3 operator*(float s) const { return {x*s, y*s, z*s}; }
+    Vec3 operator/(float s) const { return {x/s, y/s, z/s}; }
+    Vec3 operator-() const { return {-x, -y, -z}; }
+};
+}
+
+\note{加减是**分量对应运算**，标量乘除是**每个分量同乘同除**。取反 `operator-()` 翻转向量方向。这些运算在游戏中用于组合力、计算位移差、反向移动等。}
+
+// 向量长度与平方长度
+
+**长度（Magnitude）** 是向量在空间中的"大小"，由勾股定理推广而来：
+
+\code[cpp]{
+float length(Vec3 v) {
+    return std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
+}
+
+// 平方长度：省去 sqrt，用于距离比较
+float lengthSq(Vec3 v) {
+    return v.x*v.x + v.y*v.y + v.z*v.z;
+}
+
+// 两点之间的距离
+float distance(Vec3 a, Vec3 b) {
+    return length(b - a);
+}
+}
+
+\tip{**性能关键：** `sqrt` 是昂贵操作。比较距离时用 `lengthSq` 对比阈值的平方——`if (lengthSq(delta) < radius * radius)` 等价于 `if (length(delta) < radius)` 但省去开方。每帧数千次碰撞检查中差异显著。}
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec3 {
+    float x, y, z;
+    Vec3 operator-(const Vec3& v) const { return {x-v.x, y-v.y, z-v.z}; }
+    Vec3 operator*(float s) const { return {x*s, y*s, z*s}; }
+};
+
+float lengthSq(Vec3 v) { return v.x*v.x + v.y*v.y + v.z*v.z; }
+float length(Vec3 v) { return std::sqrt(lengthSq(v)); }
+float distance(Vec3 a, Vec3 b) { return length(b - a); }
+
+int main() {
+    Vec3 player{3.0f, 0.0f, 4.0f};
+    Vec3 enemy{6.0f, 0.0f, 8.0f};
+    float dist = distance(player, enemy);
+    std::cout << "距离: " << dist << "\n";                // 5.0
+    std::cout << "距离平方: " << lengthSq(enemy - player) << "\n"; // 25.0
+
+    // 距离比较：不需要开方
+    float alertRange = 10.0f;
+    if (lengthSq(enemy - player) < alertRange * alertRange) {
+        std::cout << "敌人在警戒范围内!\n";
+    }
+}
+}
+
+// 归一化
+
+**归一化（Normalize）** 将向量缩放为长度为 1 的**单位向量（Unit Vector）**，保留方向、丢弃大小。单位向量在游戏中表示"纯方向"——朝向、法线、移动方向。
+
+\code[cpp]{
+Vec3 normalize(Vec3 v) {
+    float len = length(v);
+    if (len < 1e-8f) return {0, 0, 0};  // 零向量防护，避免除零
+    return v / len;
+}
+
+// 游戏应用：角色朝目标方向匀速移动
+Vec3 toTarget = target.pos - player.pos;
+Vec3 moveDir = normalize(toTarget);        // 纯方向
+player.pos = player.pos + moveDir * speed * deltaTime;
+}
+
+\warning{**对零向量调用归一化是未定义行为（UB）的温床。** `Vec3{0,0,0}` 的长度为 0，除以 0 产生 `inf` 或 `NaN`，沿后续帧传播污染整个变换链。始终在归一化前检查长度。}
+
+// 点积
+
+**点积（Dot Product）** 是向量运算中信息量最大的单一数值。几何意义：$\vec{a} \cdot \vec{b} = |\vec{a}||\vec{b}|\cos\theta$。
+
+\code[cpp]{
+float dot(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+}
+
+当两个向量都是单位向量时，点积直接等于 $\cos\theta$。根据点积的符号判断方向关系：
+
+\table{
+点积值 | 几何关系 | 游戏含义
+---
+> 0 | 夹角 < 90° | 目标在前方
+= 0 | 夹角 = 90° | 目标在正侧方
+< 0 | 夹角 > 90° | 目标在后方
+}
+
+\code[cpp]{
+// 应用1：视野锥检测（FOV Check）
+Vec3 toEnemy = normalize(enemy.pos - player.pos);
+float cosAngle = dot(player.forward, toEnemy);
+bool inFOV = cosAngle > std::cos(fovHalfAngle);
+
+// 应用2：Lambert 漫反射光照
+float brightness = std::max(0.0f, dot(surfaceNormal, lightDir));
+
+// 应用3：向量投影 — a 在 b 方向上的分量
+Vec3 project(Vec3 a, Vec3 b) {
+    return b * (dot(a, b) / dot(b, b));
+}
+
+// 应用4：反射向量（弹球反弹、光线追踪）
+Vec3 reflect(Vec3 incident, Vec3 normal) {
+    return incident - normal * (2.0f * dot(incident, normal));
+}
+}
+
+\diagram[flow]{
+点积应用 -> 符号判断方向(前方/侧方/后方)
+点积应用 -> cos(θ) -> 夹角 -> FOV检测
+点积应用 -> 投影长度 -> 向量投影
+点积应用 -> 投影长度 -> 反射向量
+}
+
+// 叉积
+
+**叉积（Cross Product）** 仅定义于 3D 向量，结果是**垂直于两个输入向量的新向量**。几何意义：$|\vec{a} \times \vec{b}| = |\vec{a}||\vec{b}|\sin\theta$（平行四边形面积）。
+
+\code[cpp]{
+Vec3 cross(Vec3 a, Vec3 b) {
+    return {
+        a.y*b.z - a.z*b.y,   // x
+        a.z*b.x - a.x*b.z,   // y
+        a.x*b.y - a.y*b.x    // z
+    };
+}
+
+// 应用1：计算三角面法线
+Vec3 edge1 = v1 - v0;
+Vec3 edge2 = v2 - v0;
+Vec3 faceNormal = normalize(cross(edge1, edge2));
+
+// 应用2：2D中判断左右（取 z 分量）
+float cross2D(Vec2 a, Vec2 b) { return a.x*b.y - a.y*b.x; }
+// > 0 → b 在 a 的左侧（逆时针方向）
+// < 0 → b 在 a 的右侧（顺时针方向）
+}
+
+\warning{**叉积方向取决于坐标系手性（Handedness）。** 右手系（OpenGL）和左手系（DirectX）的叉积方向相反。项目初期确定坐标系约定并全程一致——这是许多隐蔽 bug 的根源。}
+
+// 线性插值
+
+**线性插值（Linear Interpolation, Lerp）** 在两个值之间做平滑过渡，参数 `t` 控制混合比例：
+
+\code[cpp]{
+Vec3 lerp(Vec3 a, Vec3 b, float t) {
+    return a + (b - a) * t;  // t=0→a, t=0.5→中点, t=1→b
+}
+
+// 角色平滑移动到目标位置
+player.pos = lerp(player.pos, targetPos, 0.1f);  // 每帧靠近 10%
+
+// 颜色渐变：HP从绿到红
+Vec3 color = lerp(green, red, 1.0f - healthPercent);
+}
+
+\tip{**`a + (b - a) * t` 比 `a * (1-t) + b * t` 更好。** 前者在 `t = 1` 时精确返回 `b`（因为 `a + (b-a) = b`），后者可能有浮点误差。游戏中推荐前者。}
+
+/// 工程实践
+
+\collapse[🔧 生产级 Vec3 设计要点]{
+\list{
+- 所有纯计算函数标记 `[[nodiscard]]` 防止丢弃返回值
+- 尽量使用 `constexpr` 允许编译期求值和 `static_assert` 测试
+- 提供 `+=`, `-=`, `*=`, `/=` 复合赋值运算符（减少临时对象）
+- 友元 `operator*(float, Vec3)` 支持 `2.0f * v` 写法
+- 添加 `Vec2 xy()` 从 Vec3 提取 2D 分量（swizzle 简易版）
+- 精度敏感场景（天体模拟、大世界坐标）考虑 `double` 或模板化
+}
+}
+
+/// 难点易错点分析
+
+\danger{**`acos` 的定义域是 [-1, 1]。** 由于浮点误差，`dot(a, b)` 可能算出 1.0000001 或 -1.0000001，传入 `std::acos` 返回 **NaN**。必须先 `std::clamp(d, -1.0f, 1.0f)` 再求角度。}
+
+\danger{**归一化零向量导致 NaN 传播。** 物体静止时 `velocity = {0,0,0}`，对其归一化后所有后续运算被 NaN 污染。防御：归一化前检查 `lengthSq(v) > epsilon`。}
+
+\warning{**误用叉积的 2D 版本。** 2D 叉积返回标量（`a.x*b.y - a.y*b.x`），3D 叉积返回向量。混淆两者会导致编译错误或语义错误。}
+
+\quiz[choice]{
+Q: 两个**单位向量** `a` 和 `b` 的点积为 -0.5，它们之间的夹角最接近？
+A: 60°
+B: 90°
+C: 120°
+D: 150°
+ANS: C
+EXP: cos(θ) = -0.5 → θ = 120°。点积为负表示夹角大于 90°，两个方向"分开"。
+}
+
+\quiz[tf]{
+Q: `cross(a, b)` 与 `cross(b, a)` 对任意非零 3D 向量结果相同。
+ANS: F
+EXP: 叉积满足**反交换律**：cross(a, b) = -cross(b, a)，方向相反。交换操作数会翻转法线方向。
+}
+
+/// 实战作业
+
+// 🟢 基础题：向量工具函数
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+
+struct Vec3 {
+    float x, y, z;
+    Vec3 operator+(const Vec3& v) const { return {x+v.x, y+v.y, z+v.z}; }
+    Vec3 operator-(const Vec3& v) const { return {x-v.x, y-v.y, z-v.z}; }
+    Vec3 operator*(float s) const { return {x*s, y*s, z*s}; }
+    Vec3 operator/(float s) const { return {x/s, y/s, z/s}; }
+};
+
+/* TODO: 实现以下函数 */
+float lengthSq(Vec3 v) { /* 返回向量长度的平方 */ return 0; }
+float length(Vec3 v)   { /* 返回向量长度 */ return 0; }
+Vec3 normalize(Vec3 v) { /* 返回单位向量，零向量返回{0,0,0} */ return {}; }
+float dot(Vec3 a, Vec3 b) { /* 返回点积 */ return 0; }
+
+float angleBetween(Vec3 a, Vec3 b) {
+    /* TODO: 用 dot + acos 计算夹角（弧度），注意 clamp */
+    return 0;
+}
+
+int main() {
+    Vec3 a{3, 0, 4}, b{0, 5, 0};
+    std::cout << "length(a) = " << length(a) << " (期望: 5)\n";
+    std::cout << "normalize(a).x = " << normalize(a).x << " (期望: 0.6)\n";
+    std::cout << "dot(a, b) = " << dot(a, b) << " (期望: 0)\n";
+    std::cout << "angle = " << angleBetween(a, b) << " (期望: ~1.5708)\n";
+}
+}
+
+// 🟡 进阶题：视野锥 + 投影
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+
+struct Vec2 {
+    float x, y;
+    Vec2 operator-(const Vec2& v) const { return {x-v.x, y-v.y}; }
+    Vec2 operator*(float s) const { return {x*s, y*s}; }
+};
+float lengthSq(Vec2 v) { return v.x*v.x + v.y*v.y; }
+float length(Vec2 v) { return std::sqrt(lengthSq(v)); }
+Vec2 normalize(Vec2 v) { float l = length(v); return l>1e-8f ? Vec2{v.x/l,v.y/l} : Vec2{0,0}; }
+float dot(Vec2 a, Vec2 b) { return a.x*b.x + a.y*b.y; }
+
+/*
+ * TODO: 实现 isInFOV
+ * 判断 target 是否在以 player 为原点、forward 为中心方向的视野锥内。
+ * fovDeg: 视野总角度(度), maxDist: 最大视距
+ * 条件：角度 AND 距离都满足才返回 true
+ */
+bool isInFOV(Vec2 player, Vec2 forward, Vec2 target,
+             float fovDeg, float maxDist) {
+    /* TODO */
+    return false;
+}
+
+int main() {
+    Vec2 player{0,0}, forward{1,0};
+    Vec2 e1{5,1}, e2{-3,0}, e3{100,0};
+    std::cout << "e1 可见: " << isInFOV(player,forward,e1,90,20) << " (期望: 1)\n";
+    std::cout << "e2 可见: " << isInFOV(player,forward,e2,90,20) << " (期望: 0)\n";
+    std::cout << "e3 可见: " << isInFOV(player,forward,e3,90,20) << " (期望: 0)\n";
+}
+}
+
+// 🔴 挑战题：FPS 沿墙滑动系统
+
+在 FPS 游戏中，角色撞墙后不应完全停止，而是沿墙面滑动。利用向量投影实现：给定角色期望速度向量和碰撞墙面法线，计算滑动后的速度（去掉法线分量，保留切线分量）。扩展考虑多墙面同时碰撞（角落卡住）的处理策略。
+
+\collapse[🤔 参考思路]{
+滑动速度 = 原速度 - 原速度在法线方向上的投影。即 `slideVel = vel - normal * dot(vel, normal)`（法线须为单位向量）。角落情况：连续对两个法线做投影；如果两次投影后速度接近零则停止。
+}
+
+向量是所有游戏数学的地基——下一节我们在此基础上构建矩阵变换，将平移、旋转、缩放统一为矩阵乘法。

@@ -1,0 +1,649 @@
+/// 简介
+
+上一节学了顺序容器和关联容器，你已经能把数据装进合适的"箱子"里了。但问题来了：STL 有几十种算法（`sort`、`find`、`copy`……），难道每种容器都得写一套专用版本？
+
+答案是不用——因为有**迭代器（Iterator）**。迭代器是容器与算法之间的"万能适配器"：算法只认迭代器接口，不关心底层是 `vector`、`list` 还是 `map`。你可以把迭代器想象成一根**指向容器元素的智能指针**——它知道怎么前进、后退、读写当前元素，但对容器的具体实现一无所知。这种解耦让 N 个容器 × M 个算法只需 N + M 份代码，而非 N × M 份。
+
+这一节我们从"为什么需要迭代器"出发，逐步掌握六种迭代器类别、半开区间模型、常用操作、反向/常量迭代器、失效规则、适配器，以及 C++20 引入的 Sentinel 新模型。
+
+/// 知识点列表
+
+\list{
+- 迭代器的概念与分类 — Input / Output / Forward / Bidirectional / RandomAccess / Contiguous
+- begin()/end() 与半开区间 — 为什么 end() 指向"最后一个之后"
+- 迭代器基本操作 — ++、--、*、->、advance、distance、next、prev
+- 反向迭代器 — reverse_iterator、rbegin/rend
+- 常量迭代器 — const_iterator、cbegin/cend
+- 迭代器失效规则 — 各容器插入/删除时的失效汇总
+- 迭代器适配器 — back_inserter、front_inserter、inserter
+- C++20 Sentinel 与 ranges 迭代模型 — 新一代迭代器设计
+}
+
+/// 知识点详解
+
+// 迭代器的概念与分类
+
+**动机：** 假设你要写一个 `print_all()` 函数打印容器所有元素。如果针对 `vector` 用下标、针对 `list` 用节点指针……每加一种容器就得重写一遍。迭代器统一了"遍历"的接口，让一份代码适用所有容器。
+
+C++ 标准将迭代器分为**六个类别（Iterator Categories）**，从弱到强形成层次：
+
+\diagram[tree]{
+root: 迭代器类别层次
+  L: InputIterator（输入迭代器）
+    L: ForwardIterator（前向迭代器）
+      L: BidirectionalIterator（双向迭代器）
+        L: RandomAccessIterator（随机访问迭代器）
+          L: ContiguousIterator（连续迭代器，C++20）
+  R: OutputIterator（输出迭代器）
+}
+
+\table{
+类别 | 可读 | 可写 | 单遍/多遍 | 方向 | 随机跳转 | 代表容器/适配器
+---
+InputIterator | ✅ | ❌ | 单遍 | 前进 | ❌ | `istream_iterator`
+OutputIterator | ❌ | ✅ | 单遍 | 前进 | ❌ | `ostream_iterator`、`back_inserter`
+ForwardIterator | ✅ | ✅ | 多遍 | 前进 | ❌ | `forward_list`、`unordered_map`
+BidirectionalIterator | ✅ | ✅ | 多遍 | 双向 | ❌ | `list`、`set`、`map`
+RandomAccessIterator | ✅ | ✅ | 多遍 | 双向 | ✅ | `vector`、`deque`、`array`
+ContiguousIterator | ✅ | ✅ | 多遍 | 双向 | ✅ | `vector`、`array`、`string`
+}
+
+**ContiguousIterator（连续迭代器）** 是 C++20 新增的最强类别，要求元素在内存中连续存放。`vector`、`array`、`string` 的迭代器都属于此类。
+
+\note{高级别迭代器**兼容**低级别的要求——一个 RandomAccessIterator 自然也能当 ForwardIterator 用。算法声明所需的最低级别，越低级别适用的容器越多。}
+
+// begin()/end() 与半开区间
+
+**动机：** 遍历容器时最容易犯的错是"差一"（off-by-one）。STL 用**半开区间（Half-Open Range）** `[begin, end)` 统一解决这个问题——`begin()` 指向第一个元素，`end()` 指向最后一个元素**之后**的位置。
+
+\diagram[flow]{
+元素:  [A] [B] [C] [D]
+        ↑               ↑
+     begin()          end()
+     
+半开区间 [begin, end) 包含 A B C D，不包含 end 处
+}
+
+这个设计有三个好处：
+
+\list{
+- **空范围判断简单：** `begin() == end()` 就是空容器，不需要特殊处理。
+- **循环终止条件统一：** `for (auto it = c.begin(); it != c.end(); ++it)` 适用于所有容器。
+- **区间长度 = end - begin：** 对 RandomAccess 迭代器直接做减法就能得到元素个数。
+}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <list>
+
+int main() {
+    std::vector<int> v = {10, 20, 30, 40};
+
+    // begin() 指向第一个元素
+    std::cout << "*v.begin() = " << *v.begin() << "\n";  // 10
+
+    // end() 指向最后一个元素之后——不能解引用！
+    // std::cout << *v.end();  // UB！千万别这么做
+
+    // 半开区间遍历
+    for (auto it = v.begin(); it != v.end(); ++it) {
+        std::cout << *it << " ";
+    }
+    std::cout << "\n";  // 10 20 30 40
+
+    // 空容器：begin() == end()
+    std::vector<int> empty_v;
+    std::cout << "空? " << (empty_v.begin() == empty_v.end()) << "\n";  // 1
+
+    // 区间长度
+    std::cout << "长度: " << (v.end() - v.begin()) << "\n";  // 4
+    return 0;
+}
+}
+
+\danger{**`end()` 迭代器永远不能解引用！** `*v.end()` 是未定义行为（UB）。`end()` 是一个"哨兵"，仅用于标记终点。}
+
+// 迭代器基本操作
+
+迭代器的核心操作分为两类：**运算符操作**和**辅助函数**。
+
+\table{
+操作 | 含义 | 最低要求
+---
+`*it` | 读/写当前元素 | Input/Output
+`it->member` | 访问当前元素的成员 | Input
+`++it` / `it++` | 前进一步 | Input/Output
+`--it` / `it--` | 后退一步 | Bidirectional
+`it + n` / `it - n` | 跳转 n 步 | RandomAccess
+`it[n]` | 等价于 `*(it + n)` | RandomAccess
+`it1 - it2` | 两迭代器间距 | RandomAccess
+`it1 < it2` | 位置比较 | RandomAccess
+}
+
+但直接用 `+n` 或 `--` 在非 RandomAccess 迭代器上会编译报错。标准库提供了**泛型辅助函数**，自动根据迭代器类别选择最优实现：
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <list>
+#include <iterator>  // std::advance, std::distance, std::next, std::prev
+
+int main() {
+    // === vector: RandomAccessIterator ===
+    std::vector<int> v = {10, 20, 30, 40, 50};
+    auto vit = v.begin();
+
+    std::advance(vit, 3);         // 前进3步，RandomAccess时 O(1)
+    std::cout << "*vit = " << *vit << "\n";  // 40
+
+    auto d = std::distance(v.begin(), v.end());  // 5, O(1)
+    std::cout << "distance = " << d << "\n";
+
+    auto nxt = std::next(v.begin(), 2);   // 不修改原迭代器，返回新迭代器
+    auto prv = std::prev(v.end(), 1);     // end前一个
+    std::cout << "next(begin,2) = " << *nxt << "\n";  // 30
+    std::cout << "prev(end,1) = " << *prv << "\n";    // 50
+
+    // === list: BidirectionalIterator ===
+    std::list<std::string> names = {"Alice", "Bob", "Carol", "Dave"};
+    auto lit = names.begin();
+
+    // lit + 2;  // 编译错误！list 迭代器不支持 + 运算
+    std::advance(lit, 2);                  // OK，内部逐步 ++，O(n)
+    std::cout << "*lit = " << *lit << "\n";  // Carol
+
+    auto d2 = std::distance(names.begin(), names.end());  // 4, O(n)
+    std::cout << "list distance = " << d2 << "\n";
+    return 0;
+}
+}
+
+\tip{**优先用 `std::next` / `std::prev` 而非 `std::advance`。** 前两者返回新迭代器、不修改原值，更安全；`advance` 就地修改，容易丢失原始位置。}
+
+// 反向迭代器
+
+**动机：** 游戏排行榜要从高到低显示分数。当然可以先 `sort` 再反向，但如果只是想反向遍历已有容器呢？**反向迭代器（Reverse Iterator）** 让你以相反方向遍历，`++` 变成向前走，`--` 变成向后走。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+int main() {
+    std::vector<int> scores = {85, 92, 78, 99, 61};
+
+    std::cout << "正序: ";
+    for (auto it = scores.begin(); it != scores.end(); ++it)
+        std::cout << *it << " ";
+    std::cout << "\n";
+
+    std::cout << "倒序: ";
+    for (auto it = scores.rbegin(); it != scores.rend(); ++it)
+        std::cout << *it << " ";  // 61 99 78 92 85
+    std::cout << "\n";
+
+    // 反向迭代器 → 正向迭代器：.base()
+    auto rit = std::find(scores.rbegin(), scores.rend(), 78);
+    if (rit != scores.rend()) {
+        auto fwd = rit.base();  // 注意：base() 指向 rit 的下一个正向位置
+        std::cout << "78 的下一个正向元素: " << *fwd << "\n";  // 99
+    }
+    return 0;
+}
+}
+
+\warning{**`rit.base()` 并不指向 `rit` 同一个元素！** 如果 `rit` 指向元素 X，则 `rit.base()` 指向 X 的下一个正向位置。要删除反向迭代器指向的元素，需要 `v.erase(std::prev(rit.base()))`。}
+
+// 常量迭代器
+
+**动机：** 有时你只想读取容器元素，明确禁止修改——这就是 **`const_iterator`（常量迭代器）** 的用途。它保证通过该迭代器只能读、不能写，帮助编译器捕获意外的修改操作。
+
+\code[cpp]{
+std::vector<int> v = {1, 2, 3};
+
+// 方式1：auto 从 const 容器推导
+const std::vector<int>& cv = v;
+auto it1 = cv.begin();   // 自动得到 const_iterator
+// *it1 = 10;            // 编译错误！
+
+// 方式2：显式使用 cbegin/cend（C++11）—— 推荐
+auto it2 = v.cbegin();   // 无论 v 是否 const，都得到 const_iterator
+// *it2 = 10;            // 编译错误！
+
+// 方式3：显式类型
+std::vector<int>::const_iterator it3 = v.begin();
+}
+
+\tip{**只读遍历时，始终用 `cbegin()` / `cend()`。** 这比依赖 `const&` 更明确地表达意图，也帮助编译器做优化。}
+
+// 迭代器失效规则
+
+**动机：** 容器在插入或删除元素时，底层内存可能重新分配或节点被销毁，之前获取的迭代器就变成了"悬空指针"——继续使用就是**未定义行为（UB）**。**迭代器失效（Iterator Invalidation）** 是 C++ 中最常见的运行时 bug 来源之一。
+
+\table{
+容器 | 插入操作 | 删除操作
+---
+vector | 扩容：**全部失效**；未扩容：插入点及之后失效 | 被删元素及之后**全部失效**
+deque | 头尾插入：迭代器失效，引用不变；中间插入：**全部失效** | 头尾删除：仅被删元素；中间删除：**全部失效**
+list / forward_list | **不影响**任何已有迭代器 ✅ | 仅被删元素失效 ✅
+set / map | **不影响**任何已有迭代器 ✅ | 仅被删元素失效 ✅
+unordered_set / unordered_map | 不 rehash：不影响；rehash：**全部失效** | 仅被删元素失效
+}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+
+int main() {
+    // 经典错误：边遍历 vector 边删除
+    std::vector<int> hp = {100, 0, 80, 0, 60, 0};
+
+    // ❌ 错误写法 —— erase 后 it 失效，++it 是 UB
+    // for (auto it = hp.begin(); it != hp.end(); ++it) {
+    //     if (*it == 0) hp.erase(it);  // UB!
+    // }
+
+    // ✅ 正确写法 —— 接住 erase 的返回值
+    for (auto it = hp.begin(); it != hp.end(); ) {
+        if (*it == 0)
+            it = hp.erase(it);  // erase 返回下一个有效迭代器
+        else
+            ++it;
+    }
+
+    for (int h : hp) std::cout << h << " ";  // 100 80 60
+    std::cout << "\n";
+    return 0;
+}
+}
+
+\danger{**黄金法则：对容器做了插入/删除后，不要再使用之前保存的迭代器、指针或引用。** 要么接住返回值，要么重新获取。}
+
+// 迭代器适配器
+
+**动机：** 算法（如 `std::copy`）通过迭代器写入目标位置。但如果目标容器是空的，写哪里？**迭代器适配器（Iterator Adaptor）** 像一个"自动扩容的写入口"，每次赋值时自动调用容器的插入操作。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <deque>
+#include <list>
+#include <iterator>   // back_inserter, front_inserter, inserter
+#include <algorithm>  // copy, transform
+
+int main() {
+    std::vector<int> src = {10, 20, 30, 40, 50};
+
+    // back_inserter: 每次赋值调用 push_back
+    std::vector<int> dst1;
+    std::copy(src.begin(), src.end(), std::back_inserter(dst1));
+    // dst1 = {10, 20, 30, 40, 50}
+
+    // front_inserter: 每次赋值调用 push_front（仅 deque/list）
+    std::deque<int> dst2;
+    std::copy(src.begin(), src.end(), std::front_inserter(dst2));
+    // dst2 = {50, 40, 30, 20, 10} —— 注意顺序反过来了！
+
+    // inserter: 在指定位置插入
+    std::list<int> dst3 = {0, 100};
+    std::copy(src.begin(), src.end(), std::inserter(dst3, std::next(dst3.begin())));
+    // dst3 = {0, 10, 20, 30, 40, 50, 100}
+
+    std::cout << "back_inserter: ";
+    for (int x : dst1) std::cout << x << " ";
+    std::cout << "\nfront_inserter: ";
+    for (int x : dst2) std::cout << x << " ";
+    std::cout << "\ninserter: ";
+    for (int x : dst3) std::cout << x << " ";
+    std::cout << "\n";
+    return 0;
+}
+}
+
+\collapse[🤔 move_iterator 是什么？]{
+`std::move_iterator`（C++11）包装普通迭代器，使得解引用时返回右值引用。配合 `std::move` 算法，可以把一个容器的元素**移动**到另一个容器中，避免深拷贝。适用于存储大对象（如 `std::string`、`std::vector`）的容器。
+
+\code[cpp]{
+std::vector<std::string> from = {"hello", "world"};
+std::vector<std::string> to(
+    std::make_move_iterator(from.begin()),
+    std::make_move_iterator(from.end())
+);
+// from 中的 string 已被移走（变为空串）
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17：全局 std::size / std::data / std::empty
+
+\code[cpp]{
+#include <iterator>
+#include <vector>
+
+std::vector<int> v = {1, 2, 3};
+int arr[] = {10, 20, 30};
+
+auto s1 = std::size(v);     // 3 —— 对容器和 C 数组都有效
+auto s2 = std::size(arr);   // 3
+auto p  = std::data(v);     // 等价于 v.data()
+bool e  = std::empty(v);    // 等价于 v.empty()
+}
+
+// C++20：概念约束 + Sentinel 模型
+
+C++20 对迭代器系统做了两大革新：
+
+**1. 用 Concepts 替代 Tag Dispatch：** 传统迭代器分类靠 `iterator_category` 类型标签做编译期分派，错误信息晦涩难懂。C++20 引入了一组**迭代器概念（Iterator Concepts）**，用 `requires` 约束，编译报错更清晰。
+
+\tabs{
+\tab[传统 Tag Dispatch]{
+\code[cpp]{
+// C++17及之前：用 iterator_traits 标签
+template<typename Iter>
+void my_sort(Iter first, Iter last) {
+    // 如果 Iter 不是 RandomAccess，报错信息一长串模板展开……
+    using category = typename std::iterator_traits<Iter>::iterator_category;
+    static_assert(std::is_same_v<category, std::random_access_iterator_tag>,
+                  "需要随机访问迭代器");
+}
+}
+}
+\tab[C++20 Concepts]{
+\code[cpp]{
+#include <iterator>
+
+// C++20：直接用 concept 约束，报错只有一行
+template<std::random_access_iterator Iter>
+void my_sort(Iter first, Iter last) {
+    // Iter 不满足 random_access_iterator 时，编译器直接说
+    // "Iter does not satisfy random_access_iterator"
+}
+
+// 完整的概念层次：
+// std::input_iterator
+// std::forward_iterator
+// std::bidirectional_iterator
+// std::random_access_iterator
+// std::contiguous_iterator  ← C++20 新增最强级别
+}
+}
+}
+
+**2. Sentinel（哨兵）模型：** 传统 STL 要求 `begin` 和 `end` 类型相同。C++20 的 **Sentinel（哨兵）** 允许 `end` 用不同类型表示终止条件——比如遍历 C 字符串到 `'\0'` 结束，不再需要提前计算长度。
+
+\run[cpp20]{
+#include <iostream>
+#include <ranges>
+#include <vector>
+#include <algorithm>
+
+int main() {
+    // ranges 算法接受 (iterator, sentinel) 对
+    std::vector<int> v = {5, 3, 8, 1, 9, 2, 7};
+
+    // 传统写法：std::sort(v.begin(), v.end());
+    // ranges 写法：直接传容器
+    std::ranges::sort(v);
+
+    for (int x : v) std::cout << x << " ";  // 1 2 3 5 7 8 9
+    std::cout << "\n";
+
+    // ranges 的强大之处：惰性组合视图
+    auto result = v
+        | std::views::filter([](int x) { return x > 3; })
+        | std::views::transform([](int x) { return x * 10; });
+    // result 不做任何计算——直到遍历时才按需求值
+
+    std::cout << "过滤>3并*10: ";
+    for (int x : result) std::cout << x << " ";  // 50 70 80 90
+    std::cout << "\n";
+    return 0;
+}
+}
+
+// C++23 改进
+
+\code[cpp]{
+// std::views::zip —— 将多个范围"拉链"合并
+// std::views::enumerate —— 带索引遍历（类似 Python 的 enumerate）
+// std::views::chunk —— 将范围分成固定大小的块
+
+#include <ranges>
+#include <vector>
+#include <string>
+
+std::vector<std::string> names = {"Alice", "Bob", "Carol"};
+// C++23: for (auto [i, name] : std::views::enumerate(names)) { ... }
+// 比手动维护索引计数器优雅得多
+}
+
+/// 工程实践
+
+// 游戏中的迭代器最佳实践
+
+\list{
+- **遍历实体列表时禁止插入/删除。** 先把需要新增/销毁的实体 ID 记到临时列表，遍历结束后统一处理。
+- **优先用范围 for（`for (auto& x : container)`）。** 除非需要迭代器控制跳跃或删除，否则范围 for 最简洁、最不容易出错。
+- **操作链用 ranges 管道。** C++20 的 `views::filter | views::transform` 比手写循环更可读，且零拷贝。
+- **用 `std::span` 传递"视图"而非迭代器对。** 需要传一段连续内存时，`span<T>` 比 `(begin, end)` 更安全、更直观。
+}
+
+\code[cpp]{
+// 实战示例：遍历时标记→遍历后批量删除
+struct Entity {
+    int id;
+    int hp;
+    bool marked_for_removal = false;
+};
+
+void update_entities(std::vector<Entity>& entities) {
+    // 阶段1：遍历并标记
+    for (auto& e : entities) {
+        if (e.hp <= 0)
+            e.marked_for_removal = true;
+    }
+    // 阶段2：批量删除（C++20）
+    std::erase_if(entities, [](const Entity& e) {
+        return e.marked_for_removal;
+    });
+}
+}
+
+\tip{**在性能敏感的游戏循环中，避免对大容器频繁调用 `std::distance()`。** 对于 `list` 和 `forward_list`，`distance` 是 O(n) 操作。如果经常需要大小信息，自己维护一个计数器。}
+
+/// 难点易错点分析
+
+\danger{**陷阱1：解引用 end() 迭代器。** `end()` 指向最后一个元素之后，解引用它是 UB。循环条件应该用 `it != end()`，而不是 `it <= end()`（后者也是错的，只有 RandomAccess 才支持 `<`，且不应该用）。}
+
+\danger{**陷阱2：对 list 迭代器用 `+` 运算符。** `list` 的迭代器是 BidirectionalIterator，不支持 `it + n`。必须用 `std::advance(it, n)` 或 `std::next(it, n)`。编译错误信息可能很长，记住根因就是"级别不够"。}
+
+\danger{**陷阱3：reverse_iterator 的 base() 偏移。** `rit.base()` 指向 `rit` 所指元素的**下一个**正向位置。要在 vector 中 erase 反向迭代器指向的元素，正确写法是 `v.erase(std::prev(rit.base()))`。}
+
+\danger{**陷阱4：边遍历边修改容器。** 对 vector/deque 做 `insert` / `erase` 会导致迭代器失效。必须用返回值更新迭代器（`it = v.erase(it)`），或改用 C++20 `std::erase_if`。}
+
+\danger{**陷阱5：front_inserter 反转顺序。** `std::copy` + `front_inserter` 会让目标容器元素顺序反转（每个元素都插到头部）。想保持原序就用 `back_inserter`。}
+
+\quiz[choice|单选]{
+Q: 以下代码能否编译通过？如果能，输出什么？
+```cpp
+std::list<int> lst = {10, 20, 30};
+auto it = lst.begin() + 2;
+std::cout << *it;
+```
+A: 编译通过，输出 30
+B: 编译错误：list 迭代器不支持 + 运算
+C: 编译通过，但运行时崩溃
+D: 编译通过，输出 20
+ANS: B
+EXP: `std::list` 的迭代器是 BidirectionalIterator，只支持 `++` 和 `--`，不支持 `+n`。应改用 `std::next(lst.begin(), 2)`。
+}
+
+\quiz[tf|判断]{
+Q: `cbegin()` 返回的迭代器不能用 `++` 前进。
+ANS: F
+EXP: `cbegin()` 返回 `const_iterator`，"const"限制的是**不能通过它修改元素**（不能 `*it = x`），而不是不能移动。`++`、`--`、`advance` 等移动操作完全正常。
+}
+
+\quiz[choice|单选]{
+Q: 执行以下代码后，`*rit` 和 `*(rit.base())` 分别是什么？
+```cpp
+std::vector<int> v = {10, 20, 30, 40};
+auto rit = std::make_reverse_iterator(v.begin() + 3);  // rit 指向 v[2]=30
+```
+A: *rit = 30, *rit.base() = 30
+B: *rit = 30, *rit.base() = 40
+C: *rit = 40, *rit.base() = 30
+D: *rit = 40, *rit.base() = 40
+ANS: B
+EXP: `make_reverse_iterator(v.begin()+3)` 创建的反向迭代器指向 `v.begin()+3` 的前一个元素，即 `v[2]=30`。而 `rit.base()` 返回原始正向迭代器 `v.begin()+3`，指向 `v[3]=40`。这就是 base() 的"偏移一位"特性。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：用迭代器遍历并过滤敌人
+
+使用迭代器遍历敌人列表，找出所有血量低于阈值的敌人并统计数量。要求使用 `cbegin/cend`（只读遍历）。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+
+struct Enemy {
+    std::string name;
+    int hp;
+};
+
+int main() {
+    std::vector<Enemy> enemies = {
+        {"哥布林", 30}, {"骷髅兵", 80}, {"蝙蝠", 15},
+        {"巨魔", 200}, {"史莱姆", 10}, {"骑士", 150}
+    };
+    int threshold = 50;
+
+    // TODO: 用 cbegin/cend 遍历，打印 hp < threshold 的敌人名字
+    // TODO: 统计并输出数量
+    // 预期输出：
+    //   低血量敌人: 哥布林(30) 蝙蝠(15) 史莱姆(10)
+    //   共 3 个
+
+    return 0;
+}
+}
+
+// 🟢 基础题 2：反向排行榜
+
+将玩家分数从高到低显示，使用反向迭代器。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+int main() {
+    std::vector<std::pair<std::string, int>> players = {
+        {"Alice", 850}, {"Bob", 1200}, {"Carol", 920}, {"Dave", 760}
+    };
+
+    // TODO 1: 用 std::sort 按分数从小到大排序
+    //         提示：自定义比较函数，比较 .second
+
+    // TODO 2: 用 rbegin/rend 反向遍历，输出排行榜（从高到低）
+    // 预期输出：
+    //   #1 Bob: 1200
+    //   #2 Carol: 920
+    //   #3 Alice: 850
+    //   #4 Dave: 760
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：安全的实体删除器
+
+实现一个函数，从 `vector<Entity>` 中删除所有 `hp <= 0` 的实体。**不允许使用 C++20 的 `std::erase_if`**，必须手动用迭代器 + `erase` 实现。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+
+struct Entity {
+    std::string name;
+    int hp;
+};
+
+void remove_dead(std::vector<Entity>& entities) {
+    // TODO: 用迭代器遍历，erase 所有 hp <= 0 的实体
+    // 关键：正确处理迭代器失效！
+    // 提示：it = entities.erase(it) 返回下一个有效迭代器
+}
+
+int main() {
+    std::vector<Entity> entities = {
+        {"战士", 100}, {"法师", 0}, {"弓箭手", 80},
+        {"盗贼", -10}, {"牧师", 50}, {"蛮族", 0}
+    };
+
+    std::cout << "删除前: " << entities.size() << " 个实体\n";
+    remove_dead(entities);
+    std::cout << "删除后: " << entities.size() << " 个实体\n";
+    for (const auto& e : entities)
+        std::cout << "  " << e.name << " HP=" << e.hp << "\n";
+    // 预期：战士(100), 弓箭手(80), 牧师(50) 共 3 个
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：用迭代器适配器合并战利品
+
+将多个怪物掉落的战利品列表合并到玩家背包中，使用 `back_inserter` 和 `inserter`。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <list>
+#include <string>
+#include <iterator>
+#include <algorithm>
+
+int main() {
+    std::vector<std::string> backpack = {"铁剑", "生命药水"};
+    std::vector<std::string> loot_goblin = {"金币", "木盾"};
+    std::list<std::string> loot_dragon = {"龙鳞", "火焰宝石", "传说之剑"};
+
+    // TODO 1: 用 std::copy + back_inserter 将哥布林掉落追加到 backpack 尾部
+
+    // TODO 2: 用 std::copy + inserter 将龙的掉落插入到 backpack 的第2个位置
+    //         （铁剑之后、生命药水之前）
+
+    std::cout << "最终背包:\n";
+    for (const auto& item : backpack)
+        std::cout << "  " << item << "\n";
+    // 预期顺序: 铁剑, 龙鳞, 火焰宝石, 传说之剑, 生命药水, 金币, 木盾
+    return 0;
+}
+}
+
+// 🔴 挑战题：泛型 Range 工具库
+
+设计一个小型泛型工具库，包含以下函数模板，要求使用 C++20 concepts 约束迭代器类别：
+
+\list{
+- `print_range(begin, end, separator)` — 打印任意范围，约束 `std::input_iterator`
+- `find_nth(begin, end, value, n)` — 找到第 n 次出现的元素，约束 `std::forward_iterator`（需多遍扫描）
+- `reverse_in_place(begin, end)` — 就地反转，约束 `std::bidirectional_iterator`
+- `shuffle_range(begin, end)` — 随机打乱，约束 `std::random_access_iterator`
+- 为你的工具库编写测试，分别用 `vector`、`list`、`forward_list` 验证
+}
+
+\collapse[💡 参考思路]{
+1. 用 `template<std::input_iterator Iter>` 约束参数类型。
+2. `find_nth` 需要多遍遍历同一范围，所以至少需要 ForwardIterator。
+3. `reverse_in_place` 用双指针法：首尾交替 swap 并向中间收缩，需要 `--` 支持。
+4. `shuffle_range` 内部用 `std::swap(*(begin + i), *(begin + j))`，需要 `+ n` 支持。
+5. 编译时如果传入不满足约束的迭代器（如 `forward_list` 传给 `shuffle_range`），编译器会给出清晰的 concept 错误——这正是 C++20 concept 的价值。
+}

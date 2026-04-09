@@ -1,0 +1,239 @@
+/// 简介
+
+本项目综合运用并发编程板块的全部知识，构建一个**游戏引擎风格的多线程任务调度系统（Job System）**。你将实现线程池、任务依赖图、帧同步屏障和性能追踪——这是现代游戏引擎（Unreal、Unity DOTS、自研引擎）的核心基础设施。
+
+/// 项目需求
+
+**项目名称：TaskForge — 多线程任务调度引擎**
+
+实现一个支持任务依赖、优先级调度和帧同步的任务调度器，包含以下核心组件：
+
+\list{
+- **ThreadPool**：固定数量的工作线程，从优先级队列中取任务执行
+- **Task / TaskId**：任务单元，包含工作函数、优先级、依赖列表
+- **TaskGraph**：有向无环图（DAG）调度，依赖满足后自动入队
+- **FrameScheduler**：按阶段（Physics→AI→Animation→Render）执行，每阶段用 barrier 同步
+- **PerformanceTracer**：记录每个任务的线程ID、开始/结束时间，输出文本时间线
+}
+
+架构示意：
+
+\diagram[flow]{
+FrameScheduler -> TaskGraph -> ThreadPool
+TaskGraph: 解析依赖 -> 就绪任务入队
+ThreadPool: Worker 取任务 -> 执行 -> 通知后续任务
+PerformanceTracer: 记录每个任务的时间线
+帧同步: barrier 等待本阶段所有任务完成
+}
+
+/// 技术要求
+
+\table{
+C++ 特性 | 使用场景
+---
+`std::jthread` + `stop_token` | 工作线程（支持优雅关闭）
+`std::mutex` + `lock_guard` | 任务队列保护
+`std::condition_variable` | 工作线程等待新任务
+`std::atomic<int>` | 任务依赖计数（waitCount）
+`std::barrier` | 帧阶段同步点
+`std::latch` | waitAll 等待所有任务完成
+`alignas(64)` | 避免 false sharing（原子计数器）
+`thread_local` | 每线程性能计数器
+`std::chrono` | 高精度时间测量
+}
+
+项目目录结构：
+
+\code[text]{
+taskforge/
+├── CMakeLists.txt
+├── include/
+│   ├── task.h           // Task, TaskId, TaskPriority
+│   ├── thread_pool.h    // ThreadPool
+│   ├── task_graph.h     // TaskGraph (DAG 调度)
+│   ├── frame_scheduler.h // FrameScheduler
+│   └── tracer.h         // PerformanceTracer
+├── src/
+│   ├── thread_pool.cpp
+│   ├── task_graph.cpp
+│   ├── frame_scheduler.cpp
+│   └── tracer.cpp
+├── tests/
+│   ├── test_pool.cpp
+│   ├── test_graph.cpp
+│   └── test_frame.cpp
+└── main.cpp             // 演示完整帧调度流程
+}
+
+CMakeLists.txt 参考：
+
+\code[cmake]{
+cmake_minimum_required(VERSION 3.20)
+project(TaskForge LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+add_executable(taskforge
+    src/thread_pool.cpp src/task_graph.cpp
+    src/frame_scheduler.cpp src/tracer.cpp main.cpp)
+target_include_directories(taskforge PRIVATE include)
+target_compile_options(taskforge PRIVATE -Wall -Wextra -pthread)
+target_link_libraries(taskforge PRIVATE pthread)
+
+# TSan 验证
+add_executable(taskforge_tsan ${ALL_SOURCES})
+target_compile_options(taskforge_tsan PRIVATE -fsanitize=thread -g -O1)
+target_link_options(taskforge_tsan PRIVATE -fsanitize=thread)
+}
+
+/// 实现提示
+
+**1. Task 与 TaskId**
+
+\code[cpp]{
+enum class TaskPriority : uint8_t { Low, Normal, High, Critical };
+
+struct TaskId {
+    uint32_t index;
+    uint32_t generation; // 区分回收后复用的同一 index
+    bool operator==(const TaskId&) const = default;
+};
+
+struct Task {
+    using Func = std::function<void()>;
+    TaskId id;
+    Func work;
+    TaskPriority priority = TaskPriority::Normal;
+    std::string name;                  // 调试用
+    std::vector<TaskId> dependencies;
+    alignas(64) std::atomic<int> depCount{0}; // 未完成依赖数
+    std::vector<Task*> successors;     // 完成后通知谁
+};
+}
+
+**2. TaskGraph 核心逻辑**
+
+\code[cpp]{
+void TaskGraph::submit(ThreadPool& pool) {
+    // 1. 扫描图，计算每个任务的 depCount
+    // 2. depCount==0 的任务直接入队
+    // 3. 任务完成后回调：对所有 successors 做 fetch_sub
+    //    当 successor.depCount 降为 0 → 入队
+}
+
+bool TaskGraph::hasCycle() const {
+    // 拓扑排序（Kahn 算法）——无法排完则有环
+}
+}
+
+**3. FrameScheduler 阶段执行**
+
+\code[cpp]{
+void FrameScheduler::executeFrame() {
+    for (auto phase : {Phase::Physics, Phase::AI, Phase::Animation, Phase::Render}) {
+        // 提交本阶段的所有任务到线程池
+        submitPhaseTasks(phase);
+        // barrier 同步——等待本阶段所有任务完成
+        frameBarrier_.arrive_and_wait();
+    }
+}
+}
+
+**4. PerformanceTracer（RAII 追踪）**
+
+\code[cpp]{
+class ScopedTrace {
+    PerformanceTracer& tracer_;
+    TraceEvent event_;
+public:
+    ScopedTrace(PerformanceTracer& t, std::string_view name)
+        : tracer_(t), event_{std::string(name), threadId(), Clock::now(), {}} {}
+    ~ScopedTrace() {
+        event_.end = Clock::now();
+        tracer_.addEvent(std::move(event_));
+    }
+};
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+线程池正确性 | 20 | 任务全部执行、无遗漏、stop_token 优雅关闭、无死锁
+任务依赖（DAG） | 20 | 拓扑排序正确、循环检测、depCount 原子更新、依赖完成自动触发
+帧同步机制 | 15 | barrier 正确使用、阶段间严格顺序、无竞态
+原子操作与无竞争 | 15 | depCount 用 atomic、alignas 避免 false sharing、TSan 零报告
+性能追踪 | 15 | RAII 记录时间、文本时间线输出、数据合理
+代码质量 | 15 | jthread、RAII、现代 C++ 风格、命名规范、注释清晰
+}
+
+/// 测试场景
+
+以下测试场景必须全部通过：
+
+\code[cpp]{
+// 测试1：基础线程池
+void testPool() {
+    ThreadPool pool(4);
+    std::atomic<int> sum{0};
+    for (int i = 0; i < 100; ++i)
+        pool.submit([&sum]{ sum.fetch_add(1); });
+    pool.waitIdle();
+    assert(sum == 100);
+}
+
+// 测试2：任务依赖图
+void testGraph() {
+    ThreadPool pool(4);
+    TaskGraph graph;
+    std::vector<int> order;
+    std::mutex mtx;
+
+    auto a = graph.createTask([&]{ lock_guard l(mtx); order.push_back(1); }, "A");
+    auto b = graph.createTask([&]{ lock_guard l(mtx); order.push_back(2); }, "B");
+    auto c = graph.createTask([&]{ lock_guard l(mtx); order.push_back(3); }, "C");
+    graph.addDependency(c, a); // C 依赖 A
+    graph.addDependency(c, b); // C 依赖 B
+    assert(!graph.hasCycle());
+
+    graph.submit(pool);
+    graph.waitAll();
+    assert(order.back() == 3); // C 一定最后执行
+}
+
+// 测试3：帧调度（10 帧压力测试）
+void testFrameScheduler() {
+    ThreadPool pool(4);
+    FrameScheduler sched(pool);
+    for (int f = 0; f < 10; ++f) {
+        sched.schedule(Phase::Physics, [f]{ /* 物理 */ });
+        sched.schedule(Phase::AI,      [f]{ /* AI */   });
+        sched.schedule(Phase::Render,  [f]{ /* 渲染 */ });
+        sched.executeFrame(); // 阶段间 barrier 同步
+    }
+}
+
+// 测试4：TSan 验证（用 -fsanitize=thread 编译运行全部测试）
+}
+
+/// 扩展挑战
+
+\list{
+- 实现**工作窃取调度**：每个 worker 有本地队列，空闲时从其他 worker 偷取任务
+- 支持**任务取消**：取消一个任务时自动取消所有依赖它的后续任务
+- 实现 **Chrome Trace JSON** 导出，在 `chrome://tracing` 中可视化任务时间线
+- 添加**内存分配追踪**：每个 worker 使用 thread_local 帧分配器，帧结束时批量释放
+- 实现 **fiber/协程版本**：任务可以 `co_await` 依赖而非阻塞线程
+- 集成前面章节的**自定义内存分配器**，每个 worker 独立内存池
+}
+
+/// 参考资源
+
+\list{
+- 《C++ Concurrency in Action》(Anthony Williams) — 线程池和无锁数据结构的经典参考
+- GDC Talk: "Parallelizing the Naughty Dog Engine Using Fibers" — Naughty Dog 的 fiber-based Job System 架构
+- Intel TBB (oneTBB) — 工业级的并行库，工作窃取实现参考
+- taskflow (GitHub: taskflow/taskflow) — 现代 C++ 静态/动态任务图库
+- 《Game Engine Architecture》(Jason Gregory) — 第15章 多线程引擎架构
+- cppreference: std::barrier, std::latch, std::jthread — C++20 同步原语文档
+}

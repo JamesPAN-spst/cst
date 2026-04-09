@@ -1,0 +1,640 @@
+/// 简介
+
+上一节（copy-move）掌握了移动构造和移动赋值的写法，知道了 `std::move` 能让编译器选择移动而非拷贝。但那只是冰山一角——你是否想过：为什么 `std::move` 明明不"移动"却叫 move？临时对象、`std::move(x)` 和函数返回值，这三者在语言层面有什么本质区别？当你写一个泛型工厂函数想把参数"原封不动"地转发给构造函数时，怎么保证左值还是左值、右值还是右值？
+
+本节从 C++ 的**值类别（Value Categories）**体系出发，深入右值引用的绑定规则、**引用折叠（Reference Collapsing）**、**完美转发（Perfect Forwarding）** 以及 **返回值优化（RVO/NRVO）** 与移动语义的配合关系。这些是理解标准库（如 `std::make_unique`、`emplace_back`）内部实现的基石。
+
+/// 知识点列表
+
+\list{
+- 值类别体系：左值（lvalue）、纯右值（prvalue）、亡值（xvalue）、泛左值（glvalue）、右值（rvalue）
+- 右值引用（&&）的绑定规则与生命期延长
+- 万能引用（Universal Reference）/ 转发引用（Forwarding Reference）
+- 引用折叠规则（Reference Collapsing）
+- std::move 的本质：无条件转换为右值
+- std::forward 与完美转发（Perfect Forwarding）
+- std::move vs std::forward 的使用场景对比
+- 移动语义在容器和算法中的体现
+- 返回值优化（RVO/NRVO）与移动的关系
+}
+
+/// 知识点详解
+
+// 值类别体系
+
+在 copy-move 一节中我们用"有名字 = 左值，临时 = 右值"做了简化。现在该揭开完整图景了。C++11 将所有**表达式（Expression）**分为五种值类别，形成一棵两层的树：
+
+\diagram[flow]{
+表达式 (expression) --> 泛左值 (glvalue)
+表达式 (expression) --> 右值 (rvalue)
+泛左值 (glvalue) --> 左值 (lvalue)
+泛左值 (glvalue) --> 亡值 (xvalue)
+右值 (rvalue) --> 亡值 (xvalue)
+右值 (rvalue) --> 纯右值 (prvalue)
+}
+
+两个核心属性决定分类：
+- **有身份（Identity）**：表达式是否对应一个可取地址的实体？
+- **可移动（Movable）**：表达式的资源是否允许被"窃取"？
+
+\table{
+值类别 | 有身份 | 可移动 | 典型例子
+---
+左值 lvalue | 是 | 否 | 变量名 `x`、`*ptr`、`arr[0]`、字符串字面量 `"hi"`
+亡值 xvalue | 是 | 是 | `std::move(x)`、返回右值引用的函数调用
+纯右值 prvalue | 否 | 是 | 数字字面量 `42`、`x + 1`、`std::string("tmp")`
+泛左值 glvalue | 是 | — | lvalue 和 xvalue 的合称
+右值 rvalue | — | 是 | xvalue 和 prvalue 的合称
+}
+
+为什么需要区分 xvalue 和 prvalue？因为它们的**生命期规则不同**。纯右值在 C++17 中受**强制拷贝消除（Mandatory Copy Elision）**保护，编译器可以直接在目标位置构造对象，完全跳过移动/拷贝。而亡值不受此保护——它指向一个已存在的对象，移动构造函数一定会被调用。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <utility>
+
+struct Tracer {
+    std::string tag;
+    Tracer(std::string t) : tag(std::move(t))
+        { std::cout << "  构造: " << tag << "\n"; }
+    Tracer(const Tracer& o) : tag(o.tag + "(拷贝)")
+        { std::cout << "  拷贝构造: " << tag << "\n"; }
+    Tracer(Tracer&& o) noexcept : tag(std::move(o.tag) + "(移动)")
+        { std::cout << "  移动构造: " << tag << "\n"; }
+    ~Tracer() { std::cout << "  析构: " << tag << "\n"; }
+};
+
+Tracer makeTracer() {
+    return Tracer("临时");  // prvalue — C++17 强制消除
+}
+
+int main() {
+    std::cout << "=== prvalue (纯右值) ===\n";
+    Tracer a = makeTracer();  // C++17: 零次拷贝/移动
+
+    std::cout << "\n=== xvalue (亡值) ===\n";
+    Tracer b = std::move(a);  // xvalue: 移动构造一定被调用
+
+    std::cout << "\n=== lvalue (左值) ===\n";
+    Tracer c = b;             // lvalue: 拷贝构造被调用
+
+    std::cout << "\n=== 析构顺序 ===\n";
+    return 0;
+}
+}
+
+\note{运行上面的程序，观察 prvalue 场景下构造次数——在 C++17 及以上，`makeTracer()` 返回的临时对象直接在 `a` 的位置构造，不触发移动。这就是**强制拷贝消除**的效果。}
+
+// 右值引用的绑定规则
+
+**右值引用（Rvalue Reference）** 用 `T&&` 声明（`T` 是具体类型，不涉及模板推导）。核心绑定规则：右值引用只能绑定**右值**（prvalue 或 xvalue）；`const T&` 是"万金油"可绑定任何值类别；而最反直觉的一点——右值引用变量一旦被命名，**它本身就成了左值**。`int&& r = 42;` 之后，`r` 有名字、可取地址，所以是左值。想再次当右值使用，必须 `std::move(r)`。
+
+\code[cpp]{
+int x = 10;
+
+int& a = x;              // OK: 左值引用绑定左值
+// int& b = 42;           // 错误: 左值引用不能绑定 prvalue
+const int& c = 42;        // OK: const 左值引用可绑定任何值类别
+
+int&& d = 42;             // OK: 右值引用绑定 prvalue
+int&& e = std::move(x);   // OK: 右值引用绑定 xvalue
+// int&& f = x;           // 错误: 右值引用不能绑定左值
+
+// 关键：d 本身是左值！
+// int&& g = d;           // 错误: d 是左值，不能绑定到右值引用
+int&& h = std::move(d);   // OK: std::move 将左值 d 转为 xvalue
+}
+
+\tip{**生命期延长规则：** 右值引用绑定到 prvalue 时，临时对象的生命期会延长到引用的作用域结束。`int&& d = 42;` 中的"42"会一直活到 `d` 离开作用域。但这个规则**不传递**——如果把这个引用再传给另一个函数，生命期不会再次延长。}
+
+// 万能引用 / 转发引用
+
+当你在**模板参数推导**的上下文中写 `T&&`，它不再是普通的右值引用——它变成了**转发引用（Forwarding Reference）**，也被称为**万能引用（Universal Reference）**。转发引用有一种独特的能力：它既能绑定左值也能绑定右值。
+
+转发引用只出现在两种情况下：`template<typename T> void func(T&& arg)` 中的 `T&&`（T 由调用方推导），以及 `auto&& val = expr`。以下**不是**转发引用：`void bar(int&& x)`（具体类型）、`void baz(std::vector<T>&& v)`（外层包装了 T）。
+
+\warning{判断转发引用的关键：`&&` 前面**必须正好是**被推导的裸模板参数（如 `T&&`），不能有 `const`、`vector<>` 等任何包装。}
+
+当转发引用接收不同的实参时，模板参数 `T` 的推导结果不同：
+
+\table{
+调用方式 | T 推导为 | arg 的类型（折叠后）
+---
+`func(lvalue)` | `int&` | `int& && → int&`（左值引用）
+`func(rvalue)` | `int` | `int&&`（右值引用）
+`func(const lvalue)` | `const int&` | `const int&`（const 左值引用）
+}
+
+// 引用折叠规则
+
+上表中出现了 `int& &&` 这种"引用的引用"——C++ 不允许程序员直接写出它，但在模板实例化和 `typedef`/`using` 中它会自然产生。编译器根据**引用折叠（Reference Collapsing）**规则自动处理：
+
+\table{
+组合 | 折叠结果
+---
+`T& &` | `T&`
+`T& &&` | `T&`
+`T&& &` | `T&`
+`T&& &&` | `T&&`
+}
+
+\note{记忆口诀：**只有两个 `&&` 叠加才得到 `&&`，其余一律折叠为 `&`。** 换句话说，左值引用像"黑洞"——一旦参与折叠，结果一定是左值引用。}
+
+引用折叠是转发引用能"自适应"的底层机制：传入左值时 `T = int&`，`T&&` 即 `int& &&` 折叠为 `int&`；传入右值时 `T = int`，`T&&` 不折叠，保持 `int&&`。
+
+// std::move 的本质
+
+`std::move` 的名字极具误导性——它**不移动任何东西**。它的全部工作就是一个 `static_cast`，将参数**无条件**转换为右值引用：
+
+\code[cpp]{
+// 简化版实现（标准库的实际实现）
+template<typename T>
+constexpr std::remove_reference_t<T>&& move(T&& t) noexcept {
+    return static_cast<std::remove_reference_t<T>&&>(t);
+}
+}
+
+拆解：`T&&` 是转发引用（接受任何值类别）→ `remove_reference_t<T>` 去掉引用修饰 → `static_cast` 转为右值引用 → 调用方拿到 xvalue。真正的资源转移发生在**移动构造/赋值**中，`std::move` 只是告诉编译器"选择移动版本的重载"。
+
+\quiz[tf]{
+Q: `std::move(x)` 执行后，`x` 的资源立刻被转移走了
+ANS: F
+EXP: `std::move` 只做类型转换（cast），不执行任何资源转移。资源转移发生在移动构造/赋值被调用时。如果你写了 `std::move(x);` 但没人接收这个右值引用，什么也不会发生。
+}
+
+// 完美转发与 std::forward
+
+**完美转发（Perfect Forwarding）**要解决的问题是：在一个泛型包装函数中，怎么把参数**原封不动**地传给另一个函数——如果调用者传的是左值，内层也收到左值；传的是右值，内层也收到右值。
+
+没有完美转发时，每种引用类型都要单独写一个重载——两个参数就要 4 个重载，三个参数要 8 个。有了转发引用 + `std::forward`，一个函数模板就够了：
+
+\code[cpp]{
+template<typename T>
+void wrapper(T&& arg) {
+    target(std::forward<T>(arg));
+}
+}
+
+`std::forward<T>` 是**条件性**的类型转换：
+- 当 `T` 被推导为左值引用（`int&`）时，`forward` 返回左值引用——不移动
+- 当 `T` 被推导为非引用类型（`int`）时，`forward` 返回右值引用——允许移动
+
+\collapse[std::forward 的简化实现]{
+\code[cpp]{
+// 当 T = int&（传入左值时）
+template<>
+constexpr int& forward<int&>(int& t) noexcept {
+    return static_cast<int&>(t);  // 原样返回左值引用
+}
+
+// 当 T = int（传入右值时）
+template<>
+constexpr int&& forward<int>(int& t) noexcept {
+    return static_cast<int&&>(t); // 转为右值引用
+}
+
+// 注意：参数类型始终是左值引用
+// 因为命名的右值引用变量本身是左值
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <utility>
+
+void process(std::string& s)  { std::cout << "  左值版本: " << s << "\n"; }
+void process(std::string&& s) { std::cout << "  右值版本: " << s << "\n"; }
+
+// 完美转发包装
+template<typename T>
+void forwarder(T&& arg) {
+    std::cout << "  转发中...\n";
+    process(std::forward<T>(arg));
+}
+
+// 对比：不用 forward 的错误版本
+template<typename T>
+void bad_forwarder(T&& arg) {
+    std::cout << "  (错误)转发中...\n";
+    process(arg);  // arg 有名字 → 永远是左值 → 永远调用左值版本！
+}
+
+int main() {
+    std::string s = "hello";
+
+    std::cout << "=== 正确的完美转发 ===\n";
+    forwarder(s);                        // 传左值 → 调左值版本
+    forwarder(std::string("world"));     // 传右值 → 调右值版本
+
+    std::cout << "\n=== 不用 forward 的结果 ===\n";
+    bad_forwarder(s);
+    bad_forwarder(std::string("world")); // 本应调右值版本却调了左值版本
+    return 0;
+}
+}
+
+// std::move vs std::forward 的使用场景
+
+这两个工具容易混淆，但用途截然不同：
+
+\table{
+特性 | std::move | std::forward<T>
+---
+转换类型 | 无条件转为右值引用 | 根据 T 条件决定
+使用场景 | 明确要放弃所有权时 | 模板中转发参数时
+是否需要模板参数 | 不需要 | 必须显式写 `<T>`
+典型位置 | 移动构造/赋值、最后一次使用某变量 | 转发引用参数传递给下一层函数
+}
+
+\danger{**不要用 `std::forward` 代替 `std::move`，也不要反过来。** `std::move` 表达"我不再需要这个对象"的意图；`std::forward` 表达"保持调用者传入时的值类别"。混用会导致意外拷贝或意外移动。}
+
+// 移动语义在容器和算法中的体现
+
+标准库容器大量利用移动语义提升性能：
+
+\code[cpp]{
+std::vector<std::string> v;
+
+// push_back 有两个重载：
+// void push_back(const T& value);  // 拷贝版本
+// void push_back(T&& value);       // 移动版本
+v.push_back(std::string("hello"));  // 调用移动版本（临时对象是 prvalue）
+
+std::string s = "world";
+v.push_back(s);                     // 调用拷贝版本（s 是左值）
+v.push_back(std::move(s));          // 调用移动版本（std::move 转为 xvalue）
+// 此后 s 处于"有效但未指定"状态，不要再读取其值
+
+// emplace_back 使用完美转发，直接在容器内存中构造
+v.emplace_back("direct");           // 转发 const char* 给 string 构造函数
+}
+
+\note{`vector` 扩容时，如果元素移动构造声明了 `noexcept` 就用移动，否则退回拷贝以保证异常安全。这是 `noexcept` 对移动构造至关重要的原因——详见 copy-move 一节。}
+
+标准算法同样受益：`std::sort` 交换时优先移动，`std::unique`/`std::remove` 将要移除的元素移动到尾部而非拷贝。
+
+// 返回值优化（RVO/NRVO）与移动的关系
+
+**返回值优化**是编译器的优化技术，让函数返回局部对象时直接在调用方的内存位置构造，跳过拷贝和移动。**RVO** 针对匿名临时对象（C++17 起强制执行），**NRVO（Named RVO）** 针对具名局部变量（主流编译器都支持但标准不强制）。
+
+当 NRVO 未能生效时（如函数有多个 return 路径返回不同变量），编译器会**自动将返回的局部变量当作右值处理**，触发移动构造而非拷贝。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <utility>
+
+struct Heavy {
+    std::string data;
+    Heavy(std::string d) : data(std::move(d))
+        { std::cout << "  构造: " << data << "\n"; }
+    Heavy(const Heavy& o) : data(o.data)
+        { std::cout << "  拷贝: " << data << "\n"; }
+    Heavy(Heavy&& o) noexcept : data(std::move(o.data))
+        { std::cout << "  移动: " << data << "\n"; }
+};
+
+// 情况1: NRVO — 通常零拷贝零移动
+Heavy case_nrvo() {
+    Heavy h("NRVO");
+    return h;          // 编译器直接在调用方位置构造 h
+}
+
+// 情况2: 多个返回路径 — NRVO 可能失败，退回自动移动
+Heavy case_multi(bool flag) {
+    Heavy a("A"), b("B");
+    if (flag) return a;  // 编译器不确定返回哪个 → 无法 NRVO
+    return b;            // 但仍自动 move（不是拷贝）
+}
+
+// 情况3: 错误用法 — std::move 阻止 NRVO！
+Heavy case_bad() {
+    Heavy h("BAD");
+    return std::move(h); // 强制移动，编译器无法执行 NRVO
+}
+
+int main() {
+    std::cout << "=== NRVO (应看到零次拷贝/移动) ===\n";
+    Heavy x = case_nrvo();
+
+    std::cout << "\n=== 多返回路径 (可能看到移动) ===\n";
+    Heavy y = case_multi(true);
+
+    std::cout << "\n=== 错误: return std::move (一定有移动) ===\n";
+    Heavy z = case_bad();
+
+    return 0;
+}
+}
+
+\danger{**永远不要 `return std::move(local_var);`！** 这会阻止 NRVO。直接 `return local_var;` 即可——编译器先尝试 NRVO，不行则自动隐式移动。}
+
+/// 新版特性（C++17/20/23）
+
+\tabs{
+\tab[C++17]{
+**强制拷贝消除（Mandatory Copy Elision）：** 返回 prvalue 时，编译器**必须**在目标位置直接构造，不再需要移动/拷贝构造函数存在。这意味着即使删除了拷贝和移动构造，`return T(args...)` 也合法。
+
+\code[cpp]{
+struct NoCopyNoMove {
+    NoCopyNoMove() = default;
+    NoCopyNoMove(const NoCopyNoMove&) = delete;
+    NoCopyNoMove(NoCopyNoMove&&) = delete;
+};
+
+NoCopyNoMove create() {
+    return NoCopyNoMove{};  // C++17 OK: 强制消除，不需要移动构造
+}
+// C++14 中这段代码会编译失败
+}
+}
+\tab[C++20]{
+**约束转发引用（Constrained Forwarding References）：** 配合**概念（Concepts）**，可以对转发引用施加类型约束，不再需要 SFINAE 技巧：
+
+\code[cpp]{
+#include <concepts>
+#include <string>
+
+template<std::convertible_to<std::string> T>
+void log(T&& msg) {
+    // 只接受能转换为 string 的类型
+    std::string s = std::forward<T>(msg);
+}
+}
+}
+\tab[C++23]{
+**推导 this（Deducing This）：** 用显式对象参数替代传统的四种引用限定重载，极大简化完美转发场景：
+
+\code[cpp]{
+struct Widget {
+    std::string name;
+
+    // C++23: 一个函数搞定所有值类别
+    template<typename Self>
+    auto&& getName(this Self&& self) {
+        return std::forward<Self>(self).name;
+    }
+
+    // 等价于 C++20 中需要写的四个重载：
+    // std::string&       getName() &;
+    // const std::string& getName() const&;
+    // std::string&&      getName() &&;
+    // const std::string&& getName() const&&;
+};
+}
+}
+}
+
+/// 工程实践
+
+\list{
+- **按值传参 + move：** 对会保存副本的 sink 参数，按值传递再 `std::move` 到成员
+- **转发引用只用于模板代码：** 非模板中 `T&&` 就是右值引用
+- **移动后不读取：** 对 moved-from 对象只允许赋值或析构
+- **移动操作加 `noexcept`：** 否则容器扩容退回拷贝
+- **不要 `return std::move(local)`：** 会阻止 NRVO
+- **`std::forward` 显式写模板参数：** `std::forward<T>(arg)` 而非 `std::forward(arg)`
+- **参数只 forward/move 一次：** 不要在循环中反复 forward 同一参数
+}
+
+\compare{
+old: C++98/03 没有右值引用和移动语义。返回大对象依赖编译器 RVO（标准不保证）。向容器插入必须拷贝。独占所有权只有残缺的 `auto_ptr`（C++17 删除）。
+
+new: C++11 引入右值引用和移动语义。C++17 强制 prvalue 拷贝消除。C++20 概念让转发引用有类型约束。C++23 推导 this 终结"四重引用限定重载"。
+}
+
+/// 难点易错点分析
+
+\danger{**右值引用变量本身是左值。** 这是最反直觉的规则。`int&& r = 42;` 之后，`r` 有名字、可取地址，所以它是左值。要再次将它当右值传递，必须 `std::move(r)`。忘记这一点会导致转发时全部退化为拷贝。}
+
+\danger{**const 对象无法被移动。** `const std::string&&` 无法匹配移动构造函数，最终调用拷贝构造。`std::move(const_obj)` 语法合法但无效。}
+
+\danger{**花括号初始化列表不能被转发：** `f({1,2,3})` 中 `{1,2,3}` 没有类型，模板无法推导 `T`。解决方法是先用 `auto` 接住再转发：}
+
+\code[cpp]{
+template<typename T>
+void f(T&& arg);
+
+// f({1, 2, 3});            // 编译错误：无法推导 T
+auto il = {1, 2, 3};        // auto 推导为 std::initializer_list<int>
+f(il);                       // OK
+}
+
+\warning{**多次移动同一对象：** 标准允许对 moved-from 对象再次移动（不是未定义行为），但第二次移动得到的是"残骸"。这几乎一定是 bug：}
+
+\code[cpp]{
+std::string s = "hello";
+auto a = std::move(s);  // s 被掏空
+auto b = std::move(s);  // 合法，但 b 大概率是空字符串
+}
+
+\quiz[choice]{
+Q: 以下代码中 `arg` 在 `wrapper` 函数体内是什么值类别？
+\code[cpp]{
+template<typename T>
+void wrapper(T&& arg) {
+    // arg 在这里是？
+}
+int x = 42;
+wrapper(std::move(x));
+}
+A: 右值（rvalue），因为传入了 std::move(x)
+B: 左值（lvalue），因为 arg 是命名变量
+C: 亡值（xvalue），因为 T 被推导为 int
+D: 纯右值（prvalue），因为 x 的值被移入
+ANS: B
+EXP: 不管传入的是左值还是右值，函数参数 `arg` 一旦有了名字，它就是左值。这就是为什么需要 `std::forward<T>(arg)` 来恢复原始值类别——`forward` 根据 `T` 的推导结果决定是否将 `arg` 转回右值。
+}
+
+\quiz[choice]{
+Q: 以下哪个引用折叠的结果是**右值引用**？
+A: `T& &` → `T&`
+B: `T&& &` → `T&`
+C: `T& &&` → `T&`
+D: `T&& &&` → `T&&`
+ANS: D
+EXP: 引用折叠规则：只有 `&& + &&` 才折叠为 `&&`，其余（`& + &`、`& + &&`、`&& + &`）全部折叠为 `&`。记忆方法：左值引用是"黑洞"，它一旦参与折叠，结果一定是左值引用。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：识别值类别
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <utility>
+#include <type_traits>
+
+// 利用模板推导判断值类别
+template<typename T>
+void identify(T&&) {
+    if constexpr (std::is_lvalue_reference_v<T&&>)
+        std::cout << "lvalue\n";
+    else
+        std::cout << "rvalue\n";
+}
+
+int main() {
+    std::string s = "hello";
+    const std::string cs = "world";
+
+    // 请在运行前预测每行输出，然后运行验证
+    std::cout << "s         → "; identify(s);
+    std::cout << "cs        → "; identify(cs);
+    std::cout << "move(s)   → "; identify(std::move(s));
+    std::cout << "string()  → "; identify(std::string("tmp"));
+    std::cout << "s + cs    → "; identify(s + cs);
+
+    return 0;
+}
+}
+
+// 🟢 基础题 2：修复转发 bug
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <utility>
+#include <memory>
+
+struct Config {
+    std::string name;
+    int value;
+    Config(std::string n, int v) : name(std::move(n)), value(v) {
+        std::cout << "Config构造: " << name << " = " << value << "\n";
+    }
+};
+
+// 这个 make 函数有 bug，请修复它使得完美转发正确工作
+// 提示：参数包需要被转发而不是直接传递
+template<typename T, typename... Args>
+std::unique_ptr<T> make(Args&&... args) {
+    // TODO: 修复下面这行，让参数被完美转发
+    return std::make_unique<T>(args...);
+}
+
+int main() {
+    std::string name = "gamma";
+
+    // 测试1: 传入左值 — name 不应被移走
+    auto p1 = make<Config>(name, 100);
+    std::cout << "name after make: " << name << "\n";
+
+    // 测试2: 传入右值
+    auto p2 = make<Config>(std::string("delta"), 200);
+
+    // 测试3: 传入 move 后的左值 — name 应被移走
+    auto p3 = make<Config>(std::move(name), 300);
+    std::cout << "name after move+make: [" << name << "]\n";
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：实现带移动语义的简易 Optional
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <utility>
+#include <new>
+#include <stdexcept>
+
+// 实现简化版 Optional<T>，要求：
+// 1. 默认构造（空）  2. 从 T 完美转发构造
+// 3. 移动构造/赋值（noexcept）  4. has_value()/value()/reset()
+
+template<typename T>
+class SimpleOptional {
+    alignas(T) unsigned char storage[sizeof(T)];
+    bool engaged = false;
+    T* ptr() { return reinterpret_cast<T*>(storage); }
+    const T* ptr() const { return reinterpret_cast<const T*>(storage); }
+public:
+    SimpleOptional() = default;
+    // TODO: template<typename U> SimpleOptional(U&& val) { placement new + forward }
+    // TODO: SimpleOptional(SimpleOptional&& other) noexcept { ... }
+    // TODO: SimpleOptional& operator=(SimpleOptional&& other) noexcept { ... }
+    ~SimpleOptional() { reset(); }
+    bool has_value() const { return engaged; }
+    T& value() {
+        if (!engaged) throw std::runtime_error("empty");
+        return *ptr();
+    }
+    void reset() { if (engaged) { ptr()->~T(); engaged = false; } }
+};
+
+int main() {
+    SimpleOptional<std::string> a;
+    std::cout << "a has_value: " << a.has_value() << "\n"; // 0
+    // TODO: 实现后取消注释
+    // SimpleOptional<std::string> b(std::string("hello"));
+    // std::cout << "b: " << b.value() << "\n";
+    // SimpleOptional<std::string> c(std::move(b));
+    // std::cout << "c: " << c.value() << "\n";
+    std::cout << "基础测试通过\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：转发引用 vs 右值引用辨析
+
+\quiz[choice]{
+Q: 以下哪个函数的参数 `x` 是**转发引用（forwarding reference）**？
+\code[cpp]{
+// (A)
+template<typename T>
+void funcA(T&& x);
+
+// (B)
+void funcB(int&& x);
+
+// (C)
+template<typename T>
+void funcC(const T&& x);
+
+// (D)
+template<typename T>
+void funcD(std::vector<T>&& x);
+}
+A: funcA — `T&&` 其中 T 由推导决定
+B: funcB — `int&&` 是右值引用
+C: funcC — `const T&&` 有 const 修饰
+D: funcD — `vector<T>&&` 的 T 需要推导
+ANS: A
+EXP: 转发引用的条件极其严格：`&&` 前面必须**恰好是**被推导的裸模板参数（如 `T&&`）。funcB 的 `int` 是具体类型；funcC 有 `const` 修饰；funcD 的 `&&` 前面是 `vector<T>` 而不是裸 `T`。只有 funcA 满足条件。
+}
+
+// 🔴 挑战题：实现一个泛型 emplace 工厂
+
+设计一个 `Registry` 类，用 `std::vector<std::any>` 存储任意类型对象。实现 `emplace<T>(args...)` 方法：使用完美转发传参给 `T` 构造函数；支持任意数量参数；返回索引；用 Tracer 类验证无多余拷贝。
+
+\collapse[参考思路]{
+\code[cpp]{
+#include <vector>
+#include <any>
+#include <utility>
+#include <iostream>
+
+class Registry {
+    std::vector<std::any> items;
+public:
+    template<typename T, typename... Args>
+    size_t emplace(Args&&... args) {
+        items.emplace_back(std::in_place_type<T>,
+                           std::forward<Args>(args)...);
+        return items.size() - 1;
+    }
+
+    template<typename T>
+    T& get(size_t idx) {
+        return std::any_cast<T&>(items[idx]);
+    }
+};
+}
+
+关键验收点：用 `std::forward` 而非 `std::move`；`std::in_place_type<T>` 让 `std::any` 原地构造；Tracer 应只显示"构造"和"移动"，不应出现意外拷贝。
+}

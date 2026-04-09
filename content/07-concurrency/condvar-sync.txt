@@ -1,0 +1,400 @@
+/// 简介
+
+互斥量解决了"谁能访问数据"的问题，但还有一个场景它处理不好：**线程需要等待某个条件成立**。忙等浪费 CPU，sleep 又不知道该等多久。**条件变量（Condition Variable）**让线程在条件不满足时高效地挂起，条件满足时被精准唤醒。它是生产者-消费者模式的基石。C++20 进一步引入了 `latch`、`barrier`、`semaphore`，覆盖了更多同步场景。
+
+本节目标：让你能在正确的场景选择正确的同步原语。
+
+/// 知识点列表
+
+\list{
+- std::condition_variable / condition_variable_any
+- wait / notify_one / notify_all
+- 虚假唤醒（Spurious Wakeup）与谓词等待
+- 生产者-消费者模式
+- std::latch（一次性屏障, C++20）
+- std::barrier（可复用屏障, C++20）
+- std::counting_semaphore / binary_semaphore（C++20）
+- std::future / std::promise / std::async
+}
+
+/// 知识点详解
+
+// condition_variable 基础
+
+条件变量的工作模型：线程获取锁 → 检查条件 → 不满足→释放锁并挂起 → 被唤醒后重新获锁并再次检查。
+
+\code[cpp]{
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+
+std::mutex mtx;
+std::condition_variable cv;
+std::queue<int> tasks;
+bool done = false;
+
+// 等待方（消费者）
+void consumer() {
+    std::unique_lock lock(mtx);       // 1. 加锁
+    cv.wait(lock, [&]{               // 2. 检查谓词
+        return !tasks.empty() || done; //    若为 false→释放锁并挂起
+    });                               // 3. 被唤醒→重新加锁→再检谓词
+    // 此处已持有锁且谓词为 true
+}
+
+// 通知方（生产者）
+void producer() {
+    {
+        std::lock_guard lock(mtx);
+        tasks.push(42);
+    }                         // 先释放锁
+    cv.notify_one();          // 再通知（避免唤醒后立即阻塞在锁上）
+}
+}
+
+\danger{**虚假唤醒（Spurious Wakeup）：**`cv.wait()` 可能在没有 `notify` 的情况下返回——这是操作系统线程实现的固有行为。因此 `wait` **必须**搭配谓词使用，在循环中检查条件是否真正满足。}
+
+\code[cpp]{
+// 错误——可能虚假唤醒后访问空队列
+cv.wait(lock);                    // 无谓词！
+auto val = tasks.front();         // 可能崩溃
+
+// 正确——带谓词的 wait 等价于 while(!pred) cv.wait(lock);
+cv.wait(lock, [&]{ return !tasks.empty() || done; });
+}
+
+\note{**`condition_variable` 只能搭配 `std::mutex`（通过 `unique_lock`）。** 如果需要搭配其他 mutex 类型（如 `shared_mutex`），使用 `condition_variable_any`，但它的开销更高。}
+
+// 生产者-消费者模式
+
+这是条件变量最经典的应用。模型：一个或多个生产者向队列放入数据，一个或多个消费者从队列取出数据。
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+
+std::mutex mtx;
+std::condition_variable cv;
+std::queue<int> q;
+bool finished = false;
+
+void producer(int count) {
+    for (int i = 0; i < count; ++i) {
+        {
+            std::lock_guard lock(mtx);
+            q.push(i);
+        }
+        cv.notify_one();
+    }
+    {
+        std::lock_guard lock(mtx);
+        finished = true;
+    }
+    cv.notify_all();
+}
+
+void consumer(int id) {
+    while (true) {
+        std::unique_lock lock(mtx);
+        cv.wait(lock, []{ return !q.empty() || finished; });
+        if (q.empty() && finished) break;
+        int val = q.front();
+        q.pop();
+        lock.unlock();
+        std::cout << "C" << id << " got " << val << "\n";
+    }
+}
+
+int main() {
+    std::thread p(producer, 10);
+    std::thread c1(consumer, 1);
+    std::thread c2(consumer, 2);
+    p.join(); c1.join(); c2.join();
+    return 0;
+}
+}
+
+\quiz[choice|单选]{
+Q: 生产完毕后应该调用 `notify_one()` 还是 `notify_all()`？
+A: notify_one()——只需唤醒一个消费者来处理
+B: notify_all()——所有消费者都需要检查"完毕"条件以决定退出
+C: 不需要通知——消费者的谓词会自动轮询
+D: 两者等价
+ANS: B
+EXP: 设置 `finished = true` 后，所有消费者都需要被唤醒来检查这个条件。如果只 `notify_one`，其他消费者可能永远阻塞在 `wait` 上。数据到达时用 `notify_one`（只需一个消费者处理），结束信号用 `notify_all`。
+}
+
+// future / promise / async
+
+条件变量是低级原语。如果只是"在一个线程中计算结果，在另一个线程中获取"，`future`/`promise` 更简洁。
+
+\tabs{
+\tab[promise + future]{
+\code[cpp]{
+#include <future>
+
+std::promise<int> prom;
+std::future<int> fut = prom.get_future();
+
+std::jthread t([&prom]{
+    int result = heavyComputation();
+    prom.set_value(result);        // 设置结果
+    // 或 prom.set_exception(...)   // 传递异常
+});
+
+int val = fut.get(); // 阻塞等待——只能调用一次
+}
+}
+\tab[std::async]{
+\code[cpp]{
+#include <future>
+
+// 最简异步执行——自动管理线程和 future
+auto fut = std::async(std::launch::async, []{
+    return heavyComputation();
+});
+
+// ... 做其他工作 ...
+int result = fut.get(); // 需要结果时阻塞
+}
+}
+}
+
+\warning{**`std::async` 返回的 `future` 析构时会阻塞等待任务完成！** 这是标准的特殊规定。如果你不保存 `async` 返回的 future，临时 future 立即析构→等同于同步调用。}
+
+\code[cpp]{
+// 陷阱：临时 future 导致同步执行
+std::async(std::launch::async, longTask);  // 变成同步了！
+
+// 正确：保存 future
+auto f = std::async(std::launch::async, longTask); // 异步执行
+}
+
+// C++20 同步原语——latch / barrier / semaphore
+
+C++20 引入了三种高级同步原语，覆盖了条件变量处理起来繁琐的常见场景。
+
+\table{
+原语 | 特征 | 是否可复用 | 典型用途
+---
+`latch` | 一次性计数降至零时释放所有等待者 | 否 | "等全部就绪再开始"
+`barrier` | 每轮所有线程到齐后继续、可执行回调 | 是 | 多阶段并行计算的同步点
+`counting_semaphore` | 控制最大并发数量 | 是 | 资源池限流
+`binary_semaphore` | 0/1 信号量 | 是 | 轻量级线程通知
+}
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <latch>
+#include <vector>
+
+int main() {
+    constexpr int N = 4;
+    std::latch ready(N);
+    std::latch done(N);
+
+    auto worker = [&](int id) {
+        std::cout << "Worker " << id << " preparing\n";
+        ready.count_down();  // 报告"我准备好了"
+        ready.wait();        // 等待所有人准备好（发令枪）
+        std::cout << "Worker " << id << " running\n";
+        done.count_down();   // 报告"我完成了"
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < N; ++i)
+        threads.emplace_back(worker, i);
+    
+    done.wait();  // 主线程等待所有工作完成
+    std::cout << "All done\n";
+
+    for (auto& t : threads) t.join();
+    return 0;
+}
+}
+
+\code[cpp]{
+#include <barrier>
+#include <semaphore>
+
+// barrier：多轮同步
+std::barrier sync(4, []() noexcept {
+    std::println("--- Phase complete ---"); // 每轮最后到达的线程执行回调
+});
+
+void phaseWorker(int id) {
+    for (int phase = 0; phase < 3; ++phase) {
+        doWork(id, phase);
+        sync.arrive_and_wait(); // 等待本轮所有线程到齐
+    }
+}
+
+// semaphore：限流
+std::counting_semaphore<4> sem(4); // 最多 4 个并发
+
+void limitedAccess() {
+    sem.acquire();   // 获取许可（满则阻塞）
+    // ... 最多 4 个线程同时在此 ...
+    sem.release();   // 释放许可
+}
+}
+
+\diagram[flow]{
+latch: Thread1 count_down -> Thread2 count_down -> Thread3 count_down -> Thread4 count_down -> 全部释放
+barrier: [Phase 1] -> 同步点 -> [Phase 2] -> 同步点 -> [Phase 3]
+semaphore: acquire(许可>0?) --yes--> 进入 -> release -> 回到检查
+acquire(许可>0?) --no--> 阻塞等待
+}
+
+\collapse[如何在 latch / barrier / condition_variable 之间选择]{
+- **一次性的"全部就绪"等待**：`latch`（比 CV 更简洁，无需 mutex）
+- **多轮同步**（如物理模拟迭代、帧同步）：`barrier`
+- **通用的"等待条件成立"**（条件可以是任何谓词）：`condition_variable`
+- **限制并发数量**（如连接池、文件句柄限流）：`counting_semaphore`
+- **轻量级线程间信号**（替代 CV 的单次通知）：`binary_semaphore`
+
+优先使用高级原语——它们封装了 CV+mutex 的样板代码，bug 更少。
+}
+
+/// 工程实践
+
+\list{
+- notify 前先释放锁——避免被唤醒的线程立即因竞争锁而再次阻塞
+- `notify_one` 用于"一条数据对应一个消费者"，`notify_all` 用于"状态变更影响所有等待者"
+- 优先使用 C++20 的 `latch`/`barrier`/`semaphore`——它们比 CV 更不容易出错
+- 不要用 `std::async` 做线程池——每次调用可能创建新线程。真正的线程池需自己实现（见 patterns 章节）
+- `future::get()` 只能调用一次；若多个线程需要同一结果，使用 `std::shared_future`
+}
+
+/// 常用方法速查
+
+\table{
+API | 用途 | 标准
+---
+`condition_variable::wait(lock, pred)` | 带谓词的条件等待 | C++11
+`cv.notify_one()` | 唤醒一个等待线程 | C++11
+`cv.notify_all()` | 唤醒所有等待线程 | C++11
+`condition_variable_any` | 支持任意 mutex 类型的 CV | C++11
+`std::promise<T>` | 设置值/异常的一端 | C++11
+`std::future<T>` | 获取结果的一端 | C++11
+`std::shared_future<T>` | 可多次 get 的 future | C++11
+`std::async(policy, f, args)` | 简易异步执行 | C++11
+`std::latch` | 一次性倒计时屏障 | C++20
+`std::barrier` | 可复用多轮屏障 | C++20
+`std::counting_semaphore<N>` | 计数信号量 | C++20
+`std::binary_semaphore` | 二元信号量 | C++20
+}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11 提供了 `condition_variable`、`future`/`promise`、`async`，但缺少常用模式的标准封装：latch/barrier/semaphore 都需自己用 CV+mutex 手搓。`condition_variable` 不支持取消等待。
+
+new: C++20 引入 `latch`、`barrier`、`counting_semaphore`、`binary_semaphore`。`condition_variable_any` 新增接受 `stop_token` 的 `wait` 重载——等待可被 `jthread::request_stop()` 取消，无需另设 `done` 标志。`std::atomic` 的 `wait`/`notify_one`/`notify_all`（C++20）在某些场景下可替代 CV。
+}
+
+/// 难点易错点分析
+
+\danger{**忘记谓词的 `wait` → 虚假唤醒导致逻辑错误。** 裸 `cv.wait(lock)` 是并发编程中最常见的 bug 源之一。始终使用 `cv.wait(lock, predicate)`。}
+
+\danger{**`future::get()` 只能调用一次。** 第二次调用行为未定义。如果多个消费者需要同一结果，使用 `std::shared_future`（通过 `future::share()` 获取）。}
+
+\danger{**`notify` 在锁内还是锁外？** 两种都正确，但在锁内 notify 可能导致被唤醒的线程立即因竞争锁而再次阻塞——浪费一次上下文切换。推荐：修改数据在锁内，notify 在锁外。}
+
+\quiz[tf|判断]{
+Q: `std::latch` 可以在计数归零后再次使用（重新增加计数）。
+ANS: F
+EXP: `latch` 是一次性原语——计数只能减不能增。归零后所有 `wait()` 返回，之后再调用 `count_down()` 是未定义行为。需要可复用的同步点应使用 `std::barrier`。
+}
+
+/// 实战作业
+
+🟢 **基础：有界缓冲区**
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+
+template<typename T, int MaxSize = 10>
+class BoundedQueue {
+    std::queue<T> q_;
+    std::mutex mtx_;
+    std::condition_variable not_full_;
+    std::condition_variable not_empty_;
+public:
+    void push(T val) {
+        std::unique_lock lock(mtx_);
+        /* TODO: 等待队列不满，然后入队，通知 not_empty_ */
+    }
+    T pop() {
+        std::unique_lock lock(mtx_);
+        /* TODO: 等待队列非空，然后出队，通知 not_full_，返回值 */
+        return T{};
+    }
+};
+
+int main() {
+    BoundedQueue<int, 5> bq;
+    std::thread producer([&]{
+        for (int i = 0; i < 20; ++i) bq.push(i);
+    });
+    std::thread consumer([&]{
+        for (int i = 0; i < 20; ++i)
+            std::cout << bq.pop() << " ";
+    });
+    producer.join();
+    consumer.join();
+    std::cout << "\nDone\n";
+    return 0;
+}
+}
+
+🟡 **进阶：多阶段计算**
+
+使用 `std::barrier` 实现 3 个阶段的并行计算：
+- Phase 1：每个线程计算局部数组的平方
+- Phase 2：每个线程将结果归约求和
+- Phase 3：输出结果
+每个阶段用 barrier 同步，barrier 回调打印当前阶段号。
+
+🔴 **挑战：简易线程池**
+
+实现 `ThreadPool`：
+- 构造函数接受线程数 `N`，创建 `N` 个工作线程
+- `submit(callable)` 返回 `std::future` 给调用者
+- 内部用 `condition_variable` + 任务队列调度
+- 析构时等待所有已提交的任务执行完毕再关闭
+- 测试：提交 100 个随机延时任务，验证全部执行
+
+\collapse[线程池核心结构提示]{
+\code[cpp]{
+class ThreadPool {
+    std::vector<std::jthread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+
+    void workerLoop(std::stop_token st) {
+        while (!st.stop_requested()) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(mtx_);
+                cv_.wait(lock, [&]{ return stop_ || !tasks_.empty(); });
+                if (stop_ && tasks_.empty()) return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            task();
+        }
+    }
+};
+}
+}

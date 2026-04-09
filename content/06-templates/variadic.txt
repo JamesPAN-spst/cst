@@ -1,0 +1,496 @@
+/// 简介
+
+前面我们学的函数模板和类模板，参数个数都是固定的。但现实中经常需要"接受任意数量的参数"——想想 `std::make_unique<T>(args...)`，它需要把任意个参数完美转发给 T 的构造函数。在模板出现之前，C++ 只能用 C 风格的 `...`（va_args），既不安全也不优雅。
+
+**可变参数模板（Variadic Templates, C++11）** 改变了一切：通过**参数包（Parameter Pack）**，模板可以接受零个或任意多个参数，且全部类型安全。C++17 的**折叠表达式（Fold Expressions）** 进一步简化了参数包的展开操作。`std::tuple`、`std::variant`、`std::format` 等标准库设施都建立在可变参数模板之上。
+
+/// 知识点列表
+
+\list{
+- 参数包（Parameter Pack）
+- 包展开（Pack Expansion）
+- `sizeof...` 运算符
+- 递归展开模式
+- 折叠表达式（Fold Expressions, C++17）
+- `if constexpr` 与可变参数
+- `std::apply` / `std::invoke` 与参数包
+- 可变参数在工厂模式/事件系统中的应用
+}
+
+/// 知识点详解
+
+// 参数包基础
+
+参数包有两种：**类型参数包**（`typename... Ts`）和**函数参数包**（`Ts... args`）。`...` 在声明位置表示"这里是一个包"，在使用位置表示"展开这个包"：
+
+\code[cpp]{
+// typename... Args 声明类型参数包
+// Args... args 声明函数参数包
+template<typename... Args>
+void log(Args... args) {
+    // Args 是类型包，可能是 {int, double, const char*}
+    // args 是值包，可能是 {42, 3.14, "hello"}
+
+    sizeof...(Args);  // 参数个数，编译期常量
+    sizeof...(args);  // 同上
+}
+
+log(42, 3.14, "hello"); // Args = {int, double, const char*}
+log();                    // Args = {} 空包，合法！
+}
+
+\run[cpp]{
+#include <iostream>
+
+template<typename... Args>
+void showInfo(Args... args) {
+    std::cout << "参数个数: " << sizeof...(Args) << '\n';
+    std::cout << "总字节数: " << (sizeof(Args) + ...) << '\n';
+}
+
+int main() {
+    showInfo(42, 3.14, 'A', true);
+    // 参数个数: 4
+    // 总字节数: 4+8+1+1 = 14
+    showInfo();
+    // 参数个数: 0
+}
+}
+
+// 包展开（Pack Expansion）
+
+在参数包名字后面加 `...`，编译器就会将其展开。关键在于**展开的模式**——`...` 前面的整个表达式都是模式，每个包元素替换进去：
+
+\code[cpp]{
+template<typename... Ts>
+void examples(Ts... args) {
+    // 直接展开
+    someFunc(args...);
+    // 如果 args = {a, b, c}，展开为 someFunc(a, b, c)
+
+    // 表达式中展开——每个元素都被变换
+    someFunc(transform(args)...);
+    // 展开为 someFunc(transform(a), transform(b), transform(c))
+
+    // 初始化列表中展开
+    auto v = std::vector<int>{static_cast<int>(args)...};
+
+    // Lambda 捕获中展开（C++20）
+    auto f = [...args = std::move(args)]() { /* 使用 args... */ };
+}
+
+// 完美转发 + 包展开——最常见的组合
+template<typename T, typename... Args>
+std::unique_ptr<T> myMakeUnique(Args&&... args) {
+    return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+    // 展开为: new T(std::forward<A1>(a1), std::forward<A2>(a2), ...)
+}
+}
+
+\note{`std::forward<Args>(args)...` 中，`...` 同时展开两个包：类型包 `Args` 和值包 `args`。它们必须等长，编译器逐一配对展开。}
+
+// sizeof... 运算符
+
+`sizeof...(pack)` 返回参数包的元素个数，结果是 `std::size_t` 类型的**编译期常量**。可以用于 `static_assert`、`if constexpr`、数组大小等：
+
+\code[cpp]{
+template<typename... Ts>
+class Tuple {
+    static_assert(sizeof...(Ts) > 0, "Tuple must have at least one element");
+    // ...
+};
+
+template<typename... Args>
+void exactlyThree(Args... args) {
+    static_assert(sizeof...(Args) == 3, "Need exactly 3 arguments");
+}
+}
+
+// 递归展开模式
+
+在 C++17 折叠表达式出现之前，处理参数包的标准方式是**递归**——取出第一个元素处理，然后递归处理剩余：
+
+\code[cpp]{
+// 基础情况：空包
+void print() {
+    std::cout << '\n';
+}
+
+// 递归情况：头 + 尾
+template<typename T, typename... Rest>
+void print(const T& first, const Rest&... rest) {
+    std::cout << first;
+    if constexpr (sizeof...(rest) > 0) {
+        std::cout << ", ";
+    }
+    print(rest...);  // 尾部递归
+}
+
+print(1, 2.5, "three"); // 输出: 1, 2.5, three
+}
+
+\diagram[flow]{
+print(1, 2.5, "three") -> first=1, rest={2.5, "three"} -> print(2.5, "three") -> first=2.5, rest={"three"} -> print("three") -> first="three", rest={} -> print() 基础情况
+}
+
+这种模式有效但啰嗦，每次都需要写基础情况和递归情况。C++17 的折叠表达式是更好的选择。
+
+// 折叠表达式（C++17）
+
+折叠表达式让你用一行代码对参数包的所有元素施加同一个运算符。有四种形式：
+
+\table{
+形式 | 语法 | 展开结果
+---
+一元右折叠 | `(pack op ...)` | `a op (b op (c op d))`
+一元左折叠 | `(... op pack)` | `((a op b) op c) op d`
+二元右折叠 | `(pack op ... op init)` | `a op (b op (c op init))`
+二元左折叠 | `(init op ... op pack)` | `((init op a) op b) op c`
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// 求和（一元右折叠）
+template<typename... Args>
+auto sum(Args... args) {
+    return (args + ...);
+}
+
+// 带初始值的求和（二元左折叠）——空包安全
+template<typename... Args>
+auto safeSum(Args... args) {
+    return (0 + ... + args);  // 空包时返回 0
+}
+
+// 打印所有参数（逗号运算符折叠）
+template<typename... Args>
+void printAll(const Args&... args) {
+    ((std::cout << args << ' '), ...);
+    std::cout << '\n';
+}
+
+// 逻辑判断
+template<typename... Ts>
+bool allPositive(Ts... vals) {
+    return ((vals > 0) && ...);
+}
+
+template<typename T, typename... Ts>
+bool isOneOf(const T& val, const Ts&... candidates) {
+    return ((val == candidates) || ...);
+}
+
+int main() {
+    std::cout << sum(1, 2, 3, 4) << '\n';     // 10
+    std::cout << safeSum() << '\n';             // 0（空包）
+    printAll(42, 3.14, "hello", 'A');           // 42 3.14 hello A
+    std::cout << std::boolalpha;
+    std::cout << allPositive(1, 2, 3) << '\n';  // true
+    std::cout << allPositive(1, -2, 3) << '\n'; // false
+    std::cout << isOneOf(42, 1, 2, 42, 100) << '\n'; // true
+}
+}
+
+\warning{**空参数包的折叠：** 一元折叠在包为空时，`&&` 返回 `true`，`||` 返回 `false`，逗号 `,` 返回 `void()`。其他运算符（`+`、`*` 等）空包会**编译错误**。安全做法：用带初始值的二元折叠。}
+
+// if constexpr 与可变参数
+
+`if constexpr`（C++17）可以在编译期根据参数包大小选择不同的处理路径，避免递归的基础情况函数：
+
+\code[cpp]{
+template<typename T, typename... Rest>
+void print(const T& first, const Rest&... rest) {
+    std::cout << first;
+    if constexpr (sizeof...(rest) > 0) {
+        std::cout << ", ";
+        print(rest...);  // 只在包非空时递归
+    } else {
+        std::cout << '\n'; // 最后一个元素后换行
+    }
+}
+// 不再需要单独的 print() 基础情况函数！
+}
+
+// std::apply 与参数包
+
+`std::apply` 将一个 `tuple` 的元素作为参数传给函数——它在内部使用 `std::index_sequence` 来展开 tuple：
+
+\run[cpp]{
+#include <iostream>
+#include <tuple>
+#include <functional>
+
+void greet(const std::string& name, int age, double score) {
+    std::cout << name << ", age " << age << ", score " << score << '\n';
+}
+
+int main() {
+    auto args = std::make_tuple(std::string("Alice"), 25, 95.5);
+
+    // std::apply 把 tuple 展开为函数参数
+    std::apply(greet, args); // Alice, age 25, score 95.5
+
+    // 也适用于 lambda
+    auto result = std::apply(
+        [](auto... args) { return (args + ...); },
+        std::make_tuple(1, 2, 3, 4, 5)
+    );
+    std::cout << "sum = " << result << '\n'; // 15
+}
+}
+
+// 可变参数在工厂模式中的应用
+
+可变参数模板 + 完美转发是工厂函数的标准实现方式：
+
+\code[cpp]{
+#include <memory>
+#include <unordered_map>
+
+class GameObject {
+public:
+    virtual ~GameObject() = default;
+};
+
+class Enemy : public GameObject {
+    std::string name_;
+    int hp_;
+public:
+    Enemy(std::string name, int hp) : name_(std::move(name)), hp_(hp) {}
+};
+
+// 泛型工厂函数——完美转发任意参数给构造函数
+template<typename T, typename... Args>
+std::unique_ptr<T> create(Args&&... args) {
+    return std::make_unique<T>(std::forward<Args>(args)...);
+}
+
+auto enemy = create<Enemy>("Goblin", 100);
+}
+
+可变参数模板在**事件系统**中的应用同样典型——信号可以携带任意类型的参数：
+
+\code[cpp]{
+// 简化的事件系统
+template<typename... Args>
+class Signal {
+    std::vector<std::function<void(Args...)>> slots_;
+public:
+    void connect(std::function<void(Args...)> slot) {
+        slots_.push_back(std::move(slot));
+    }
+    void emit(Args... args) {
+        for (auto& slot : slots_) {
+            slot(args...);
+        }
+    }
+};
+
+Signal<int, int> onResize;  // 携带 width, height
+onResize.connect([](int w, int h) {
+    std::cout << "Resized to " << w << "x" << h << '\n';
+});
+onResize.emit(1920, 1080);
+}
+
+// 索引序列技巧
+
+当需要按索引访问 `tuple` 元素时，`std::index_sequence` 是标准工具——它在编译期生成 `0, 1, 2, ...` 的整数序列：
+
+\collapse[index_sequence 详解]{
+\code[cpp]{
+// std::index_sequence_for<Ts...> 生成 {0, 1, ..., sizeof...(Ts)-1}
+
+template<typename Tuple, std::size_t... Is>
+void printTupleImpl(const Tuple& t, std::index_sequence<Is...>) {
+    ((std::cout << (Is == 0 ? "" : ", ") << std::get<Is>(t)), ...);
+}
+
+template<typename... Ts>
+void printTuple(const std::tuple<Ts...>& t) {
+    std::cout << "(";
+    printTupleImpl(t, std::index_sequence_for<Ts...>{});
+    std::cout << ")\n";
+}
+
+auto t = std::make_tuple(1, 2.5, "three");
+printTuple(t); // (1, 2.5, three)
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11/14 处理参数包只能用递归展开，写起来冗长。模拟"对每个元素做操作"需要 tricks（初始化列表展开等），代码晦涩。
+
+new: C++17 折叠表达式让大部分包操作变成一行代码。C++17 `if constexpr` 消除了递归的基础情况。C++20 Concepts 可以约束包中每个类型的要求。C++23 引入 pack indexing（`Ts...[I]`）直接按索引取包元素。
+}
+
+/// 工程实践
+
+\list{
+- 折叠表达式是处理参数包的首选（C++17+），递归展开作为后备
+- 完美转发模式 `Args&&... args` + `std::forward<Args>(args)...` 是工厂函数的标准写法
+- 用 `sizeof...` + `static_assert` 约束参数个数
+- 参数包类型约束：C++20 用 `requires (std::convertible_to<Args, int> && ...)` 约束每个元素
+- 避免超深递归实例化（编译器默认限制 256-1024 层），优先用折叠表达式
+}
+
+/// 难点易错点分析
+
+\danger{**包展开位置错误：** `f(args)...` 和 `f(args...)` 含义完全不同！前者是对每个 arg 独立调用 f（展开为 `f(a), f(b), f(c)`），后者是把整个包展开为 f 的参数（展开为 `f(a, b, c)`）。}
+
+\code[cpp]{
+template<typename... Ts>
+void foo(Ts... args) {
+    bar(args...);         // bar(a, b, c) — 一次调用，三个参数
+    (bar(args), ...);     // bar(a); bar(b); bar(c); — 三次调用（折叠）
+}
+}
+
+\danger{**空包的一元折叠可能编译失败：** `(args + ...)` 如果 args 为空，`+` 没有定义的空值→编译错误。始终用 `(0 + ... + args)` 这样的二元折叠处理可能为空的包。}
+
+\warning{**注意逗号运算符折叠的返回值：** `((std::cout << args), ...)` 中，整个表达式的值是最后一个逗号表达式的值。如果你不小心把折叠结果赋值给变量，可能得到意外的值。}
+
+\quiz[choice]{
+Q: `(args + ...)` 当 `args = {1, 2, 3, 4}` 时展开为什么？
+A: `(((1 + 2) + 3) + 4)`
+B: `(1 + (2 + (3 + 4)))`
+C: `1 + 2 + 3 + 4`（无括号，按运算符优先级）
+D: 编译错误
+ANS: B
+EXP: 这是一元**右折叠** `(pack op ...)`，从右边开始结合：`1 + (2 + (3 + 4))`。一元**左折叠**是 `(... op pack)` → `((1 + 2) + 3) + 4`。
+}
+
+\quiz[tf]{
+Q: `sizeof...(args)` 是在运行时计算参数包元素个数的。
+ANS: F
+EXP: `sizeof...` 是编译期运算符，返回值是编译期常量（`constexpr`）。和 `sizeof` 一样，不涉及任何运行时计算。
+}
+
+\quiz[choice]{
+Q: 以下代码的输出是什么？
+\code[cpp]{
+template<typename... Ts>
+auto product(Ts... args) { return (args * ... * 1); }
+
+std::cout << product(2, 3, 4);
+}
+A: 24
+B: 10
+C: 编译错误
+D: 0
+ANS: A
+EXP: 二元右折叠 `(pack op ... op init)`：`2 * (3 * (4 * 1))` = 24。即使空包也安全（返回 init=1）。
+}
+
+/// 实战作业
+
+// 🟢 基础题：折叠求最大值
+
+\run[cpp]{
+#include <iostream>
+
+// TODO: 用折叠表达式实现 maxOf(args...)
+// 返回所有参数中的最大值
+// 提示：可以用 std::max 和逗号折叠，或写一个辅助 lambda
+
+/* TODO: 你的代码 */
+
+int main() {
+    std::cout << maxOf(3, 1, 4, 1, 5, 9) << '\n';  // 期望: 9
+    std::cout << maxOf(42) << '\n';                   // 期望: 42
+    std::cout << maxOf(-1, -5, -2) << '\n';           // 期望: -1
+}
+}
+
+// 🟢 基础题：类型安全的 println
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// TODO: 实现 println(args...)
+// 用空格分隔打印所有参数，末尾换行
+// 要求使用折叠表达式（不用递归）
+
+/* TODO: 你的代码 */
+
+int main() {
+    println(42, 3.14, "hello", 'A');
+    // 期望输出: 42 3.14 hello A
+    println("single");
+    // 期望输出: single
+}
+}
+
+// 🟡 进阶题：泛型工厂
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+
+struct Enemy {
+    std::string name;
+    int hp;
+    Enemy(std::string n, int h) : name(std::move(n)), hp(h) {
+        std::cout << "Enemy created: " << name << " HP=" << hp << '\n';
+    }
+};
+
+struct Bullet {
+    float speed;
+    int damage;
+    Bullet(float s, int d) : speed(s), damage(d) {
+        std::cout << "Bullet created: speed=" << speed << " dmg=" << damage << '\n';
+    }
+};
+
+// TODO: 实现泛型工厂 create<T>(args...)
+// 返回 unique_ptr<T>，完美转发所有参数
+
+/* TODO: 你的代码 */
+
+int main() {
+    auto e = create<Enemy>("Goblin", 100);
+    auto b = create<Bullet>(5.0f, 25);
+}
+}
+
+// 🟡 进阶题：简易信号系统
+
+实现 `Signal<Args...>` 类模板：
+- `connect(callback)` 注册回调函数
+- `emit(args...)` 触发所有已注册的回调
+- 支持 lambda、函数指针等任意可调用对象
+
+\collapse[参考思路]{
+\code[cpp]{
+template<typename... Args>
+class Signal {
+    std::vector<std::function<void(Args...)>> slots_;
+public:
+    void connect(std::function<void(Args...)> slot) {
+        slots_.push_back(std::move(slot));
+    }
+    void emit(Args... args) {
+        for (auto& slot : slots_) slot(args...);
+    }
+};
+}
+}
+
+// 🔴 挑战题：类型安全的 format
+
+实现 `myFormat(fmt, args...)`，格式串用 `{}` 作占位符：
+1. `myFormat("Hello {} you are {}", "Alice", 25)` → `"Hello Alice you are 25"`
+2. 占位符数量与参数数量不匹配时，`static_assert` 编译错误
+3. 支持任何可以 `operator<<` 输出的类型
+4. 返回 `std::string`
+
+\collapse[参考思路]{
+分两步：①编译期用 `constexpr` 函数数 `fmt` 中 `{}` 的个数，`static_assert` 检查与 `sizeof...(args)` 相等。②运行时用 `std::ostringstream` + 折叠表达式逐个替换 `{}`，或递归查找 `{}` 并插入对应参数。
+}

@@ -1,0 +1,220 @@
+/// 简介
+
+本项目综合运用模板章节的全部知识——函数模板、类模板、可变参数模板、SFINAE/Concepts、类型萃取和 CRTP——构建一个**类型安全的 ECS（Entity-Component-System）框架**。与 OOP 章节的运行时 ECS 不同，这里的核心约束是：**访问未注册的组件类型时必须在编译期报错**，而非运行时崩溃。
+
+/// 项目需求
+
+\project{TypedECS — 编译期类型安全的ECS框架}{
+
+**核心功能：**
+
+\list{
+- 编译期组件注册：`World<Position, Velocity, Sprite>` 声明所有合法组件类型
+- 添加/移除/获取组件：`addComponent<T>`、`removeComponent<T>`、`getComponent<T>`
+- 编译期类型检查：`addComponent<int>(...)` 直接编译失败（int 不在注册列表中）
+- 泛型查询：`forEach<Position, Velocity>(func)` 遍历拥有指定组件组合的所有实体
+- CRTP 静态多态 System 基类
+}
+
+**使用示例：**
+
+\code[cpp]{
+struct Position {
+    float x = 0, y = 0;
+    static constexpr auto name() { return "Position"; }
+};
+struct Velocity {
+    float dx = 0, dy = 0;
+    static constexpr auto name() { return "Velocity"; }
+};
+struct Sprite {
+    std::string texture;
+    static constexpr auto name() { return "Sprite"; }
+};
+
+int main() {
+    World<Position, Velocity, Sprite> world;
+
+    auto player = world.createEntity();
+    world.addComponent(player, Position{100, 200});
+    world.addComponent(player, Velocity{1, 0});
+    world.addComponent(player, Sprite{"hero.png"});
+
+    auto bullet = world.createEntity();
+    world.addComponent(bullet, Position{100, 200});
+    world.addComponent(bullet, Velocity{10, 0});
+
+    // 编译期安全！下面这行打开注释会编译失败：
+    // world.addComponent(player, int{42});
+
+    // 查询所有有 Position+Velocity 的实体
+    world.forEach<Position, Velocity>(
+        [](EntityId id, Position& pos, Velocity& vel) {
+            pos.x += vel.dx;
+            pos.y += vel.dy;
+        }
+    );
+}
+}
+}
+
+/// 技术要求
+
+\table{
+模板特性 | 使用场景
+---
+函数模板 | `addComponent<T>`、`getComponent<T>`、`forEach<Qs...>`
+类模板 | `ComponentStorage<T>`、`World<Components...>`
+可变参数模板 | `World<Ts...>`、`forEach<Qs...>` 查询
+折叠表达式 | `(hasComponent<Qs>(id) && ...)` 联合检查
+SFINAE 或 Concepts | `Component` 约束、编译期组件类型校验
+类型萃取 / TypeList | `Contains`、`IndexOf`、编译期类型到索引映射
+CRTP | `System<Derived>` 静态多态基类
+`std::tuple` | 存储异构 `ComponentStorage` 集合
+`std::get<T>` | 按类型索引 tuple
+`static_assert` | 未注册组件的编译期报错
+}
+
+**项目目录结构：**
+
+\code[text]{
+typed-ecs/
+├── CMakeLists.txt
+├── include/
+│   ├── typelist.hpp        // TypeList 及操作
+│   ├── component.hpp       // Component concept + ComponentStorage
+│   ├── world.hpp           // World<Components...> 主类
+│   └── system.hpp          // CRTP System 基类
+├── src/
+│   └── main.cpp            // 使用示例 + 测试
+└── tests/
+    └── test_ecs.cpp        // static_assert 编译期测试
+}
+
+**CMakeLists.txt 参考：**
+
+\code[cmake]{
+cmake_minimum_required(VERSION 3.20)
+project(TypedECS LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(typed_ecs src/main.cpp)
+target_include_directories(typed_ecs PRIVATE include)
+}
+
+/// 实现提示
+
+// TypeList 操作
+
+\code[cpp]{
+template<typename... Ts> struct TypeList {};
+
+// 必须实现：
+// Size<List>::value
+// Contains<List, T>::value   — 核心：编译期检查组件是否已注册
+// IndexOf<List, T>::value    — 可选：用于替代 std::get<T>
+// Front<List>::type
+// ForEach<List>(func)        — 运行时对每个类型执行操作
+}
+
+// Component 概念约束
+
+\code[cpp]{
+template<typename T>
+concept Component = std::movable<T>
+    && std::default_initializable<T>
+    && requires {
+        { T::name() } -> std::convertible_to<std::string_view>;
+    };
+}
+
+// World 核心架构
+
+\code[cpp]{
+template<Component... Comps>
+class World {
+    std::tuple<ComponentStorage<Comps>...> storages_;
+    // ...
+
+    template<Component T>
+    void addComponent(EntityId id, T comp) {
+        // 编译期检查
+        static_assert(Contains<TypeList<Comps...>, T>::value,
+            "Component type not registered in this World!");
+        std::get<ComponentStorage<T>>(storages_).add(id, std::move(comp));
+    }
+
+    template<Component... Qs>
+    void forEach(auto&& func) {
+        for (auto id : entities_.all()) {
+            if ((hasComponent<Qs>(id) && ...)) {    // 折叠表达式
+                func(id, getComponent<Qs>(id)...);  // 包展开
+            }
+        }
+    }
+};
+}
+
+// CRTP System 基类
+
+\code[cpp]{
+template<typename Derived>
+class System {
+public:
+    void update(float dt) {
+        static_cast<Derived*>(this)->updateImpl(dt);
+    }
+    std::string_view name() const {
+        return Derived::systemName();
+    }
+};
+
+class MovementSystem : public System<MovementSystem> {
+public:
+    static constexpr auto systemName() { return "Movement"; }
+
+    template<typename WorldT>
+    void updateImpl(WorldT& world, float dt) {
+        world.template forEach<Position, Velocity>(
+            [dt](EntityId, Position& p, Velocity& v) {
+                p.x += v.dx * dt;
+                p.y += v.dy * dt;
+            }
+        );
+    }
+};
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+类型安全 | 25分 | 访问未注册组件→编译错误；static_assert 消息清晰；Component concept 正确约束
+TypeList 操作 | 20分 | Contains、Size、IndexOf 完整正确；用 static_assert 测试
+泛型接口 | 20分 | forEach 的可变参数查询正确；包展开、折叠表达式运用得当
+模板技术运用 | 15分 | CRTP System、Concepts、类型萃取至少各用一处
+数据布局 | 10分 | SOA（每种组件独立数组）而非 AOS；ComponentStorage 使用连续内存
+代码质量 | 10分 | 现代 C++ 风格；命名规范；有注释说明模板设计决策
+}
+
+/// 扩展挑战
+
+\list{
+- **Archetype 存储**：相同组件组合的实体存储在同一个 Archetype 中（参考 Unity DOTS / flecs）
+- **编译期系统注册**：SystemList<MovementSys, RenderSys, ...> 自动按顺序 update
+- **序列化**：利用 TypeList + if constexpr 自动序列化/反序列化所有组件
+- **SparseSet 优化**：ComponentStorage 用 Sparse Set 替代 vector<optional>，提升遍历性能
+- **组件依赖声明**：`requires(T t) { typename T::requires_components; }` 编译期检查组件依赖
+}
+
+/// 参考资源
+
+\list{
+- EnTT Library：https://github.com/skypjack/entt（工业级 ECS，大量模板技巧）
+- 《C++ Templates: The Complete Guide》 by Josuttis, Gregor, Vandevoorde
+- CppCon 2019 "The C++ Type System is your Friend" by Hubert Tong
+- flecs ECS: https://github.com/SanderMertens/flecs（Archetype 存储模式）
+- cppreference type_traits: https://en.cppreference.com/w/cpp/header/type_traits
+}

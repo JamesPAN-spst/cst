@@ -1,0 +1,568 @@
+/// 简介
+
+上一节我们学习了 `new`/`delete` 的底层机制。但你有没有想过，为什么 `sizeof(一个只有3字节数据的struct)` 会返回 4 甚至 8？答案就是**内存对齐（Memory Alignment）**。
+
+CPU 从内存读数据不是"一个字节一个字节取"的——它以**字（Word）** 为单位批量读取（64 位 CPU 一次读 8 字节）。如果一个 `int` 的起始地址落在 4 的倍数上，CPU 一次就能读完；如果地址不是 4 的倍数，CPU 需要读两次再拼接，甚至在某些架构（ARM、SPARC）上直接触发硬件异常导致崩溃。
+
+本节从 CPU 为什么需要对齐讲起，逐步深入 `alignof`/`alignas`、结构体填充、`#pragma pack`、SIMD 对齐、缓存行对齐，最终落到游戏引擎中的对齐优化实践。
+
+/// 知识点列表
+
+\list{
+- 为什么需要对齐：CPU 读取效率与硬件要求
+- 自然对齐（Natural Alignment）规则
+- alignof 运算符（Alignment Query）
+- alignas 说明符（Alignment Specifier）
+- 结构体填充（Padding）与尾部填充（Tail Padding）
+- 成员排列优化：减少填充浪费
+- #pragma pack 与手动控制填充
+- std::aligned_storage / std::aligned_union（已弃用）及替代方案
+- SIMD 对齐要求：SSE 16 字节、AVX 32 字节
+- 缓存行（Cache Line）对齐与伪共享（False Sharing）
+- 游戏引擎中的对齐优化：ECS 组件、粒子系统
+}
+
+/// 知识点详解
+
+// 为什么需要对齐
+
+假设你有一排储物柜，每个柜子放 4 本书。取编号 0-3 的书，打开第一个柜子就行；取编号 1-4 的书，你要开两个柜子。CPU 读取内存的道理一模一样。
+
+**自然对齐（Natural Alignment）** 规则：类型 T 的变量，其地址应是 `sizeof(T)` 的整数倍。
+
+\table{
+类型 | 大小（字节） | 对齐要求（典型 x86-64）
+---
+`char` / `bool` | 1 | 1
+`short` | 2 | 2
+`int` / `float` | 4 | 4
+`double` / `long long` / 指针 | 8 | 8
+}
+
+不满足对齐时的后果：
+
+\list{
+- **x86/x64**：硬件自动处理，但有性能惩罚（Penalty）——慢 2-10 倍
+- **ARM（早期）**：直接触发总线错误（Bus Error），程序崩溃
+- **SIMD 指令**：多数对齐加载指令要求严格对齐，否则段错误（Segmentation Fault）
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+
+int main() {
+    std::cout << "=== 各类型自然对齐要求 ===\n";
+    std::cout << "alignof(char):      " << alignof(char)      << "\n";
+    std::cout << "alignof(int):       " << alignof(int)       << "\n";
+    std::cout << "alignof(double):    " << alignof(double)    << "\n";
+    std::cout << "alignof(void*):     " << alignof(void*)     << "\n";
+
+    // 验证编译器保证了自然对齐
+    int x = 42;
+    double y = 3.14;
+    std::cout << "\n&x 地址 % 4 = "
+              << (reinterpret_cast<std::uintptr_t>(&x) % 4) << "\n";
+    std::cout << "&y 地址 % 8 = "
+              << (reinterpret_cast<std::uintptr_t>(&y) % 8) << "\n";
+    return 0;
+}
+}
+
+// alignof 运算符
+
+`alignof` 是 C++11 引入的**编译期运算符（Compile-time Operator）**，查询类型的对齐要求，返回 `std::size_t`，值总是 2 的幂。
+
+\code[cpp]{
+alignof(int)               // 4
+alignof(double)            // 8
+alignof(char[100])         // 1（数组的对齐 = 元素的对齐）
+alignof(std::max_align_t)  // 平台最大基本对齐，通常 16
+}
+
+\note{`alignof` 只能作用于**类型**，不能作用于变量。对结构体返回其最大对齐成员的对齐值：`struct{char c; double d;}` → `alignof == 8`。}
+
+// 结构体填充规则
+
+编译器为了让每个成员满足对齐，会在成员之间和末尾插入**填充字节（Padding Bytes）**。规则两条：
+
+**规则一（成员对齐）：** 每个成员的偏移量必须是其 `alignof` 值的整数倍。
+
+**规则二（总大小）：** 结构体总大小必须是 `alignof(该结构体)` 的整数倍（尾部填充）。
+
+\diagram[memory]{
+stack:
+  [偏移0 ] char a     (1字节)
+  [偏移1 ] --- 填充 --- (3字节)
+  [偏移4 ] int b      (4字节)
+  [偏移8 ] char c     (1字节)
+  [偏移9 ] --- 填充 --- (7字节)
+  [偏移16] double d   (8字节)
+  [偏移24] === 总大小 24 字节 ===
+}
+
+实际数据只有 14 字节，却占了 24 字节——10 字节浪费在填充上（42%）！
+
+\run[cpp]{
+#include <iostream>
+#include <cstddef>  // offsetof
+
+struct Bad {
+    char a;    // 偏移 0
+    int b;     // 偏移 4（跳过 3 字节填充）
+    char c;    // 偏移 8
+    double d;  // 偏移 16（跳过 7 字节填充）
+};
+
+struct Good {
+    double d;  // 偏移 0
+    int b;     // 偏移 8
+    char a;    // 偏移 12
+    char c;    // 偏移 13
+    // 2 字节尾部填充
+};
+
+int main() {
+    std::cout << "=== Bad 布局 ===\n";
+    std::cout << "sizeof: " << sizeof(Bad) << "  alignof: " << alignof(Bad) << "\n";
+    std::cout << "a:" << offsetof(Bad,a) << " b:" << offsetof(Bad,b)
+              << " c:" << offsetof(Bad,c) << " d:" << offsetof(Bad,d) << "\n";
+
+    std::cout << "\n=== Good 布局（从大到小排列）===\n";
+    std::cout << "sizeof: " << sizeof(Good) << "  alignof: " << alignof(Good) << "\n";
+    std::cout << "d:" << offsetof(Good,d) << " b:" << offsetof(Good,b)
+              << " a:" << offsetof(Good,a) << " c:" << offsetof(Good,c) << "\n";
+
+    std::cout << "\n节省 " << sizeof(Bad) - sizeof(Good) << " 字节！\n";
+    return 0;
+}
+}
+
+\tip{**成员排列优化原则：按 `alignof` 从大到小排列成员。** 在 GCC/Clang 中使用 `-Wpadded` 可让编译器告知哪里插入了填充。}
+
+// alignas 说明符
+
+`alignas` 是 C++11 引入的**对齐说明符（Alignment Specifier）**，用于**提高**（不能降低）变量或类型的对齐要求。参数必须是 2 的幂。
+
+\code[cpp]{
+alignas(16) int x = 42;         // 这个 int 放在 16 字节对齐地址上
+
+struct alignas(16) Vec4 {
+    float x, y, z, w;           // 4×4 = 16 字节，刚好填满
+};
+static_assert(alignof(Vec4) == 16);
+
+alignas(64) float data[256];    // 数组起始地址 64 字节对齐
+
+alignas(1) int y;  // 无效！int 自然对齐为 4，alignas 不能降低
+}
+
+\quiz[tf]{
+Q: `alignas(2) double d;` 会使 `d` 的对齐要求变为 2 字节。
+ANS: F
+EXP: `alignas` 只能提高对齐要求，不能降低。`double` 自然对齐 8 字节，`alignas(2)` 比 8 小，被编译器忽略。
+}
+
+// #pragma pack 与手动控制填充
+
+需要**减少**填充（网络协议、文件格式）时，用编译器扩展 `#pragma pack`：
+
+\code[cpp]{
+#pragma pack(push, 1)           // 对齐上限设为 1，消除所有填充
+struct NetworkPacket {
+    uint8_t  type;              // 偏移 0
+    uint32_t sequence;          // 偏移 1（而非 4！）
+    uint16_t length;            // 偏移 5
+    uint8_t  flags;             // 偏移 7
+};
+#pragma pack(pop)               // 恢复默认
+// sizeof = 8，默认对齐下为 12
+}
+
+\warning{`#pragma pack` 不是 C++ 标准，是编译器扩展。它让成员未对齐，某些架构上会崩溃，x86 上有性能损失。**只在与外部二进制协议交互时使用。**}
+
+\collapse[#pragma pack 参数速查]{
+\list{
+- `#pragma pack(push, N)`：保存当前设置，对齐上限设为 N
+- `#pragma pack(pop)`：恢复上次 push 的设置
+- N 的含义：成员实际对齐 = min(自然对齐, N)
+}
+}
+
+// std::aligned_storage 及其替代方案
+
+C++11 的 `std::aligned_storage<Size, Align>` 用于创建满足对齐的原始存储，常见于手写 `variant`/`optional`。
+
+\danger{`std::aligned_storage` 在 **C++23 正式弃用**——它返回的 `char` 数组通过 `reinterpret_cast` 使用时违反严格别名规则（Strict Aliasing Rule），可能导致未定义行为。}
+
+**替代方案（C++17+）：** 直接用 `alignas` + `std::byte` 数组：
+
+\code[cpp]{
+// ❌ 旧写法（C++23 弃用）
+std::aligned_storage<sizeof(T), alignof(T)>::type buf;
+
+// ✅ 新写法
+alignas(T) std::byte buf[sizeof(T)];
+}
+
+// SIMD 对齐要求
+
+**SIMD（Single Instruction, Multiple Data，单指令多数据）** 用一条指令同时处理多个数据，但对对齐有严格要求：
+
+\table{
+指令集 | 寄存器宽度 | 对齐要求
+---
+SSE / SSE2 | 128 位（16 字节） | 16 字节
+AVX / AVX2 | 256 位（32 字节） | 32 字节
+AVX-512 | 512 位（64 字节） | 64 字节
+}
+
+用 `_mm_load_ps`（对齐加载）从未 16 字节对齐的地址读取，直接段错误。
+
+\code[cpp]{
+#include <immintrin.h>
+
+struct alignas(16) SSEVec4 { float x, y, z, w; };  // SSE 16 对齐
+struct alignas(32) AVXVec8 { float v[8]; };         // AVX 32 对齐
+
+void add_sse(const SSEVec4& a, const SSEVec4& b, SSEVec4& out) {
+    __m128 va = _mm_load_ps(&a.x);    // 要求 16 字节对齐
+    __m128 vb = _mm_load_ps(&b.x);
+    _mm_store_ps(&out.x, _mm_add_ps(va, vb));
+}
+}
+
+\note{游戏引擎数学库几乎都用 `alignas(16)` 满足 SSE 要求。C++17 之前 `new` 不保证过度对齐类型的分配——需自定义分配器或用 `_mm_malloc`。}
+
+// 缓存行对齐与伪共享
+
+CPU 以**缓存行（Cache Line，主流 64 字节）** 为单位读写内存。多线程场景中的隐蔽性能杀手——**伪共享（False Sharing）**：两个线程修改不同变量，但变量在同一缓存行内，每次修改都导致对方核心的缓存行失效。
+
+\diagram[memory]{
+stack:
+  [缓存行 64B] counter1(4B) counter2(4B) ...56B...
+  [           ] ↑线程A修改   ↑线程B修改
+  [           ] → 同一缓存行，互相导致缓存失效！
+}
+
+解决：`alignas(64)` 让每个变量独占一条缓存行。
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+struct BadSharing {
+    std::atomic<int> counter1{0};
+    std::atomic<int> counter2{0};  // 与 counter1 在同一缓存行
+};
+
+struct GoodSharing {
+    alignas(64) std::atomic<int> counter1{0};
+    alignas(64) std::atomic<int> counter2{0};  // 各占独立缓存行
+};
+
+template<typename T>
+long long bench(const char* name) {
+    T s;
+    constexpr int N = 5'000'000;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::thread t1([&]{ for(int i=0;i<N;++i) s.counter1.fetch_add(1,std::memory_order_relaxed); });
+    std::thread t2([&]{ for(int i=0;i<N;++i) s.counter2.fetch_add(1,std::memory_order_relaxed); });
+    t1.join(); t2.join();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now()-t0).count();
+    std::cout << name << ": " << ms << " ms (sizeof=" << sizeof(T) << ")\n";
+    return ms;
+}
+
+int main() {
+    std::cout << "=== 伪共享 (False Sharing) 性能对比 ===\n";
+    auto bad = bench<BadSharing>("BadSharing ");
+    auto good = bench<GoodSharing>("GoodSharing");
+    if (good > 0) std::cout << "差距约 " << (double)bad/good << " 倍\n";
+    return 0;
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17：过度对齐类型的动态分配
+
+C++17 之前 `operator new` 只保证 `alignof(std::max_align_t)`（通常 16 字节）对齐。`alignas(32)` 类型用 `new` 分配时地址可能不满足。C++17 修复了这个缺陷：
+
+\compare{
+old:
+// C++14：new 不保证过度对齐
+struct alignas(32) AVXData { float v[8]; };
+auto* p = new AVXData;  // 可能只有 16 字节对齐！
+
+new:
+// C++17：new 自动处理过度对齐
+struct alignas(32) AVXData { float v[8]; };
+auto* p = new AVXData;  // 保证 32 字节对齐 ✅
+// 编译器调用 operator new(size, std::align_val_t{32})
+}
+
+// C++20：[[no_unique_address]]
+
+空类成员按规则至少占 1 字节。C++20 的 `[[no_unique_address]]` 让空类成员**不占额外空间**：
+
+\run[cpp20]{
+#include <iostream>
+
+struct Empty {};
+
+struct Old { Empty tag; int value; };
+struct New { [[no_unique_address]] Empty tag; int value; };
+
+// 无状态删除器的真实场景
+struct NoOp { void operator()(void*) const {} };
+struct Ptr_Old { int* p; NoOp d; };
+struct Ptr_New { int* p; [[no_unique_address]] NoOp d; };
+
+int main() {
+    std::cout << "sizeof(Old): " << sizeof(Old) << "\n";       // 8
+    std::cout << "sizeof(New): " << sizeof(New) << "\n";       // 4
+    std::cout << "sizeof(Ptr_Old): " << sizeof(Ptr_Old) << "\n"; // 16
+    std::cout << "sizeof(Ptr_New): " << sizeof(Ptr_New) << "\n"; // 8
+    return 0;
+}
+}
+
+\tip{C++17 引入了 `std::hardware_destructive_interference_size`（`<new>`），值为避免伪共享应隔开的最小距离（通常 64）。但部分编译器未完整支持，实践中直接用 `alignas(64)` 更可靠。}
+
+/// 工程实践
+
+// 游戏引擎中的对齐优化
+
+**1. ECS 组件对齐**——16 字节对齐以支持 SSE：
+
+\code[cpp]{
+struct alignas(16) Position { float x, y, z, _pad; };
+struct alignas(16) Velocity { float vx, vy, vz, _pad; };
+alignas(64) Position positions[1024];  // 缓存行对齐
+alignas(64) Velocity velocities[1024];
+}
+
+**2. SoA 粒子系统**——每个属性独立数组，AVX 对齐：
+
+\code[cpp]{
+struct ParticleSystem {
+    static constexpr size_t MAX = 65536;
+    alignas(32) float pos_x[MAX];  // AVX 32 字节对齐
+    alignas(32) float pos_y[MAX];
+    alignas(32) float pos_z[MAX];
+    alignas(32) float vel_x[MAX];
+    alignas(32) float vel_y[MAX];
+    alignas(32) float vel_z[MAX];
+    size_t count = 0;
+};
+}
+
+**3. 对齐指针工具函数**——内存池必备：
+
+\code[cpp]{
+inline void* align_up(void* ptr, std::size_t alignment) {
+    auto addr = reinterpret_cast<std::uintptr_t>(ptr);
+    return reinterpret_cast<void*>((addr + alignment - 1) & ~(alignment - 1));
+}
+}
+
+\quiz[choice]{
+Q: 在 ECS 中将 `Position{float x,y,z}` 填充到 16 字节对齐的主要原因是？
+A: 节省内存空间
+B: 方便 JSON 序列化
+C: 满足 SSE 指令的对齐要求以使用 SIMD 加速
+D: 防止多线程数据竞争
+ANS: C
+EXP: SSE 要求 16 字节对齐。填充后可用 `_mm_load_ps` 一次加载整个位置向量，SIMD 并行加速远超 4 字节填充的代价。
+}
+
+/// 难点易错点分析
+
+\danger{**`alignas` 不能减小对齐，只能增大。** `alignas(1) int x;` 被编译器忽略。要打包数据必须用 `#pragma pack`（需承受性能代价）。}
+
+\danger{**不要混用 `#pragma pack` 和 `alignas`。** 前者设对齐"上限"，后者设"下限"，同时作用在不同编译器上行为不同。二选一。}
+
+\danger{**序列化不能直接 `memcpy` 整个 struct。** 填充字节内容未定义（可能含栈上残留敏感数据），不同平台填充不同。必须逐字段序列化或用 Protocol Buffers / FlatBuffers。}
+
+\warning{**C++17 前 `new` 不保证过度对齐。** `new AVXData`（要求 32 对齐）可能只返回 16 对齐地址。升级到 C++17 或用 `_mm_malloc`。}
+
+\warning{**`std::vector` 默认分配器不保证过度对齐。** `std::vector<alignas(32) T>` 在 C++17 前内部缓冲区可能不满足 32 对齐。需自定义对齐分配器。}
+
+\quiz[choice]{
+Q: 以下哪种情况会导致未定义行为？
+A: `alignas(16) int arr[4];`
+B: `#pragma pack(push,1)` 后定义 struct 并用 `_mm_load_ps` 加载其 float 数组
+C: 使用 `alignof` 查询 `std::string` 的对齐要求
+D: 用 `reinterpret_cast<uintptr_t>(&x) % alignof(int)` 检查对齐
+ANS: B
+EXP: `#pragma pack(1)` 消除填充，float 数组可能不在 16 字节对齐地址。`_mm_load_ps` 要求 16 对齐——不满足时触发段错误。其余三项均合法。
+}
+
+\quiz[tf]{
+Q: C++ 结构体的 `sizeof` 值一定 ≥ 其所有成员 `sizeof` 之和。
+ANS: T
+EXP: 填充字节使 `sizeof(struct)` ≥ 成员大小之和。等号仅在成员恰好无需任何填充时成立。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：结构体布局分析
+
+分析 `Mystery` 的内存布局，先笔算偏移量再运行验证，然后重排成员使 `sizeof` 最小。
+
+\run[cpp]{
+#include <iostream>
+#include <cstddef>
+
+struct Mystery {
+    char a;
+    double b;
+    int c;
+    char d;
+    short e;
+};
+
+int main() {
+    std::cout << "sizeof(Mystery) = " << sizeof(Mystery) << "\n";
+    std::cout << "alignof(Mystery) = " << alignof(Mystery) << "\n\n";
+    std::cout << "a:" << offsetof(Mystery,a) << " b:" << offsetof(Mystery,b)
+              << " c:" << offsetof(Mystery,c) << " d:" << offsetof(Mystery,d)
+              << " e:" << offsetof(Mystery,e) << "\n";
+
+    // TODO: 创建 OptimizedMystery，按对齐从大到小排列，使 sizeof 最小
+    // struct OptimizedMystery { ... };
+    // std::cout << "sizeof(OptimizedMystery) = " << sizeof(OptimizedMystery) << "\n";
+    return 0;
+}
+}
+
+// 🟢 基础题 2：alignas 实践
+
+给 `SimdVec4` 添加正确的 `alignas` 并验证地址对齐。
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+
+// TODO: 添加 alignas 使其满足 SSE 16 字节对齐
+struct SimdVec4 {
+    float x, y, z, w;
+};
+
+int main() {
+    std::cout << "alignof(SimdVec4) = " << alignof(SimdVec4) << "\n";
+    SimdVec4 v{1,2,3,4};
+    auto addr = reinterpret_cast<std::uintptr_t>(&v);
+    std::cout << "地址 % 16 = " << (addr % 16) << " (应为 0)\n";
+
+    // TODO: C++17 堆分配验证
+    // SimdVec4* p = new SimdVec4{5,6,7,8};
+    // std::cout << "堆地址 % 16 = " << (reinterpret_cast<std::uintptr_t>(p)%16) << "\n";
+    // delete p;
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：消除伪共享
+
+下面的多线程计数器存在伪共享，修复后对比性能。
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <vector>
+
+struct Counters {
+    // TODO: 消除 counter 之间的伪共享
+    std::atomic<long long> counter[4];
+};
+
+int main() {
+    Counters c{};
+    constexpr int N = 10'000'000;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t)
+        ts.emplace_back([&c,t]{ for(int i=0;i<N;++i) c.counter[t].fetch_add(1,std::memory_order_relaxed); });
+    for (auto& t : ts) t.join();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::high_resolution_clock::now()-t0).count();
+    std::cout << "耗时: " << ms << " ms  sizeof=" << sizeof(Counters) << "\n";
+    long long sum=0; for(int i=0;i<4;++i) sum+=c.counter[i].load();
+    std::cout << "总计: " << sum << " (期望 " << 4LL*N << ")\n";
+    return 0;
+}
+}
+
+\collapse[🤔 提示]{用 `alignas(64)` 包装每个 counter 使其独占缓存行。可定义 `struct alignas(64) PaddedCounter { std::atomic<long long> val{0}; };` 再用数组。}
+
+// 🟡 进阶题 2：手写对齐分配函数
+
+实现 `my_aligned_alloc`/`my_aligned_free`，支持任意 2 的幂对齐。
+
+\run[cpp]{
+#include <iostream>
+#include <cstdlib>
+#include <cstdint>
+#include <cassert>
+
+void* my_aligned_alloc(std::size_t size, std::size_t alignment) {
+    /* TODO: 多分配空间，找到对齐地址，在其前面存原始指针 */
+    return nullptr;
+}
+
+void my_aligned_free(void* ptr) {
+    /* TODO: 取回原始指针并 free */
+}
+
+int main() {
+    void* p = my_aligned_alloc(256, 32);
+    assert(p && reinterpret_cast<std::uintptr_t>(p) % 32 == 0);
+    std::cout << "32对齐: " << p << " 检查通过\n";
+
+    void* q = my_aligned_alloc(1024, 64);
+    assert(q && reinterpret_cast<std::uintptr_t>(q) % 64 == 0);
+    std::cout << "64对齐: " << q << " 检查通过\n";
+
+    my_aligned_free(p);
+    my_aligned_free(q);
+    std::cout << "所有测试通过！\n";
+    return 0;
+}
+}
+
+\collapse[🤔 参考思路]{
+\code[cpp]{
+void* my_aligned_alloc(std::size_t size, std::size_t alignment) {
+    void* raw = std::malloc(size + alignment + sizeof(void*));
+    if (!raw) return nullptr;
+    auto addr = reinterpret_cast<std::uintptr_t>(raw) + sizeof(void*);
+    auto aligned = (addr + alignment - 1) & ~(alignment - 1);
+    reinterpret_cast<void**>(aligned)[-1] = raw;  // 存原始指针
+    return reinterpret_cast<void*>(aligned);
+}
+void my_aligned_free(void* ptr) {
+    if (ptr) std::free(reinterpret_cast<void**>(ptr)[-1]);
+}
+}
+}
+
+// 🔴 挑战题：SoA vs AoS 粒子系统性能对比
+
+\list{
+- 实现 SoA 粒子系统：pos(x,y,z)、vel(vx,vy,vz)、life 各为独立数组，`alignas(64)`
+- 实现 AoS 对照组：`struct Particle{float x,y,z,vx,vy,vz,life;}`
+- 两者各实现 `update(float dt)` 更新位置
+- 至少 100000 个粒子，用 `<chrono>` 测量并输出对比结果
+- 可选加分：SSE intrinsics 加速 SoA 版本
+}
+
+\collapse[🤔 参考思路]{
+SoA update 只顺序访问 pos_x/vel_x 等连续数组，缓存预取高效；AoS 每个粒子间隔 28 字节（7 个 float），缓存行中混入不相关数据。10 万+粒子时 SoA 通常快 2-5 倍。
+}

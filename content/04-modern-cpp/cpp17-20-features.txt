@@ -1,0 +1,528 @@
+/// 简介
+
+前面几节我们分别深入了 `auto` 推导、`constexpr`、概念（Concepts）、移动语义、智能指针、错误处理、模块与协程。但现代 C++ 标准（C++17/20/23）带来的改进远不止这些——还有一大批"散落"的实用特性，它们单独看不起眼，组合起来却能显著提升代码的**简洁性、安全性和可读性**。
+
+这一节是这些特性的"集合站"。我们按标准版本分组，重点讲授本章其它文件没有覆盖的内容：C++17 的带初始化 `if`/`switch`、折叠表达式（Fold Expressions）、`std::filesystem`、嵌套命名空间、标准属性；C++20 的指定初始化器（Designated Initializers）、三路比较回顾；C++23 的 `std::print`/`std::println`、多维下标、推导 `this`（Deducing This）和 `std::generator` 速览。最后给出一份**特性采用路线图**。
+
+/// 知识点列表
+
+\list{
+- C++17：带初始化语句的 if / switch
+- C++17：折叠表达式（Fold Expressions）
+- C++17：嵌套命名空间与 std::filesystem
+- C++17/20：标准属性 [[nodiscard]] / [[maybe_unused]] / [[deprecated]] / [[likely]]
+- C++20：指定初始化器（Designated Initializers）
+- C++20：三路比较运算符 <=>（回顾）
+- C++23：std::print / std::println、多维下标、推导 this、std::generator
+- 特性采用路线图
+}
+
+/// 知识点详解
+
+// C++17：带初始化语句的 if / switch
+
+C++17 之前，`if` 判断前做局部操作时，变量作用域会"泄漏"到 `if` 外面。C++17 的**带初始化语句的 if**（if with initializer）解决了这个问题——把声明放进 `if`，作用域仅限 `if-else` 块内部：
+
+\run[cpp]{
+#include <iostream>
+#include <map>
+#include <string>
+
+int main() {
+    std::map<std::string, int> scores{{"Alice", 95}, {"Bob", 82}};
+
+    // C++17: init-statement 在 if 内部声明变量
+    if (auto it = scores.find("Alice"); it != scores.end()) {
+        std::cout << "Found: " << it->second << "\n";
+    } else {
+        std::cout << "Not found\n";
+    }
+    // it 在这里不可见——作用域被限制住了
+
+    // switch 也支持同样的语法
+    switch (int val = 42 % 3; val) {
+        case 0: std::cout << "divisible by 3\n"; break;
+        case 1: std::cout << "remainder 1\n"; break;
+        default: std::cout << "remainder 2\n"; break;
+    }
+}
+}
+
+\note{`if` 初始化语句在并发编程中尤其有用——`if (std::lock_guard lock(mtx); shared_data.ready)` 可以把锁的作用域限制在 `if` 块内。}
+
+// C++17：折叠表达式（Fold Expressions）
+
+用过**可变参数模板（Variadic Templates）** 的人都体会过递归展开参数包的繁琐。C++17 的**折叠表达式**用一行语法替代了递归模板。四种形式：
+
+\table{
+形式 | 语法 | 展开结果
+---
+一元右折叠 | `(pack op ...)` | `a op (b op (c op d))`
+一元左折叠 | `(... op pack)` | `((a op b) op c) op d`
+二元右折叠 | `(pack op ... op init)` | `a op (b op (c op init))`
+二元左折叠 | `(init op ... op pack)` | `((init op a) op b) op c`
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// 一元右折叠：求和
+template<typename... Args>
+auto sum(Args... args) { return (args + ...); }
+
+// 二元左折叠：带初始值
+template<typename... Args>
+auto sumFrom(int init, Args... args) { return (init + ... + args); }
+
+// 逗号折叠：打印所有参数
+template<typename... Args>
+void printAll(const Args&... args) {
+    ((std::cout << args << " "), ...);
+    std::cout << "\n";
+}
+
+// 逻辑折叠：检查值是否在候选列表中
+template<typename T, typename... Ts>
+bool isAnyOf(const T& val, const Ts&... candidates) {
+    return ((val == candidates) || ...);
+}
+
+int main() {
+    std::cout << "sum = " << sum(1, 2, 3, 4) << "\n";            // 10
+    std::cout << "sumFrom = " << sumFrom(100, 1, 2, 3) << "\n";  // 106
+    printAll("hello", 42, 3.14);                                   // hello 42 3.14
+    std::cout << std::boolalpha << isAnyOf(42, 1, 2, 42) << "\n"; // true
+}
+}
+
+\warning{**空参数包：** 一元折叠在参数包为空时，`&&` 返回 `true`，`||` 返回 `false`，但 `+`/`*` 等会**编译失败**。如果函数可能收到零参数，用二元折叠提供初始值。}
+
+// C++17：嵌套命名空间与 std::filesystem
+
+**嵌套命名空间**是纯语法糖，但可读性提升明显：
+
+\compare{
+old: namespace Game {
+    namespace Engine {
+        namespace Renderer {
+            class Mesh { };
+        }
+    }
+}
+
+new: // C++17——一行搞定
+namespace Game::Engine::Renderer {
+    class Mesh { };
+}
+}
+
+**std::filesystem** 是另一个重量级 C++17 特性——标准库终于有了跨平台文件系统操作能力，不再需要 POSIX API 或 Boost.Filesystem。
+
+\table{
+常用操作 | 函数 / 方法 | 说明
+---
+路径拼接 | `p1 / p2` | 用 `/` 运算符拼接
+文件是否存在 | `fs::exists(p)` | 返回 `bool`
+创建目录 | `fs::create_directories(p)` | 递归创建
+复制/删除 | `fs::copy` / `fs::remove_all` | 支持选项/递归
+文件大小 | `fs::file_size(p)` | 返回字节数
+递归遍历 | `fs::recursive_directory_iterator` | 深度优先遍历
+}
+
+\code[cpp]{
+#include <filesystem>
+namespace fs = std::filesystem;
+
+// 路径拼接与查询
+fs::path file = fs::current_path() / "data" / "config.json";
+std::cout << file.filename() << "\n";   // config.json
+std::cout << file.extension() << "\n";  // .json
+
+// 遍历目录
+for (const auto& entry : fs::directory_iterator(fs::current_path())) {
+    if (entry.is_regular_file())
+        std::cout << entry.path().filename() << " " << entry.file_size() << "B\n";
+}
+}
+
+\tip{`std::filesystem` 的函数有两种重载：抛异常版和接受 `std::error_code&` 版。在循环中处理大量文件时优先用后者，避免异常开销。}
+
+// C++17/20：标准属性（Attributes）
+
+**属性（Attributes）** 是用 `[[ ]]` 包裹的编译器提示。C++17/20 陆续加入了多个实用属性：
+
+\table{
+属性 | 版本 | 作用
+---
+`[[nodiscard]]` | C++17 | 返回值被忽略时警告
+`[[nodiscard("msg")]]` | C++20 | 同上，附带消息
+`[[maybe_unused]]` | C++17 | 抑制"未使用"警告
+`[[deprecated("msg")]]` | C++14 | 标记废弃 API
+`[[likely]]` / `[[unlikely]]` | C++20 | 分支概率提示
+`[[no_unique_address]]` | C++20 | 空类成员零开销
+}
+
+\code[cpp]{
+[[nodiscard("检查错误码")]]
+int openFile(const char* path);
+
+void debug([[maybe_unused]] int level, const char* msg);
+
+[[deprecated("请使用 newApi()")]]
+void oldApi();
+
+if (cache.hit()) [[likely]] { return cache.get(); }
+}
+
+\note{`[[nodiscard]]` 特别适合用在返回错误码的函数、工厂函数和 `lock()` 这类返回锁守卫的函数上。忘记接收返回值几乎肯定是 bug。}
+
+// C++20：指定初始化器（Designated Initializers）
+
+C 语言一直支持按名字给结构体赋值，C++ 直到 C++20 才正式引入（且更严格——要求顺序与声明一致）：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+struct WindowConfig {
+    int width = 800;
+    int height = 600;
+    bool fullscreen = false;
+    bool vsync = true;
+    std::string title = "My App";
+};
+
+void createWindow(const WindowConfig& cfg) {
+    std::cout << cfg.title << " (" << cfg.width << "x" << cfg.height << ")"
+              << (cfg.fullscreen ? " [fullscreen]" : "") << "\n";
+}
+
+int main() {
+    // 只写关心的字段，其余用默认值
+    createWindow({.width = 1920, .height = 1080,
+                  .fullscreen = true, .title = "Game Engine"});
+    createWindow({.width = 1280, .height = 720, .title = "Debug View"});
+}
+}
+
+\warning{C++20 要求字段出现顺序与声明一致。`{.height = 1080, .width = 1920}` 是**编译错误**（C99 允许乱序）。}
+
+这种模式在游戏引擎中大量用于配置结构体，是**命名参数（Named Parameters）** 的优雅替代方案。
+
+// C++20：三路比较运算符 <=>（回顾）
+
+**太空船运算符（Spaceship Operator）** `<=>` 可以一次性定义所有比较关系：
+
+\code[cpp]{
+#include <compare>
+struct Point {
+    int x, y;
+    auto operator<=>(const Point&) const = default;
+    // 自动生成 ==, !=, <, >, <=, >= 全部六个
+};
+}
+
+`= default` 按声明顺序逐字段比较。自定义则手动返回 `std::strong_ordering` / `std::weak_ordering` / `std::partial_ordering`。
+
+\collapse[三种排序类别的区别]{
+- **`std::strong_ordering`**：`a == b` 表示完全不可区分（如整数比较）
+- **`std::weak_ordering`**：`a == b` 表示等价但不一定相同（如大小写不敏感字符串）
+- **`std::partial_ordering`**：允许"不可比较"（如浮点 `NaN`）
+}
+
+// C++23 新特性速览
+
+**std::print / std::println** — 基于 `<format>` 的格式化输出，替代 `cout`：
+
+\compare{
+old: std::cout << "Name: " << name << ", Age: " << age << "\n";
+
+new: std::println("Name: {}, Age: {}", name, age);  // C++23
+}
+
+**多维下标运算符** — `operator[]` 可接受多个参数：
+
+\code[cpp]{
+class Matrix {
+    std::vector<double> data_;
+    int cols_;
+public:
+    double& operator[](int r, int c) { return data_[r * cols_ + c]; }
+};
+Matrix m(3, 3);
+m[1, 2] = 5.0;  // 比 m(1,2) 或 m[1][2] 更自然
+}
+
+**推导 this（Deducing This）** — 一个函数替代 const/非const/左值/右值四个重载：
+
+\code[cpp]{
+struct Widget {
+    std::string name;
+    // C++23: 显式对象形参
+    template<typename Self>
+    auto&& getName(this Self&& self) {
+        return std::forward<Self>(self).name;
+    }
+};
+}
+
+**std::generator** — 标准惰性生成器，配合 `co_yield` 使用：
+
+\code[cpp]{
+#include <generator>
+std::generator<int> fibonacci() {
+    int a = 0, b = 1;
+    while (true) {
+        co_yield a;
+        auto next = a + b; a = b; b = next;
+    }
+}
+// for (int val : fibonacci()) { ... }  // 惰性求值
+}
+
+\note{`std::generator` 和协程的完整机制详见本章的**模块与协程**节。}
+
+/// 新版特性（C++17/20/23）
+
+跨版本特性速查表（包括其它文件详讲的内容）：
+
+\table{
+特性 | 版本 | 详解位置 | 一句话总结
+---
+`auto` / 结构化绑定 | C++11/17 | auto-deduction 节 | 编译器推导类型
+if/switch with init | C++17 | 本节 | 缩小变量作用域
+折叠表达式 | C++17 | 本节 | 一行展开参数包
+`std::filesystem` | C++17 | 本节 | 跨平台文件操作
+`constexpr` / `consteval` | C++17/20 | constexpr 节 | 编译期计算
+Concepts | C++20 | concepts 节 | 模板约束
+`operator<=>` | C++20 | 本节 | 自动生成全套比较
+属性 `[[nodiscard]]` 等 | C++17/20 | 本节 | 编译器静态检查
+指定初始化器 | C++20 | 本节 | 按名字初始化结构体
+Modules / Coroutines | C++20 | modules-coroutines 节 | 新编译模型 / 可暂停函数
+`std::expected` | C++23 | error-handling 节 | 值或错误返回
+`std::print` / 多维下标 / 推导 this | C++23 | 本节 | 输出 / 下标 / 成员函数简化
+}
+
+/// 工程实践
+
+// 特性采用路线图
+
+\table{
+优先级 | 特性 | 理由
+---
+★★★ 立即采用 | `[[nodiscard]]`、`[[maybe_unused]]` | 零风险，帮编译器发现 bug
+★★★ 立即采用 | if with initializer、嵌套命名空间 | 纯语法改善，所有编译器支持
+★★★ 立即采用 | 指定初始化器 | 配置结构体最佳搭档
+★★☆ 推荐采用 | 折叠表达式、`std::filesystem`、`<=>` | 需要一定基础，个别边缘差异
+★☆☆ 酌情采用 | `std::print`、多维 `[]`、推导 this | C++23 编译器支持仍在完善
+☆☆☆ 观望 | Modules、`std::generator` | 工具链支持不成熟
+}
+
+// 特性测试宏
+
+实际项目中用**特性测试宏（Feature Test Macros）** 检查编译器支持：
+
+\code[cpp]{
+#include <version>
+#if __cpp_designated_initializers >= 201707L
+    // 支持指定初始化器
+#endif
+#if __cpp_lib_filesystem >= 201703L
+    // 支持 std::filesystem
+#endif
+#if __cpp_lib_print >= 202207L
+    // 支持 std::print / std::println
+#endif
+}
+
+\tip{CMake 中用 `target_compile_features(mylib PUBLIC cxx_std_20)` 要求最低标准版本。}
+
+/// 难点易错点分析
+
+\danger{**折叠表达式空包：** `(args + ...)` 空包时 `&&` 返回 `true`、`||` 返回 `false`，但 `+`/`*` 等直接编译失败。务必用二元折叠 `(0 + ... + args)` 处理可能为空的参数包。}
+
+\danger{**指定初始化器顺序：** 字段顺序必须与声明一致。`{.y = 1, .x = 2}`（`x` 在 `y` 前声明）是编译错误。与 C99 不同。}
+
+\danger{**filesystem 异常：** `fs::copy`、`fs::remove` 等默认抛异常。循环中处理大量文件时应使用 `std::error_code` 版本。}
+
+\warning{**[[likely]]/[[unlikely]] 不是银弹：** 现代 CPU 分支预测器很智能，只在有 profiling 数据支持的热点路径使用，滥用反而误导编译器。}
+
+\quiz[choice]{
+Q: 以下哪个 C++17 折叠表达式在**参数包为空**时会编译失败？
+A: `(args && ...)`
+B: `(args || ...)`
+C: `(args + ...)`
+D: `(0 + ... + args)`
+ANS: C
+EXP: `&&` 空包返回 `true`，`||` 返回 `false`，这是特殊规则。`+` 无此规则，空包编译失败。D 是二元折叠有初始值，空包返回 `0`。
+}
+
+\quiz[tf]{
+Q: C++20 的指定初始化器允许以任意顺序指定结构体成员（和 C99 一样）。
+ANS: F
+EXP: C++20 要求字段顺序与声明顺序一致，乱序是编译错误。这与 C99 不同。
+}
+
+\quiz[choice]{
+Q: 关于 `[[nodiscard]]`，哪个说法**正确**？
+A: 只能用在函数返回类型上
+B: 运行时检查返回值是否被使用
+C: 忽略返回值会产生编译器警告（非错误）
+D: C++20 才引入
+ANS: C
+EXP: `[[nodiscard]]` 产生**警告**而非错误。C++17 引入，C++20 增加带消息版。也可用在类/枚举声明上，是纯编译期检查。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：属性与 if 初始化语句
+
+添加合适的属性，并将传统 `if` 改写为带初始化语句的 `if`。
+
+\run[cpp]{
+#include <iostream>
+#include <map>
+#include <string>
+
+// TODO: 添加 [[nodiscard]]
+int computeHash(const std::string& input) {
+    int hash = 0;
+    for (char c : input) hash = hash * 31 + c;
+    return hash;
+}
+
+// TODO: 给 verbose 添加 [[maybe_unused]]
+void processData(bool verbose) {
+    std::cout << "Processing...\n";
+}
+
+int main() {
+    std::map<std::string, int> inv{{"apple", 5}, {"banana", 3}};
+
+    // TODO: 改写为 if with initializer
+    auto it = inv.find("banana");
+    if (it != inv.end()) {
+        std::cout << it->first << " = " << it->second << "\n";
+    }
+
+    int h = computeHash("hello");
+    std::cout << "Hash: " << h << "\n";
+    processData(true);
+}
+}
+
+// 🟢 基础题 2：折叠表达式
+
+用折叠表达式实现 `maxOf` 和 `joinWith`。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// TODO: 折叠表达式求所有参数的最大值
+template<typename T, typename... Rest>
+T maxOf(T first, Rest... rest) {
+    /* TODO: 你的代码 */
+    return first;
+}
+
+// TODO: 折叠表达式将字符串用分隔符连接
+template<typename... Args>
+std::string joinWith(const std::string& sep, const Args&... args) {
+    /* TODO: 你的代码 */
+    return "";
+}
+
+int main() {
+    std::cout << "max = " << maxOf(3, 7, 2, 9, 1) << "\n";          // 9
+    std::cout << joinWith(", ", "hello", "world", "cpp") << "\n";     // hello, world, cpp
+}
+}
+
+// 🟡 进阶题 1：filesystem 文件统计
+
+递归遍历目录，按扩展名分组统计文件数和总大小。要求使用 `error_code` 版本。
+
+\run[cpp]{
+#include <iostream>
+#include <filesystem>
+#include <map>
+#include <string>
+#include <iomanip>
+
+namespace fs = std::filesystem;
+
+struct FileStats { int count = 0; std::uintmax_t totalSize = 0; };
+
+std::map<std::string, FileStats> analyzeDirectory(const fs::path& dir) {
+    std::map<std::string, FileStats> stats;
+    /* TODO: 用 recursive_directory_iterator + error_code 遍历
+       按 extension() 分组统计 count 和 file_size */
+    return stats;
+}
+
+int main() {
+    if (auto stats = analyzeDirectory(fs::current_path()); !stats.empty()) {
+        std::cout << std::left << std::setw(12) << "Ext"
+                  << std::right << std::setw(6) << "Count"
+                  << std::setw(12) << "Size(B)" << "\n";
+        for (const auto& [ext, s] : stats)
+            std::cout << std::left << std::setw(12) << (ext.empty() ? "(none)" : ext)
+                      << std::right << std::setw(6) << s.count
+                      << std::setw(12) << s.totalSize << "\n";
+    }
+}
+}
+
+// 🟡 进阶题 2：指定初始化器 + 属性改造
+
+将旧风格代码改造为 C++20：删除构造函数改用指定初始化器，添加属性，改用 if with initializer。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+
+// TODO: 删除构造函数，改为聚合类型 + 默认值
+struct Task {
+    std::string name;
+    int priority;
+    bool completed;
+    Task(const std::string& n, int p, bool c) : name(n), priority(p), completed(c) {}
+};
+
+// TODO: 添加 [[nodiscard]]
+int countPending(const std::vector<Task>& tasks) {
+    int n = 0;
+    for (const auto& t : tasks) if (!t.completed) ++n;
+    return n;
+}
+
+int main() {
+    // TODO: 改用指定初始化器
+    std::vector<Task> tasks{
+        Task("Buy groceries", 2, false),
+        Task("Fix bug", 8, false),
+        Task("Code review", 3, true),
+    };
+    // TODO: 改为 if with initializer
+    int p = countPending(tasks);
+    if (p > 0) std::cout << "Pending: " << p << "\n";
+}
+}
+
+// 🔴 挑战题：现代 C++ 特性全面改造
+
+给定一段 C++11 风格的完整程序，改造为 C++17/20 风格。
+
+**要求：** 至少应用以下 7 项中的 5 项——结构化绑定替代 `.first/.second`、折叠表达式替代递归模板、if with initializer（≥3 处）、`[[nodiscard]]`、指定初始化器、嵌套命名空间、`std::filesystem`。改造后行为完全不变。
+
+\collapse[参考思路]{
+1. 写一个"文件管理器"程序：遍历目录、统计文件、排序输出
+2. 先用 C++11 风格实现，确认编译通过
+3. 逐项改造，每改一项编译验证
+4. 折叠表达式用在"打印多个统计值"或"合并多个过滤条件"
+5. 嵌套命名空间组织工具函数：`namespace FM::Utils::Format {}`
+6. 用 `std::filesystem` 替换手写递归遍历
+}

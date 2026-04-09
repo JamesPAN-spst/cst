@@ -1,0 +1,447 @@
+/// 简介
+
+经典 GoF 模式诞生于 C++98 时代，而现代 C++（C++11~23）的语言特性催生了一批**独特的惯用法（Idioms）和模式**——它们利用模板元编程、值语义、概念约束等新机制，解决继承层次膨胀、运行时开销、编译依赖等问题。本节从实际工程需求出发，讲解八种在现代 C++ 代码库中高频出现的模式，每种都对比传统方案说明"为什么要用它"。
+
+/// 知识点列表
+
+\list{
+- CRTP（Curiously Recurring Template Pattern）— 静态多态
+- 类型擦除（Type Erasure）— 编译期类型 + 运行时多态的桥梁
+- 基于策略的设计（Policy-Based Design）— 编译期组合行为
+- 混入（Mixins）— 通过模板继承注入功能
+- Tag Dispatch vs Concepts — 静态分派的演化
+- RAII 变体：ScopeGuard — 作用域结束自动执行清理
+- Pimpl（编译防火墙）— 隐藏实现减少编译依赖
+- NVI（Non-Virtual Interface）— Template Method 的现代变体
+}
+
+/// 知识点详解
+
+// CRTP
+
+虚函数有运行时开销（vtable 间接跳转、无法内联）。**CRTP（Curiously Recurring Template Pattern，奇异递归模板模式）** 通过让派生类作为基类的模板参数，实现**编译期多态（Static Polymorphism）**——零运行时开销。
+
+\run[cpp]{
+#include <iostream>
+
+// CRTP 基类——Base 知道 Derived 的完整类型
+template<typename Derived>
+class Renderable {
+public:
+    void render() {
+        // 编译期"虚函数调用"——无 vtable
+        static_cast<Derived*>(this)->renderImpl();
+    }
+};
+
+class Sprite : public Renderable<Sprite> {
+public:
+    void renderImpl() { std::cout << "Render sprite\n"; }
+};
+
+class Mesh : public Renderable<Mesh> {
+public:
+    void renderImpl() { std::cout << "Render mesh\n"; }
+};
+
+// 编译期多态——函数模板而非虚函数
+template<typename T>
+void draw(Renderable<T>& obj) {
+    obj.render();  // 编译器直接内联 renderImpl()
+}
+
+int main() {
+    Sprite s;
+    Mesh m;
+    draw(s);
+    draw(m);
+}
+}
+
+\warning{**CRTP 的限制：** 不同的 `Renderable<Sprite>` 和 `Renderable<Mesh>` 是**不同类型**——无法放入同一个 `vector<Base*>` 中。需要运行时异构集合时，仍需虚函数或类型擦除。CRTP 适合**批量处理同类型对象**的场景。}
+
+// 类型擦除
+
+`std::function` 可以存储 lambda、函数指针、函数对象——它是怎么做到的？答案是**类型擦除（Type Erasure）**：外部看到统一的非模板类型，内部用模板捕获具体类型并通过虚函数调用。这是**模板（编译期类型）+ 虚函数（运行时多态）的桥梁**。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+
+// 手写简化版 std::function<int(int)>
+class AnyCallable {
+    struct Concept {
+        virtual int call(int) = 0;
+        virtual ~Concept() = default;
+    };
+
+    template<typename F>
+    struct Model : Concept {
+        F func;
+        explicit Model(F f) : func(std::move(f)) {}
+        int call(int x) override { return func(x); }
+    };
+
+    std::unique_ptr<Concept> impl_;
+public:
+    template<typename F>
+    AnyCallable(F f) : impl_(std::make_unique<Model<F>>(std::move(f))) {}
+
+    int operator()(int x) { return impl_->call(x); }
+};
+
+int doubleIt(int x) { return x * 2; }
+
+int main() {
+    AnyCallable f1 = [](int x) { return x + 10; };  // lambda
+    AnyCallable f2 = doubleIt;                         // 函数指针
+
+    std::cout << "f1(5) = " << f1(5) << "\n";  // 15
+    std::cout << "f2(5) = " << f2(5) << "\n";  // 10
+
+    // 统一类型——可以放在同一个容器中
+}
+}
+
+\note{**类型擦除三件套：Concept（内部接口）、Model（模板实现）、外部持有 `unique_ptr<Concept>`。** `std::any`、`std::function`、`std::move_only_function`、Sean Parent 的 `runtime polymorphism` 都遵循这个模式。理解这个结构就掌握了类型擦除的核心。}
+
+// 基于策略的设计
+
+**基于策略的设计（Policy-Based Design）** 通过模板参数注入行为策略，在编译期组合出不同的类变体——每种策略是一个小型类，通过继承或成员聚合混入宿主类。经典例子：Alexandrescu 的 `SmartPtr`。
+
+\code[cpp]{
+// 存储策略
+struct HeapStorage {
+    void* ptr_ = nullptr;
+    void alloc(size_t n) { ptr_ = ::operator new(n); }
+    void dealloc() { ::operator delete(ptr_); ptr_ = nullptr; }
+    void* get() const { return ptr_; }
+};
+
+// 线程安全策略
+struct SingleThread { void lock() {} void unlock() {} };
+struct MultiThread {
+    std::mutex mtx_;
+    void lock() { mtx_.lock(); }
+    void unlock() { mtx_.unlock(); }
+};
+
+// 检查策略
+struct NoCheck { static void check(void*) {} };
+struct NullCheck {
+    static void check(void* p) {
+        if (!p) throw std::runtime_error("null pointer access");
+    }
+};
+
+// 组合：用户选择策略组合
+template<typename Storage, typename Threading, typename Checking>
+class SmartPtr : private Storage, private Threading {
+public:
+    void* operator->() {
+        Threading::lock();
+        Checking::check(Storage::get());
+        auto* p = Storage::get();
+        Threading::unlock();
+        return p;
+    }
+};
+
+using FastPtr = SmartPtr<HeapStorage, SingleThread, NoCheck>;
+using SafePtr = SmartPtr<HeapStorage, MultiThread, NullCheck>;
+}
+
+\tip{**Policy-Based Design vs Strategy 模式：** 两者都让行为可替换，但 Policy 在**编译期**组合（零运行时开销、可内联），Strategy 在**运行时**切换（灵活但有间接调用开销）。Policy 适合库开发（用户在实例化时选择策略），Strategy 适合需要运行时切换的场景。}
+
+// 混入
+
+**混入（Mixin）** 通过模板继承链注入功能，每个 Mixin 是一个模板类，其模板参数是它继承的基类——可以灵活地堆叠功能而不产生深层继承层次。
+
+\code[cpp]{
+// 每个 Mixin 继承其模板参数（链式叠加）
+template<typename Base>
+struct Printable : Base {
+    void print() const {
+        std::cout << "Name: " << Base::name() << "\n";
+    }
+};
+
+template<typename Base>
+struct Serializable : Base {
+    std::string serialize() const {
+        return "{\"name\":\"" + std::string(Base::name()) + "\"}";
+    }
+};
+
+struct Entity {
+    std::string name() const { return "Player"; }
+};
+
+// 组合 Mixin：Serializable<Printable<Entity>>
+using FullEntity = Serializable<Printable<Entity>>;
+
+FullEntity e;
+e.print();                    // 从 Printable 获得
+std::string s = e.serialize(); // 从 Serializable 获得
+}
+
+\note{**Mixin vs 多重继承：** Mixin 链是线性继承（`A : B : C`），避免了多重继承的菱形问题。每个 Mixin 只依赖其模板参数提供的接口，职责清晰。缺点是模板嵌套过深会影响编译时间和错误信息可读性。}
+
+// Tag Dispatch vs Concepts
+
+C++11 时代用**标签分派（Tag Dispatch）** 或 SFINAE 实现函数重载的编译期选择。C++20 的 **Concepts** 直接声明类型约束，代码可读性大幅提升。
+
+\compare{
+old: C++11 Tag Dispatch / SFINAE
+\code[cpp]{
+// Tag Dispatch
+struct RandomAccessTag {};
+struct ForwardTag {};
+
+template<typename Iter>
+void advance_impl(Iter& it, int n, RandomAccessTag) {
+    it += n;  // O(1)
+}
+
+template<typename Iter>
+void advance_impl(Iter& it, int n, ForwardTag) {
+    for (int i = 0; i < n; ++i) ++it;  // O(n)
+}
+// 调用者需要手动传递 tag
+}
+
+new: C++20 Concepts
+\code[cpp]{
+template<std::random_access_iterator Iter>
+void advance(Iter& it, int n) { it += n; }
+
+template<std::forward_iterator Iter>
+void advance(Iter& it, int n) {
+    for (int i = 0; i < n; ++i) ++it;
+}
+// 编译器根据迭代器类别自动选择——无需 tag
+}
+}
+
+// ScopeGuard（RAII 变体）
+
+**RAII（Resource Acquisition Is Initialization）** 是 C++ 的核心资源管理理念。**ScopeGuard** 是 RAII 的一种推广：在作用域退出时自动执行**任意清理代码**，而不仅限于释放资源。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <string>
+
+template<typename F>
+class ScopeGuard {
+    F func_;
+    bool active_ = true;
+public:
+    explicit ScopeGuard(F f) : func_(std::move(f)) {}
+    ~ScopeGuard() { if (active_) func_(); }
+    void dismiss() { active_ = false; }  // 成功时取消清理
+    ScopeGuard(ScopeGuard&& o) noexcept
+        : func_(std::move(o.func_)), active_(o.active_) { o.active_ = false; }
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+};
+
+// 便捷工厂函数
+template<typename F>
+auto makeGuard(F f) { return ScopeGuard<F>(std::move(f)); }
+
+bool doRiskyWork() { return true; }  // 模拟可能失败的操作
+
+void transaction() {
+    std::cout << "Begin transaction\n";
+    auto rollback = makeGuard([] { std::cout << "  ROLLBACK!\n"; });
+
+    if (!doRiskyWork()) return;  // 失败→rollback 自动执行
+
+    rollback.dismiss();  // 全部成功→不回滚
+    std::cout << "  COMMIT\n";
+}
+
+int main() {
+    transaction();
+}
+}
+
+// Pimpl（编译防火墙）
+
+头文件中暴露私有成员的类型——修改私有实现会导致所有 `#include` 该头文件的翻译单元重新编译。**Pimpl（Pointer to Implementation，编译防火墙，Compilation Firewall）** 将私有成员移到 `.cpp` 中的不完整类型里，头文件只暴露前向声明。
+
+\tabs{
+\tab[widget.hpp]{
+\code[cpp]{
+class Widget {
+public:
+    Widget();
+    ~Widget();                    // 必须在 .cpp 中定义
+    Widget(Widget&&) noexcept;    // 同上
+    Widget& operator=(Widget&&) noexcept;
+    void doWork();
+private:
+    struct Impl;                  // 前向声明——不完整类型
+    std::unique_ptr<Impl> pImpl_;
+};
+// 头文件不 #include 任何 Impl 的依赖
+}
+}
+\tab[widget.cpp]{
+\code[cpp]{
+#include "widget.hpp"
+#include <vector>
+#include <string>
+#include "heavy_dependency.hpp"
+
+struct Widget::Impl {
+    std::string name;
+    std::vector<int> data;
+    HeavyDependency dep;  // 依赖隐藏在 .cpp 中
+};
+
+Widget::Widget() : pImpl_(std::make_unique<Impl>()) {}
+Widget::~Widget() = default;
+Widget::Widget(Widget&&) noexcept = default;
+Widget& Widget::operator=(Widget&&) noexcept = default;
+void Widget::doWork() { pImpl_->data.push_back(42); }
+}
+}
+}
+
+\danger{**Pimpl 的五大件：** `unique_ptr<Impl>` 的析构、移动构造、移动赋值**必须在 .cpp 中定义**（即使用 `= default`），因为头文件中 `Impl` 是不完整类型——编译器无法生成 `unique_ptr` 的删除器。忘记这一步会导致编译错误。}
+
+// NVI（Non-Virtual Interface）
+
+公开虚函数让派生类可以改变基类的公有接口行为——这违反了基类对接口的控制权。**NVI（Non-Virtual Interface，非虚接口）** 将公有接口定义为非虚函数，内部调用私有或保护虚函数——基类控制调用协议（前置/后置条件检查），派生类只定制可变部分。
+
+\code[cpp]{
+class Renderer {
+public:
+    // 非虚公有接口——基类控制协议
+    void render(const Scene& scene) {
+        beginFrame();        // 基类保证前置操作
+        doRender(scene);     // 可定制部分
+        endFrame();          // 基类保证后置操作
+    }
+    virtual ~Renderer() = default;
+
+private:
+    virtual void doRender(const Scene& scene) = 0;  // 派生类只需实现这个
+
+    void beginFrame() { /* 清屏、设置状态 */ }
+    void endFrame()   { /* 提交命令、呈现 */ }
+};
+
+class ForwardRenderer : public Renderer {
+    void doRender(const Scene& scene) override { /* 前向渲染 */ }
+};
+}
+
+\note{**NVI 是 Template Method 的现代 C++ 表达。** 区别在于 NVI 将虚函数设为 `private`（派生类可 override 但不能直接调用），强制所有调用走公有非虚接口——基类对调用时机有绝对控制权。这是 C++ Core Guidelines 推荐的风格。}
+
+/// 新版特性（C++17/20/23）
+
+\list{
+- C++20 Concepts 完全取代 Tag Dispatch 和 SFINAE——代码清晰度提升一个量级
+- C++23 `std::move_only_function` — 比 `std::function` 更适合类型擦除（不需要拷贝）
+- C++23 Deducing this — 可能简化 CRTP 的某些用法
+- C++20 模块（Modules）— 减少 Pimpl 的必要性（模块不暴露实现细节给导入方）
+- C++23 `std::expected` — ScopeGuard 的回滚可以返回具体错误信息
+}
+
+/// 工程实践
+
+\list{
+- CRTP 适合"所有同类型对象批量操作"的场景（如 ECS 系统中的组件基类），不适合异构集合
+- 类型擦除的 Concept/Model 模式应支持 SBO（Small Buffer Optimization）——避免小对象堆分配
+- Pimpl 在大型项目中显著减少增量编译时间——特别是被广泛 include 的基础库头文件
+- NVI 应作为虚函数类设计的默认起点——除非有明确理由将虚函数设为 public
+- ScopeGuard 在 C++23 后可考虑用 `std::scope_exit`（<scope> 头文件，部分编译器已支持）
+}
+
+/// 难点易错点分析
+
+\danger{**类型擦除的性能开销：** 每次调用经过虚函数间接跳转。在热路径（每帧百万次调用）中，用 `variant + visit`（编译器可优化为跳转表）或 CRTP（零开销）替代。类型擦除适合"创建少、调用频率中等"的场景。}
+
+\danger{**CRTP 的类型安全漏洞：** `class A : public Base<B>` 而非 `Base<A>` 会导致 `static_cast` 未定义行为。可以用 `static_assert` 或 C++20 的 Concepts 在基类中检查 `Derived` 确实继承自 `Base<Derived>`。}
+
+\quiz[choice]{
+Q: 以下哪种模式最适合在**不使用虚函数**的前提下实现多态？
+A: 类型擦除
+B: CRTP
+C: Pimpl
+D: NVI
+ANS: B
+EXP: CRTP 通过 `static_cast` 在编译期解析实际类型——零虚函数开销。类型擦除内部仍使用虚函数；NVI 本身依赖虚函数；Pimpl 与多态无关。
+}
+
+\quiz[tf]{
+Q: Pimpl 模式中，`Widget` 类的析构函数可以在头文件中用 `= default` 声明。
+ANS: F
+EXP: 头文件中 `Impl` 是不完整类型，`unique_ptr<Impl>` 的删除器需要完整类型定义。析构函数（即使 `= default`）必须在 .cpp 文件中定义，此时 `Impl` 的完整定义可见。
+}
+
+/// 实战作业
+
+// 🟢 基础：ScopeGuard
+
+完成下面的 `ScopeGuard` 模板类实现，使事务在异常路径自动回滚。
+
+\run[cpp]{
+#include <iostream>
+#include <functional>
+#include <string>
+
+template<typename F>
+class ScopeGuard {
+    F func_;
+    bool active_ = true;
+public:
+    /* TODO: 构造函数——接受 F 并存储 */
+    /* TODO: 析构函数——如果 active_ 则调用 func_() */
+    /* TODO: dismiss()——将 active_ 设为 false */
+
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+};
+
+template<typename F>
+auto makeGuard(F f) { return ScopeGuard<F>(std::move(f)); }
+
+int main() {
+    std::cout << "Test 1: Normal exit\n";
+    {
+        auto g = makeGuard([] { std::cout << "  Guard fired!\n"; });
+    }  // 应输出 "Guard fired!"
+
+    std::cout << "Test 2: Dismissed\n";
+    {
+        auto g = makeGuard([] { std::cout << "  Guard fired!\n"; });
+        g.dismiss();
+    }  // 不应输出
+
+    std::cout << "Done\n";
+}
+}
+
+// 🟡 进阶：手写类型擦除
+
+实现一个 `AnyDrawable` 类型擦除类，可以存储任何拥有 `void draw() const` 方法的类型。内部使用 Concept/Model 模式，支持拷贝（`clone()`）。将 `Circle`、`Rect`、`Text` 三种不相关类型统一存储在 `vector<AnyDrawable>` 中遍历绘制。
+
+// 🟡 进阶：CRTP 计数器
+
+用 CRTP 实现 `InstanceCounter<T>` 基类，自动统计每个派生类的当前实例数量。`Sprite : InstanceCounter<Sprite>` 和 `Mesh : InstanceCounter<Mesh>` 各自独立计数。测试创建和销毁后计数是否正确。
+
+// 🔴 挑战：Policy-Based 容器
+
+用 Policy-Based Design 实现一个可配置的容器 `Container<T, GrowthPolicy, BoundsCheckPolicy>`：GrowthPolicy 控制扩容策略（倍增 / 固定增量），BoundsCheckPolicy 控制越界行为（抛异常 / 未定义行为 / 返回默认值）。实现 `push_back`、`operator[]`、`size`。
+
+\collapse[🔴 参考思路]{
+`GrowthPolicy` 提供 `static size_t grow(size_t currentCap, size_t needed)` 方法。`BoundsCheckPolicy` 提供 `static void check(size_t index, size_t size)` 方法。`Container` 通过私有继承或成员聚合使用这两个策略。`push_back` 中调用 `GrowthPolicy::grow` 决定新容量，`operator[]` 中调用 `BoundsCheckPolicy::check` 验证索引。
+
+示例组合：
+- `Container<int, DoubleGrowth, ThrowOnBounds>` — 倍增扩容 + 越界抛异常
+- `Container<int, FixedGrowth<64>, NoCheck>` — 固定增长 + 不检查（最快）
+}

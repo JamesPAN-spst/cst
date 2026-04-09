@@ -1,0 +1,423 @@
+/// 简介
+
+前面几节分别学了智能指针、移动语义、constexpr、concepts、auto 推导、错误处理和 optional/variant/expected——每个都是独立的"武器"。但实际项目中，这些特性从来不是孤立使用的：一个智能指针管理的对象可能在 variant 中存储、用 concepts 约束接口、以 expected 返回错误、在 constexpr 中计算默认值、通过移动语义高效传递。
+
+本项目把它们**全部串联起来**：构建一个 **RPG 游戏物品与背包系统（Item & Inventory System）**。你将体验现代 C++ 特性如何协同工作，设计出类型安全、零开销、易扩展的游戏工具库。
+
+/// 项目需求
+\project{ItemVault — RPG 物品与背包系统}{
+
+**背景：** 你正在为一款 RPG 开发核心物品系统。冒险者的背包需要管理装备、消耗品、材料——每种物品有不同的属性和行为。系统必须类型安全、高效、能优雅地处理各种异常（背包满、物品不存在、类型不匹配……）。
+
+**核心需求：**
+
+1. **物品类型系统** — 用 `std::variant` 表示不同物品类型
+2. **背包容器** — 用智能指针管理物品所有权，支持增删查改
+3. **物品转移** — 用移动语义在背包之间高效转移物品
+4. **稀有度计算** — 用 constexpr 在编译期计算属性加成
+5. **类型约束** — 用 concepts 约束可放入背包的物品类型
+6. **错误处理** — 用 expected/optional 优雅报告操作结果
+}
+
+\diagram[flow]{
+ItemLike(concept) --> Weapon: 满足约束
+ItemLike(concept) --> Potion: 满足约束
+ItemLike(concept) --> Material: 满足约束
+Weapon --> variant<W,P,M>: 包装为 GameItem
+Potion --> variant<W,P,M>: 包装为 GameItem
+Material --> variant<W,P,M>: 包装为 GameItem
+variant<W,P,M> --> unique_ptr<GameItem>: 独占所有权
+unique_ptr<GameItem> --> Inventory: 背包管理
+}
+
+/// 技术要求
+
+\table{
+现代 C++ 特性 | 使用场景 | 要求
+---
+`auto` / `decltype(auto)` | 物品查询返回类型、lambda 参数 | 至少 3 处有意义的推导
+`std::unique_ptr` | 背包中物品的所有权管理 | 物品只能属于一个背包
+`std::move` / 移动语义 | 物品在背包间转移 | transfer 函数必须用 move
+`constexpr` / `consteval` | 稀有度加成倍率、属性上限 | 至少 2 个编译期计算
+Concepts (`requires`) | 约束"什么能当物品" | 自定义 ItemLike concept
+`std::variant` | 统一存储不同物品类型 | GameItem 必须用 variant
+`std::optional` | 查询可能失败的操作 | find_item 返回 optional
+`std::expected` (C++23) | 需要错误原因的操作 | add_item / transfer 返回 expected
+`[[nodiscard]]` | 不能忽略错误返回值 | expected 返回的函数必须标注
+结构化绑定 | 遍历背包、解构查询结果 | 至少 2 处使用
+}
+
+/// 实现提示
+
+\steps{
+\step[阶段一：稀有度与 Concept]{
+
+先定义编译期稀有度系统和物品类型约束。
+
+\code[cpp]{
+enum class Rarity : uint8_t { Common, Uncommon, Rare, Epic, Legendary };
+
+constexpr double rarityMultiplier(Rarity r) {
+    constexpr double table[] = {1.0, 1.2, 1.5, 2.0, 3.0};
+    return table[static_cast<int>(r)];
+}
+static_assert(rarityMultiplier(Rarity::Legendary) >= 3.0);
+
+template<typename T>
+concept ItemLike = requires(const T& item) {
+    { item.name() }   -> std::convertible_to<std::string_view>;
+    { item.weight() }  -> std::convertible_to<double>;
+    { item.rarity() }  -> std::same_as<Rarity>;
+    { item.describe() } -> std::convertible_to<std::string>;
+};
+}
+
+\collapse[想一想：为什么用 concept 而不是基类继承？]{
+Concept 是**静态多态**——编译期检查，零运行时开销，不需要虚函数表。物品类型可以是互不相关的类，只要满足接口约束就行。基类继承需要 virtual、vptr，有运行时成本。在游戏开发中物品数量巨大，这个性能差异很有意义。
+}
+}
+
+\step[阶段二：物品类型与 variant]{
+
+定义具体物品类型，用 `std::variant` 统一封装，用 `std::visit` + auto lambda 多态访问。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <format>
+#include <cstdint>
+
+enum class Rarity : uint8_t { Common, Uncommon, Rare, Epic, Legendary };
+constexpr double rarityMultiplier(Rarity r) {
+    constexpr double table[] = {1.0, 1.2, 1.5, 2.0, 3.0};
+    return table[static_cast<int>(r)];
+}
+constexpr const char* rarityName(Rarity r) {
+    constexpr const char* names[] = {"普通","优秀","稀有","史诗","传说"};
+    return names[static_cast<int>(r)];
+}
+
+struct Weapon {
+    std::string name_; int baseDmg_; double weight_; Rarity rarity_;
+    auto name() const -> std::string_view { return name_; }
+    auto weight() const -> double { return weight_; }
+    auto rarity() const -> Rarity { return rarity_; }
+    auto damage() const { return static_cast<int>(baseDmg_ * rarityMultiplier(rarity_)); }
+    auto describe() const -> std::string {
+        return std::format("[{}] {} — 伤害:{} 重量:{:.1f}kg",
+                           rarityName(rarity_), name_, damage(), weight_);
+    }
+};
+
+struct Potion {
+    std::string name_; int heal_; double weight_; Rarity rarity_;
+    auto name() const -> std::string_view { return name_; }
+    auto weight() const -> double { return weight_; }
+    auto rarity() const -> Rarity { return rarity_; }
+    auto describe() const -> std::string {
+        return std::format("[{}] {} — 恢复:{}HP", rarityName(rarity_), name_, heal_);
+    }
+};
+
+struct Material {
+    std::string name_; int count_; double unitW_; Rarity rarity_;
+    auto name() const -> std::string_view { return name_; }
+    auto weight() const -> double { return unitW_ * count_; }
+    auto rarity() const -> Rarity { return rarity_; }
+    auto describe() const -> std::string {
+        return std::format("[{}] {} ×{}", rarityName(rarity_), name_, count_);
+    }
+};
+
+using GameItem = std::variant<Weapon, Potion, Material>;
+
+// std::visit + auto lambda = 静态多态分发
+auto itemName(const GameItem& item) -> std::string_view {
+    return std::visit([](const auto& i) -> std::string_view { return i.name(); }, item);
+}
+auto itemDescribe(const GameItem& item) -> std::string {
+    return std::visit([](const auto& i) { return i.describe(); }, item);
+}
+
+int main() {
+    GameItem sword = Weapon{"屠龙剑", 100, 3.5, Rarity::Legendary};
+    GameItem pot   = Potion{"生命药水", 50, 0.3, Rarity::Common};
+    GameItem ore   = Material{"秘银矿石", 5, 1.2, Rarity::Rare};
+
+    for (const auto& item : {sword, pot, ore})
+        std::cout << itemDescribe(item) << "\n";
+}
+}
+
+\collapse[关键理解：variant vs 继承]{
+`std::variant<Weapon, Potion, Material>` 在内存中是联合体 + 类型标签，大小等于最大成员 + 对齐，不需要堆分配、不需要 vptr。`std::visit` 会生成编译期跳转表，性能接近直接调用。物品种类固定时，variant 优于继承。需要运行时扩展新物品类型时，才回到基类继承。
+}
+}
+
+\step[阶段三：Inventory 背包 + 错误处理]{
+
+用 `unique_ptr<GameItem>` 管理所有权，`expected` 报告错误，`optional` 处理查询。这是 **所有现代特性汇合的核心**——仔细看每个返回类型的选择。
+
+\code[cpp]{
+enum class InvError { Full, TooHeavy, NotFound, TypeMismatch };
+
+class Inventory {
+    std::string owner_;
+    std::vector<std::unique_ptr<GameItem>> items_;
+    size_t cap_;
+    double maxW_;
+public:
+    Inventory(std::string owner, size_t cap, double maxW)
+        : owner_(std::move(owner)), cap_(cap), maxW_(maxW) {}  // move 构造函数参数
+
+    Inventory(Inventory&&) noexcept = default;             // 允许移动
+    Inventory& operator=(Inventory&&) noexcept = default;
+    Inventory(const Inventory&) = delete;                  // 禁止拷贝
+
+    [[nodiscard]] auto addItem(std::unique_ptr<GameItem> item)
+        -> std::expected<size_t, InvError>;    // expected: 可能失败且需要原因
+
+    auto findItem(std::string_view name) const
+        -> std::optional<size_t>;              // optional: 可能找不到
+
+    [[nodiscard]] auto removeItem(size_t idx)
+        -> std::expected<std::unique_ptr<GameItem>, InvError>;  // 所有权转出
+};
+}
+
+\tip{**返回类型选择原则：** 查询"存不存在"用 `optional`——调用方不需要知道为什么不存在。修改操作"成功或失败"用 `expected`——调用方需要错误原因来决定如何处理。}
+}
+
+\step[阶段四：物品转移——综合实战]{
+
+在两个背包之间转移物品——`expected` + 移动语义 + 错误回滚，三者协同工作。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
+#include <memory>
+#include <optional>
+#include <expected>
+#include <variant>
+#include <format>
+#include <cstdint>
+#include <numeric>
+
+enum class Rarity : uint8_t { Common, Uncommon, Rare, Epic, Legendary };
+constexpr double rarityMultiplier(Rarity r) {
+    constexpr double table[] = {1.0, 1.2, 1.5, 2.0, 3.0};
+    return table[static_cast<int>(r)];
+}
+
+struct Weapon {
+    std::string name_; int baseDmg_; double weight_; Rarity rarity_;
+    auto name() const -> std::string_view { return name_; }
+    auto weight() const -> double { return weight_; }
+};
+struct Potion {
+    std::string name_; int heal_; double weight_; Rarity rarity_;
+    auto name() const -> std::string_view { return name_; }
+    auto weight() const -> double { return weight_; }
+};
+using GameItem = std::variant<Weapon, Potion>;
+
+auto itemName(const GameItem& g) -> std::string_view {
+    return std::visit([](const auto& i) -> std::string_view { return i.name(); }, g);
+}
+auto itemWeight(const GameItem& g) -> double {
+    return std::visit([](const auto& i) { return i.weight(); }, g);
+}
+
+enum class InvError { Full, TooHeavy, NotFound };
+constexpr const char* errorMsg(InvError e) {
+    switch(e) {
+        case InvError::Full: return "背包已满";
+        case InvError::TooHeavy: return "超重";
+        case InvError::NotFound: return "物品不存在";
+    }
+    return "?";
+}
+
+class Inventory {
+    std::string owner_;
+    std::vector<std::unique_ptr<GameItem>> items_;
+    size_t cap_; double maxW_;
+public:
+    Inventory(std::string o, size_t c, double w)
+        : owner_(std::move(o)), cap_(c), maxW_(w) {}
+
+    [[nodiscard]] auto addItem(std::unique_ptr<GameItem> item)
+        -> std::expected<size_t, InvError> {
+        if (items_.size() >= cap_) return std::unexpected(InvError::Full);
+        if (totalWeight() + itemWeight(*item) > maxW_)
+            return std::unexpected(InvError::TooHeavy);
+        items_.push_back(std::move(item));
+        return items_.size() - 1;
+    }
+
+    [[nodiscard]] auto removeItem(size_t idx)
+        -> std::expected<std::unique_ptr<GameItem>, InvError> {
+        if (idx >= items_.size()) return std::unexpected(InvError::NotFound);
+        auto item = std::move(items_[idx]);
+        items_.erase(items_.begin() + static_cast<ptrdiff_t>(idx));
+        return item;
+    }
+
+    auto findItem(std::string_view n) const -> std::optional<size_t> {
+        for (size_t i = 0; i < items_.size(); ++i)
+            if (itemName(*items_[i]) == n) return i;
+        return std::nullopt;
+    }
+
+    auto totalWeight() const -> double {
+        return std::accumulate(items_.begin(), items_.end(), 0.0,
+            [](double s, const auto& p) { return s + itemWeight(*p); });
+    }
+    auto size() const { return items_.size(); }
+    auto owner() const -> std::string_view { return owner_; }
+
+    void listAll() const {
+        std::cout << std::format("=== {}的背包 ({}/{}) ===\n", owner_, items_.size(), cap_);
+        for (size_t i = 0; i < items_.size(); ++i)
+            std::cout << std::format("  [{}] {}\n", i, itemName(*items_[i]));
+    }
+};
+
+// 核心：背包间物品转移（带回滚）
+[[nodiscard]]
+auto transferItem(Inventory& from, Inventory& to, std::string_view name)
+    -> std::expected<void, InvError>
+{
+    auto idx = from.findItem(name);
+    if (!idx) return std::unexpected(InvError::NotFound);
+
+    auto removed = from.removeItem(*idx);
+    if (!removed) return std::unexpected(removed.error());
+
+    auto result = to.addItem(std::move(*removed));
+    if (!result) {
+        from.addItem(std::move(*removed));  // 回滚！
+        return std::unexpected(result.error());
+    }
+    return {};
+}
+
+int main() {
+    Inventory hero("勇者", 5, 20.0);
+    Inventory chest("储物箱", 10, 100.0);
+
+    hero.addItem(std::make_unique<GameItem>(Weapon{"屠龙剑", 100, 3.5, Rarity::Legendary}));
+    hero.addItem(std::make_unique<GameItem>(Potion{"生命药水", 50, 0.3, Rarity::Common}));
+    hero.addItem(std::make_unique<GameItem>(Weapon{"匕首", 20, 0.8, Rarity::Uncommon}));
+
+    std::cout << "--- 转移前 ---\n";
+    hero.listAll();
+    chest.listAll();
+
+    if (auto r = transferItem(hero, chest, "匕首"); r)
+        std::cout << "\n转移成功！\n\n";
+    else
+        std::cout << std::format("\n转移失败: {}\n\n", errorMsg(r.error()));
+
+    std::cout << "--- 转移后 ---\n";
+    hero.listAll();
+    chest.listAll();
+
+    // 测试错误：向满背包添加    Inventory tiny("小袋", 1, 1.0);
+    tiny.addItem(std::make_unique<GameItem>(Potion{"小药水", 10, 0.5, Rarity::Common}));
+    if (auto f = tiny.addItem(std::make_unique<GameItem>(Potion{"另一瓶", 10, 0.5, Rarity::Common})); !f)
+        std::cout << std::format("\n预期失败: {}\n", errorMsg(f.error()));
+}
+}
+}
+
+\step[阶段五：Concept 工厂与完美转发]{
+
+用 concept 约束 + `std::forward` 实现类型安全的物品工厂。
+
+\code[cpp]{
+static_assert(ItemLike<Weapon>);
+static_assert(ItemLike<Potion>);
+static_assert(ItemLike<Material>);
+
+template<ItemLike T>
+auto makeItem(T&& item) -> std::unique_ptr<GameItem> {
+    return std::make_unique<GameItem>(std::forward<T>(item));
+}
+// makeItem(42);  // 编译错误：int 不满足 ItemLike
+}
+
+\collapse[为什么用 std::forward 而不是 std::move？]{
+`makeItem` 的参数是**转发引用（Forwarding Reference）**（`T&&`，T 是模板参数）。传左值时 T 推导为 `Weapon&`，应该拷贝；传右值时 T 推导为 `Weapon`，应该移动。`std::forward<T>` 保留调用者的值类别，而 `std::move` 会无条件移动——可能掏空调用方的对象。
+}
+}
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 达标标准
+---
+类型安全与 Concepts | 20分 | 自定义 ItemLike concept；static_assert 验证；模板参数约束
+编译期计算 | 15分 | constexpr 稀有度函数、属性上限；static_assert 验证
+variant 与访问者 | 15分 | variant 存储物品；std::visit + auto lambda 多态分发
+智能指针与所有权 | 20分 | unique_ptr 管理物品；无裸 new/delete；transfer 所有权正确
+错误处理 | 15分 | expected 用于可能失败的操作；optional 用于查询；[[nodiscard]]
+移动语义 | 15分 | 背包禁拷贝只允许移动；转移全程无拷贝；完美转发
+}
+
+\warning{**常见扣分点：**
+- transfer 中忘记处理"放入目标失败"时的回滚——物品凭空消失
+- variant 用 `std::get<T>` 不做类型检查（可能抛 `bad_variant_access`）
+- `expected` 返回值没标 `[[nodiscard]]`，调用方默默忽略错误
+- 用裸指针传递物品所有权，破坏 `unique_ptr` 的设计意图
+}
+
+/// 扩展挑战
+
+\list{
+- **装备槽系统**：EquipmentSlots 类限制特定槽位只能装特定类型（用 `holds_alternative`）
+- **物品堆叠**：Material 支持堆叠，合并同名材料的 count
+- **序列化**：toJson() / fromJson()，用 expected 处理解析错误
+- **原子交易**：两个 Inventory 间的物品交换——全部成功或全部回滚
+- **筛选器**：concept 约束的模板，按稀有度/重量/类型筛选
+- **编译期物品表**：constexpr std::array 定义内建物品模板，编译期验证数据
+}
+
+/// 参考资源
+
+\collapse[核心特性速查表]{
+\table{
+特性 | 头文件 | 关键点
+---
+std::unique_ptr | `<memory>` | 独占所有权，move-only，零开销
+std::variant | `<variant>` | 类型安全联合体，std::visit 多态访问
+std::optional | `<optional>` | 可能为空，value_or() 提供默认值
+std::expected | `<expected>` | C++23，成功值或错误值的二选一
+concepts | `<concepts>` | requires 从句，编译期接口约束
+std::forward | `<utility>` | 条件转发，保留值类别
+}
+}
+
+\collapse[项目文件组织建议]{
+\code[text]{
+item_vault/
+├── include/          // rarity.hpp, items.hpp, game_item.hpp, inventory.hpp, transfer.hpp
+├── src/              // inventory.cpp, main.cpp
+├── tests/            // test_items.cpp, test_inventory.cpp, test_transfer.cpp
+└── CMakeLists.txt    // 要求 C++23
+}
+}
+
+\collapse[推荐阅读]{
+\list{
+- cppreference: std::variant — variant API 与 std::visit 用法
+- cppreference: std::expected — C++23 expected 语义与示例
+- C++ Core Guidelines R — 资源管理与智能指针规范
+- C++ Core Guidelines T.10-T.13 — Concepts 设计指南
+}
+}

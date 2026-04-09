@@ -1,0 +1,809 @@
+/// 简介
+
+在游戏开发中，一个角色拥有位置、血量、名字等属性，还能移动、攻击、受伤——这些数据和行为天然属于同一个整体。C++ 的**类（Class）**正是将相关数据与操作绑定在一起的核心机制。如果说变量是"带标签的盒子"，那么类就是"带抽屉和按钮的机器"：抽屉存放状态，按钮触发行为。
+
+上一节你已经见过 `struct`，而 `class` 与 `struct` 在 C++ 中几乎等价——唯一区别是默认访问权限（`class` 默认 `private`，`struct` 默认 `public`）。本节将深入探讨类的声明、`this` 指针、`const` 限定、内存布局等核心知识，帮助你写出既安全又高效的自定义类型。
+
+/// 知识点列表
+
+\list{
+- 类的声明与定义（Declaration vs Definition）
+- 成员变量（Member Variables）与成员函数（Member Functions）
+- this 指针（this Pointer）
+- 成员函数的 const 限定（const Qualification）
+- 内联成员函数（Inline Member Functions）
+- 类的大小与内存布局（Size & Memory Layout），含填充（Padding）与对齐（Alignment）
+- 前向声明（Forward Declaration）
+- 嵌套类（Nested Class）与局部类（Local Class）
+- mutable 关键字
+- C++23 deducing this（显式对象参数）
+}
+
+/// 知识点详解
+
+// 类的声明与定义
+
+**为什么要区分声明和定义？** 在大型项目中，编译器需要知道一个类"长什么样"才能分配内存和调用成员。但我们不希望把所有实现细节都塞进头文件——这会拖慢编译速度并暴露实现。因此 C++ 允许将类的**声明**（接口）和**定义**（实现）分开。
+
+\code[cpp]{
+// === Entity.h（头文件：类声明）===
+class Entity {
+public:
+    float x, y;
+    void move(float dx, float dy);   // 只声明，不写函数体
+    float distanceTo(const Entity& other) const;
+};
+
+// === Entity.cpp（源文件：成员函数定义）===
+#include "Entity.h"
+#include <cmath>
+
+// 用 类名::函数名 的语法在类外定义成员函数
+void Entity::move(float dx, float dy) {
+    x += dx;
+    y += dy;
+}
+
+float Entity::distanceTo(const Entity& other) const {
+    float dx = x - other.x;
+    float dy = y - other.y;
+    return std::sqrt(dx * dx + dy * dy);
+}
+}
+
+\note{类体内直接写出函数体 = 声明+定义同时完成（且隐式内联）。类体外用 `ClassName::` 作用域解析符（Scope Resolution Operator）来补充定义。}
+
+\tip{头文件放"是什么"（接口），源文件放"怎么做"（实现）。这是 C++ 项目组织的基本原则，在多人协作和大型游戏引擎中尤为关键。}
+
+// 成员变量与成员函数
+
+成员变量描述对象的**状态**，成员函数定义对象的**行为**。C++11 起，成员变量可以在声明时给出**默认成员初始化器（Default Member Initializer）**，省去在每个构造函数中重复初始化的麻烦。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Player {
+public:
+    // 默认成员初始化器——对象创建时自动生效
+    std::string name = "Unknown";
+    int hp = 100;          // 生命值
+    int maxHp = 100;
+    float speed = 5.0f;    // 移动速度
+
+    void takeDamage(int dmg) {
+        hp -= dmg;
+        if (hp < 0) hp = 0;  // 防止血量为负
+        std::cout << name << " 受到 " << dmg
+                  << " 点伤害, 剩余 HP: " << hp << "\n";
+    }
+
+    bool isAlive() const {
+        return hp > 0;
+    }
+};
+
+int main() {
+    Player p;
+    p.name = "Archer";
+    p.takeDamage(30);
+    p.takeDamage(80);
+    std::cout << p.name << (p.isAlive() ? " 存活" : " 阵亡") << "\n";
+}
+}
+
+\warning{成员变量如果没有默认初始化器且没被构造函数初始化，其值是**未定义的（Undefined）**——对于 `int`、`float` 等基本类型，读取未初始化成员是未定义行为（UB）。养成给成员写默认值的好习惯。}
+
+// this 指针
+
+每个非静态成员函数被调用时，编译器会隐式传入一个指向当前对象的指针，这就是 **`this` 指针（this Pointer）**。它的类型在普通成员函数中是 `T*`，在 `const` 成员函数中是 `const T*`。
+
+`this` 有两个常见用途：
+
+\list{
+- 当参数名与成员名冲突时，用 `this->member` 显式区分
+- 返回 `*this` 实现**链式调用（Method Chaining）**模式
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Sprite {
+    std::string texture = "";
+    float x = 0.0f, y = 0.0f;
+    float scaleX = 1.0f, scaleY = 1.0f;
+
+public:
+    // 返回自身引用，支持链式调用
+    Sprite& setTexture(const std::string& texture) {
+        this->texture = texture;  // this-> 区分成员与参数
+        return *this;
+    }
+
+    Sprite& setPosition(float x, float y) {
+        this->x = x;
+        this->y = y;
+        return *this;
+    }
+
+    Sprite& setScale(float s) {
+        scaleX = s;     // 无歧义时 this-> 可省略
+        scaleY = s;
+        return *this;
+    }
+
+    void print() const {
+        std::cout << "Sprite[" << texture << "] at ("
+                  << x << "," << y << ") scale="
+                  << scaleX << "\n";
+    }
+};
+
+int main() {
+    Sprite hero;
+    // 链式调用——一行完成多项配置
+    hero.setTexture("hero.png")
+        .setPosition(100.0f, 200.0f)
+        .setScale(2.0f);
+    hero.print();
+}
+}
+
+\note{链式调用在游戏引擎的 Builder/配置场景中极为常见，例如配置 UI 组件、粒子系统参数等。关键是返回类型必须是引用（`T&`），而非值拷贝。}
+
+// 成员函数的 const 限定
+
+在成员函数参数列表后加 `const`，表示"这个函数承诺不修改对象状态"。`const` 对象或 `const` 引用**只能调用 `const` 成员函数**——所以将不修改状态的函数标记为 `const` 不是可选的好习惯，而是接口正确性的必要条件。
+
+\code[cpp]{
+class Vec2 {
+    float x, y;
+public:
+    Vec2(float x, float y) : x(x), y(y) {}
+
+    // const 函数：只读操作
+    float length() const { return std::sqrt(x*x + y*y); }
+    float dot(const Vec2& v) const { return x*v.x + y*v.y; }
+
+    // 非 const 函数：会修改对象
+    void normalize() {
+        float len = length();   // const 函数可在非 const 函数中调用
+        if (len > 0.0f) { x /= len; y /= len; }
+    }
+};
+
+void printLength(const Vec2& v) {
+    std::cout << v.length();    // OK：v 是 const 引用，调用 const 函数
+    // v.normalize();           // 编译错误！const 引用不能调 非const 函数
+}
+}
+
+\quiz[choice]{
+Q: 以下哪个说法关于 const 成员函数是**正确**的？
+A: const 成员函数内可以修改所有成员变量
+B: const 对象只能调用 const 成员函数
+C: const 成员函数不能调用任何其他成员函数
+D: const 仅是编码风格建议，编译器不强制检查
+ANS: B
+EXP: const 对象的 this 指针类型是 const T*，因此只能调用 const 成员函数。编译器会严格检查这一约束。const 函数内不能修改普通成员（除非标记 mutable），但可以调用其他 const 函数。
+}
+
+// 内联成员函数
+
+**内联（Inline）**是对编译器的暗示：将函数调用展开为函数体，避免调用开销。类体内直接定义的成员函数**隐式内联**；类体外定义时需显式加 `inline` 关键字。
+
+\code[cpp]{
+class Transform {
+    float x = 0, y = 0, rotation = 0;
+public:
+    // 类体内定义 → 隐式内联
+    float getX() const { return x; }
+    float getY() const { return y; }
+
+    // 声明（头文件中）
+    void setPosition(float nx, float ny);
+};
+
+// 类体外定义——如果在头文件中，需要 inline 防止重复定义
+inline void Transform::setPosition(float nx, float ny) {
+    x = nx;
+    y = ny;
+}
+}
+
+\compare{
+old: C++98 时代，内联是性能优化的重要手段，程序员手动标记 `inline` 很常见。
+
+new: 现代编译器（GCC/Clang/MSVC -O2）会自行判断是否内联，`inline` 更多用于解决头文件中函数定义的**链接问题（ODR, One Definition Rule）**，而非性能暗示。
+}
+
+// 类的大小与内存布局
+
+**为什么成员顺序会影响类的大小？** CPU 访问内存时有对齐要求——例如 4 字节的 `int` 通常需要放在 4 的倍数地址上。编译器会在成员之间插入**填充字节（Padding）**以满足对齐，最终类的大小还需是最大对齐成员的倍数。
+
+\diagram[memory]{
+三种不同成员排列的内存布局比较：
+
+布局A — struct Bad { char a; int b; char c; }
+| a(1) | pad(3) | b(4) | c(1) | pad(3) | = 12 bytes
+
+布局B — struct Good { int b; char a; char c; }
+| b(4) | a(1) | c(1) | pad(2) | = 8 bytes
+
+布局C — struct Empty { }
+| pad(1) | = 1 byte（每个对象必须有唯一地址）
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cstddef>
+
+struct Bad  { char a; int b; char c; };
+struct Good { int b; char a; char c; };
+struct Empty {};
+
+// 游戏中的真实案例：ECS 组件
+struct TransformBad {
+    bool active;       // 1 byte + 3 padding
+    float x, y, z;    // 12 bytes
+    bool dirty;        // 1 byte + 3 padding
+};  // = 20 bytes
+
+struct TransformGood {
+    float x, y, z;    // 12 bytes
+    bool active;       // 1 byte
+    bool dirty;        // 1 byte + 2 padding
+};  // = 16 bytes（节省 20%！）
+
+int main() {
+    std::cout << "Bad:    " << sizeof(Bad)  << "\n";   // 12
+    std::cout << "Good:   " << sizeof(Good) << "\n";   // 8
+    std::cout << "Empty:  " << sizeof(Empty) << "\n";  // 1
+
+    std::cout << "\n--- ECS 组件对比 ---\n";
+    std::cout << "TransformBad:  " << sizeof(TransformBad)  << "\n";
+    std::cout << "TransformGood: " << sizeof(TransformGood) << "\n";
+
+    // offsetof 可以查看成员偏移量
+    std::cout << "\nTransformBad 成员偏移:\n";
+    std::cout << "  active: " << offsetof(TransformBad, active) << "\n";
+    std::cout << "  x:      " << offsetof(TransformBad, x)      << "\n";
+    std::cout << "  dirty:  " << offsetof(TransformBad, dirty)   << "\n";
+}
+}
+
+\quiz[tf]{
+Q: struct A { double d; int i; char c; }; 的大小是 13 字节（8+4+1）。
+ANS: F
+EXP: 由于对齐要求，最终大小需是最大对齐成员（double, 8字节）的倍数。d(8) + i(4) + c(1) + padding(3) = 16 字节。
+}
+
+\tip{**性能关键场景下的经验法则：** 将成员按大小从大到小排列，可以最小化填充浪费。在 ECS 架构中，上万个组件的内存节省是很可观的。可以用 `static_assert(sizeof(T) == expected)` 来守护类大小不被意外改变。}
+
+// 前向声明
+
+当两个类需要互相引用时（例如 `Player` 持有 `Weapon*`，`Weapon` 需要知道 `Owner` 类型），如果互相 `#include` 会导致循环依赖（Circular Dependency）。**前向声明（Forward Declaration）**只告诉编译器"这个名字是一个类"，不提供完整定义。
+
+\diagram[flow]{
+循环依赖与前向声明的解决方案：
+
+Player.h 需要 Weapon → #include "Weapon.h" ✓
+Weapon.h 需要 Player → 改用 class Player; （前向声明）
+Weapon.cpp → #include "Player.h" （需要完整定义时再包含）
+}
+
+\code[cpp]{
+// --- Weapon.h ---
+class Player;  // 前向声明：只知道 Player 是一个类
+
+class Weapon {
+    Player* owner;   // OK：指针/引用只需知道类名
+    int damage = 10;
+public:
+    void setOwner(Player* p) { owner = p; }
+    // void doSomething() { owner->hp -= damage; }
+    // ↑ 错误！此处不知道 Player 的成员
+};
+
+// --- Weapon.cpp ---
+// #include "Player.h"  // 需要访问 Player 成员时，在 .cpp 中包含完整定义
+// void Weapon::doSomething() { owner->hp -= damage; }  // 这里OK
+}
+
+\warning{前向声明后只能使用该类的**指针或引用**，不能创建对象、调用成员函数或访问成员变量——因为编译器还不知道类的大小和布局。}
+
+// 嵌套类与局部类
+
+**嵌套类（Nested Class）**定义在另一个类内部，常用于实现细节封装。**局部类（Local Class）**定义在函数内部，通常用于一次性的局部抽象。
+
+\code[cpp]{
+class GameEngine {
+public:
+    // 嵌套类：对外隐藏实现细节
+    class Config {
+        int width = 1280;
+        int height = 720;
+        bool fullscreen = false;
+    public:
+        int getWidth() const { return width; }
+        int getHeight() const { return height; }
+        void setFullscreen(bool fs) { fullscreen = fs; }
+    };
+
+    Config config;  // 引擎拥有一个配置对象
+
+    void init() {
+        config.setFullscreen(true);
+        // 外部用 GameEngine::Config 访问嵌套类型
+    }
+};
+
+void processInput() {
+    // 局部类：只在这个函数内使用
+    struct KeyBinding {
+        int keyCode;
+        const char* action;
+    };
+    KeyBinding bindings[] = {
+        {87, "MoveUp"}, {83, "MoveDown"},
+        {65, "MoveLeft"}, {68, "MoveRight"}
+    };
+    // KeyBinding 在函数外不可见
+}
+}
+
+\note{嵌套类常见于迭代器实现（如自定义容器的 `Container::Iterator`）、树节点（`Tree::Node`）等场景。嵌套类可以访问外部类的 `private` 成员（C++11 起）。}
+
+// mutable 关键字
+
+`const` 成员函数不允许修改任何成员——但有些"不影响逻辑状态"的成员确实需要在 `const` 函数中改变，比如缓存、访问计数器、互斥锁等。**`mutable`** 关键字标记这些成员，豁免它们的 `const` 约束。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Texture {
+    std::string path;
+    // mutable：即使在 const 函数中也可以修改
+    mutable int accessCount = 0;
+    mutable int cachedId = -1;
+
+public:
+    Texture(const std::string& path) : path(path) {}
+
+    // 逻辑上是只读的——获取纹理ID
+    // 但内部需要更新缓存和计数器
+    int getId() const {
+        ++accessCount;   // OK：mutable 豁免 const 约束
+        if (cachedId < 0) {
+            cachedId = 42;  // 模拟加载纹理到GPU
+            std::cout << "  [缓存未命中] 加载纹理: " << path << "\n";
+        }
+        return cachedId;
+    }
+
+    int getAccessCount() const { return accessCount; }
+};
+
+int main() {
+    const Texture tex("hero_sprite.png");  // const 对象
+    std::cout << "ID = " << tex.getId() << "\n";  // 第一次：缓存未命中
+    std::cout << "ID = " << tex.getId() << "\n";  // 第二次：使用缓存
+    std::cout << "访问次数: " << tex.getAccessCount() << "\n";
+}
+}
+
+\danger{**`mutable` 不是逃避 `const` 的后门！** 只有真正"不影响对象逻辑状态"的成员（缓存、锁、调试计数器）才应标记 `mutable`。滥用 `mutable` 会让 `const` 承诺形同虚设，破坏代码的可推理性。}
+
+// C++23 deducing this（显式对象参数）
+
+在 C++23 之前，如果你想让同一个 getter 同时支持 `const` 和非 `const` 版本，需要写两份几乎相同的代码。**Deducing this（推导 this）**允许将隐式的 `this` 变为显式的函数参数，通过模板推导自动适配所有情况。
+
+\compare{
+old: C++20 之前——需要为 const/非const 写两份重载：
+\code[cpp]{
+class Inventory {
+    std::vector<Item> items;
+public:
+    Item& getItem(int i)       { return items[i]; }
+    const Item& getItem(int i) const { return items[i]; }
+    // 两份代码完全一样，只有 const 限定不同
+};
+}
+
+new: C++23 deducing this——一份代码自动适配所有限定：
+\code[cpp]{
+class Inventory {
+    std::vector<Item> items;
+public:
+    // Self 推导出调用者的 const/非const、左值/右值
+    template<typename Self>
+    auto&& getItem(this Self&& self, int i) {
+        return std::forward<Self>(self).items[i];
+    }
+};
+}
+}
+
+Deducing this 还有一个强大的用途——简化 **CRTP（Curiously Recurring Template Pattern, 奇异递归模板模式）**：
+
+\collapse[deducing this 替代 CRTP 示例]{
+\code[cpp]{
+// C++23 之前：CRTP 需要模板参数传递派生类
+template<typename Derived>
+class GameObject_Old {
+public:
+    void update() {
+        static_cast<Derived*>(this)->doUpdate();
+    }
+};
+class Player_Old : public GameObject_Old<Player_Old> {
+public:
+    void doUpdate() { /* ... */ }
+};
+
+// C++23：deducing this 直接推导，无需 CRTP
+class GameObject {
+public:
+    void update(this auto&& self) {
+        self.doUpdate();  // 编译器自动推导实际类型
+    }
+};
+class Player : public GameObject {
+public:
+    void doUpdate() { /* ... */ }
+};
+}
+}
+
+\note{Deducing this 是 C++23 的重要特性，截至目前 MSVC 17.8+、GCC 14+、Clang 18+ 已支持。如果你的编译器还不支持，先了解概念即可，实际项目中仍使用传统的 const/非const 重载。}
+
+/// 新版特性（C++17/20/23）
+
+\tabs{
+\tab[C++17]{
+- **内联变量（Inline Variables）：** 类的静态成员可以在头文件中用 `inline static` 直接定义，不再需要在 .cpp 中单独定义
+- **结构化绑定（Structured Bindings）：** 可以方便地拆解简单类/结构体的成员
+- **`[[nodiscard]]` 属性：** 标记返回值不应被忽略，适用于工厂函数、状态查询等
+
+\code[cpp]{
+class Config {
+public:
+    // C++17：inline static 在头文件直接定义
+    inline static int instanceCount = 0;
+
+    [[nodiscard]] bool load(const char* path);  // 调用方必须处理返回值
+};
+}
+}
+
+\tab[C++20]{
+- **三路比较运算符 `<=>`（Spaceship Operator）：** 一行代码自动生成所有比较运算符
+- **`constinit`：** 保证静态存储期变量在编译期初始化
+- **概念（Concepts）约束成员模板：** 可以约束类模板的成员函数参数类型
+
+\code[cpp]{
+#include <compare>
+class Vec2 {
+    float x, y;
+public:
+    // 自动生成 ==, !=, <, >, <=, >= 全套比较
+    auto operator<=>(const Vec2&) const = default;
+};
+}
+}
+
+\tab[C++23]{
+- **Deducing this：** 显式对象参数，统一 const/非const/左值/右值重载（本节已详述）
+- **`static operator()`：** 允许无状态函数对象标记 `static`，消除 this 指针开销
+- **`[[assume(expr)]]`：** 向编译器提供假设条件，辅助优化
+
+\code[cpp]{
+class Comparator {
+public:
+    // C++23: static operator() 无需对象实例
+    static bool operator()(int a, int b) {
+        return a < b;
+    }
+};
+}
+}
+}
+
+/// 工程实践
+
+\steps{
+\step[成员默认初始化]{
+**始终为成员变量提供默认值**（C++11 起）。在游戏开发中，一个未初始化的 `position` 可能导致角色出现在世界原点之外的随机位置——这类 bug 极难复现。
+
+\code[cpp]{
+class Entity {
+    Vec2 position{0.0f, 0.0f};  // 安全的默认值
+    float hp = 100.0f;
+    bool active = true;         // 所有成员都有默认值
+};
+}
+}
+
+\step[const 正确性]{
+**所有不修改状态的成员函数都加 `const`。** 这不仅是约定——它决定了你的类能否在 `const` 引用、`const` 指针、以及标准库算法的谓词中使用。加 `const` 零成本，不加 `const` 后患无穷。
+}
+
+\step[成员排序减少内存浪费]{
+在 ECS（实体-组件-系统）架构中，一个组件可能有上万个实例。将成员按对齐要求从大到小排列，用 `static_assert` 锁定大小：
+
+\code[cpp]{
+struct RigidBody {
+    double mass;        // 8 bytes
+    float vx, vy, vz;  // 12 bytes
+    int16_t layer;      // 2 bytes
+    bool isKinematic;   // 1 byte
+    bool isTrigger;     // 1 byte
+};  // = 24 bytes（紧凑排列）
+static_assert(sizeof(RigidBody) == 24, "RigidBody 大小意外改变！");
+}
+}
+
+\step[头文件/源文件分离]{
+**公共接口放头文件，实现放源文件。** 内联的小函数（getter/setter）可留在头文件中。这种分离在大型游戏项目中极大减少编译时间——修改一个 `.cpp` 不会导致所有包含该头文件的翻译单元重新编译。
+}
+}
+
+/// 难点易错点分析
+
+\danger{**忘记类定义末尾的 `;`：** 这在 C++ 从 C 继承来的语法规则中是必须的。漏掉分号后，编译器报错位置通常在**下一个文件或下一行**，错误信息令人困惑，比如 "expected ';' after class definition"。
+
+\code[cpp]{
+class Entity {
+    float x, y;
+}     // ← 漏了分号！下方代码会产生莫名其妙的错误
+
+int main() { }  // 编译器可能在这里报一个完全无关的错
+}
+}
+
+\danger{**参数名遮蔽成员名：** 当构造函数或 setter 的参数名与成员变量相同时，函数体内直接使用该名字指的是**参数而非成员**。必须用 `this->` 前缀或使用不同命名。
+
+\code[cpp]{
+class Player {
+    int hp;
+public:
+    void setHp(int hp) {
+        hp = hp;         // 错误！这是参数自己赋给自己，成员未被修改
+        this->hp = hp;   // 正确：显式指定成员
+    }
+};
+}
+}
+
+\danger{**const 成员函数标记遗漏：** 最常见的后果是：你写了一个完全合理的函数，但在接收 `const` 引用的上下文中无法调用它，编译器报"passing 'const X' as 'this' discards qualifiers"。修复方法：回头给函数加 `const`。}
+
+\danger{**误解 `sizeof` 与动态数据：** `sizeof(std::string)` 返回的是 string 对象本身的大小（通常32字节左右），**不包含**它管理的堆上字符数据。`sizeof` 只计算对象的"外壳"大小。
+
+\code[cpp]{
+class Entity {
+    std::string name;   // sizeof 只算 string 对象，不算字符串内容
+    std::vector<int> v; // sizeof 只算 vector 管理结构，不算元素
+};
+// sizeof(Entity) 不反映 name 或 v 实际占用的堆内存
+}
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：角色属性类
+
+实现一个 `Character` 类，包含基本属性和方法。在 `TODO` 处补全代码：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Character {
+    std::string name;
+    int hp = 100;
+    int attack = 10;
+
+public:
+    // TODO 1: 实现 setName，使用 this-> 区分参数与成员
+    //         返回 Character& 以支持链式调用
+
+    // TODO 2: 实现 setAttack，同样支持链式调用
+
+    // TODO 3: 实现 getHp()，标记为 const
+
+    // TODO 4: 实现 takeDamage(int dmg)，减少 hp（不低于0）
+
+    void print() const {
+        std::cout << "[" << name << "] HP:" << hp
+                  << " ATK:" << attack << "\n";
+    }
+};
+
+int main() {
+    Character c;
+    c.setName("Knight").setAttack(25);  // 链式调用
+    c.print();
+
+    c.takeDamage(30);
+    std::cout << "剩余 HP: " << c.getHp() << "\n";
+
+    const Character& ref = c;
+    std::cout << "const 引用读 HP: " << ref.getHp() << "\n";
+    // ref.takeDamage(10);  // 应该编译失败——想想为什么？
+}
+}
+
+// 🟢 基础题 2：结构体大小探索
+
+预测每个结构体的大小，运行验证你的预测：
+
+\run[cpp]{
+#include <iostream>
+#include <cstddef>
+
+struct A { char c; };
+struct B { int i; char c; };
+struct C { char c1; int i; char c2; };
+struct D { char c1; char c2; int i; };
+struct E { double d; int i; char c; };
+struct F {};  // 空结构体
+
+int main() {
+    // 先在纸上预测，再运行验证！
+    std::cout << "A: " << sizeof(A) << " (预测: ?)\n";
+    std::cout << "B: " << sizeof(B) << " (预测: ?)\n";
+    std::cout << "C: " << sizeof(C) << " (预测: ?)\n";
+    std::cout << "D: " << sizeof(D) << " (预测: ?)\n";
+    std::cout << "E: " << sizeof(E) << " (预测: ?)\n";
+    std::cout << "F: " << sizeof(F) << " (预测: ?)\n";
+
+    // 进阶：用 offsetof 查看 C 的成员偏移
+    std::cout << "\nC 的成员偏移:\n";
+    std::cout << "  c1: " << offsetof(C, c1) << "\n";
+    std::cout << "  i:  " << offsetof(C, i)  << "\n";
+    std::cout << "  c2: " << offsetof(C, c2) << "\n";
+}
+}
+
+// 🟡 进阶题 1：2D 变换类
+
+实现一个完整的 `Transform2D` 类，要求具备以下功能。提供函数签名和测试用例：
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+class Transform2D {
+    // 成员排列要求：按大小从大到小，最小化 sizeof
+    float x = 0, y = 0;
+    float rotation = 0;       // 弧度
+    float scaleX = 1, scaleY = 1;
+    bool dirty = true;        // 是否需要重新计算矩阵
+
+public:
+    // 实现以下函数（全部支持链式调用）：
+    Transform2D& setPosition(float x, float y);
+    Transform2D& setRotation(float radians);
+    Transform2D& setScale(float sx, float sy);
+
+    // const 函数：
+    float getX() const;
+    float getY() const;
+    float getRotation() const;
+    bool isDirty() const;
+
+    // 计算前向向量（基于 rotation）
+    // forward = (cos(rotation), sin(rotation))
+    void getForward(float& outX, float& outY) const;
+
+    void print() const;
+};
+
+// TODO: 实现所有成员函数
+
+int main() {
+    Transform2D t;
+    t.setPosition(100, 200)
+     .setRotation(3.14159f / 4)  // 45度
+     .setScale(2.0f, 2.0f);
+    t.print();
+
+    float fx, fy;
+    t.getForward(fx, fy);
+    std::cout << "前向向量: (" << fx << ", " << fy << ")\n";
+
+    const Transform2D& ct = t;
+    std::cout << "const 访问: (" << ct.getX() << ", " << ct.getY() << ")\n";
+
+    static_assert(sizeof(Transform2D) <= 24, "Transform2D 不应超过 24 字节");
+}
+}
+
+// 🟡 进阶题 2：带缓存的纹理管理器
+
+实现一个使用 `mutable` 进行延迟加载缓存的纹理类。要求：`const Texture` 也能使用缓存机制。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Texture {
+    std::string filePath;
+    int width, height;
+    // TODO: 使用 mutable 声明缓存相关成员
+
+public:
+    Texture(const std::string& path, int w, int h);
+
+    // 返回纹理 ID —— 逻辑上是只读的，但内部需要缓存
+    // 首次调用时"加载"（模拟），后续调用直接返回缓存
+    int getTextureId() const;
+
+    // 清除缓存，下次 getTextureId 时重新加载
+    void invalidateCache();  // 思考：这个函数应该加 const 吗？
+
+    // 获取缓存命中次数（调试用）
+    int getCacheHits() const;
+};
+
+// TODO: 实现所有成员函数
+
+int main() {
+    const Texture tex("assets/hero.png", 256, 256);
+
+    std::cout << "首次获取 ID: " << tex.getTextureId() << "\n"; // 应输出"加载"
+    std::cout << "再次获取 ID: " << tex.getTextureId() << "\n"; // 应使用缓存
+    std::cout << "缓存命中: " << tex.getCacheHits() << " 次\n";
+
+    // tex.invalidateCache();  // const 对象能调用吗？为什么？
+}
+}
+
+// 🔴 挑战题：设计一个迷你 ECS 组件系统
+
+设计一个简化版的 ECS 组件存储，要求：
+- `ComponentPool` 类管理某一种组件的内存（用 `std::vector<char>` 模拟原始内存）
+- 支持 `add()` 和 `get()` 操作
+- 使用嵌套类 `ComponentPool::Iterator` 遍历组件
+- 所有只读方法正确标记 `const`
+- 组件使用 `static_assert` 验证大小
+- 考虑内存对齐问题
+
+\collapse[参考思路]{
+核心设计：
+1. `ComponentPool` 内部用 `std::vector<char>` 存储原始字节，每个组件占固定大小
+2. `add()` 在末尾追加 sizeof(T) 字节，用 placement new 构造
+3. `get(index)` 计算偏移量 `index * sizeof(T)`，用 `reinterpret_cast` 转换
+4. 嵌套类 `Iterator` 持有 `char*` 指针和步长，`operator++` 按步长前进
+5. 用 `alignof(T)` 确保起始地址对齐
+
+关键类型：
+\code[cpp]{
+class ComponentPool {
+    std::vector<char> data;
+    size_t componentSize;
+    size_t componentAlign;
+    size_t count = 0;
+
+public:
+    class Iterator { /* ... */ };
+
+    template<typename T>
+    T& add() { /* placement new */ }
+
+    template<typename T>
+    T& get(size_t index) { /* reinterpret_cast */ }
+
+    Iterator begin();
+    Iterator end();
+    size_t size() const;
+};
+}
+
+注意事项：
+- `reinterpret_cast` 和 placement new 涉及底层内存操作，需要理解对齐
+- 这是简化版——真实 ECS（如 EnTT、flecs）还需处理组件销毁、ID 映射等
+- 此题综合了类设计、嵌套类、const 正确性、内存布局等本节核心知识
+}

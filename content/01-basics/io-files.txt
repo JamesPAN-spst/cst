@@ -1,0 +1,618 @@
+/// 简介
+
+上一节我们学习了函数——把代码组织成可复用的小块。但你可能发现一个问题：程序跑完就没了，所有数据都消失了。而且到目前为止，我们的程序还是个"自言自语"的家伙，既没办法问用户要数据，也没办法把结果存下来。
+
+这就好比你是个厨师，会做菜（函数），但是：没有菜单让顾客点菜（输入），做好的菜端不出去（输出），也没有冰箱保存食材（文件）。今天我们就来补上这些能力！
+
+**输入/输出（I/O, Input/Output）** 是程序与外部世界交流的桥梁。C++ 提供了两套 I/O 体系：经典的 `iostream`（输入/输出流）和 C++20/23 的现代格式化输出 `<format>` / `<print>`。文件操作则通过 `<fstream>`（File Stream，文件流）完成。本节会两者对比，帮你选出最合适的工具。
+
+/// 知识点列表
+
+\list{
+- std::cout / std::cin / std::cerr —— 标准输出、输入、错误输出
+- std::println / std::print（C++23）—— 现代格式化输出
+- std::format（C++20）—— 格式化字符串
+- 格式说明符详解 —— 对齐、填充、进制、精度
+- std::getline 与输入缓冲陷阱
+- 流状态与错误处理
+- 文件读写：ifstream / ofstream / fstream
+- 二进制文件读写
+- std::filesystem（C++17）—— 文件系统操作
+- std::stringstream —— 字符串流
+}
+
+/// 知识点详解
+
+// std::cout —— 你的第一个"嘴巴"
+
+还记得 Hello World 吗？`std::cout` 就是程序的"嘴巴"，负责把东西说出来（输出到屏幕）。`<<` 叫做**插入运算符**（Insertion Operator），你可以理解为"往嘴里塞东西让它说出来"。
+
+\code[cpp]{
+#include <iostream>
+
+int main() {
+    // << 可以链式使用，像串珍珠一样把多个值串在一起
+    std::string name = "小明";
+    int age = 20;
+    std::cout << "我叫" << name << "，今年" << age << "岁" << '\n';
+    // 输出：我叫小明，今年20岁
+
+    // std::cerr 用来输出错误信息，它不经过缓冲区，立即显示
+    std::cerr << "出错啦！" << '\n';
+
+    return 0;
+}
+}
+
+看起来还行？但当输出内容变多，`<<` 链就会非常长，像一串裹脚布：
+
+\code[cpp]{
+// 这种代码写起来痛苦，读起来更痛苦……
+std::cout << "姓名: " << name << ", 年龄: " << age
+          << ", 分数: " << score << "/" << total
+          << ", 通过: " << (passed ? "是" : "否") << '\n';
+}
+
+有没有更简洁的方式？有！C++23 带来了救星。
+
+// std::println / std::print —— 现代化的输出（C++23）
+
+C++23 的 `std::println`（print line，打印一行）就像 Python 的 `print()` 一样好用。用 `{}` 做占位符，参数按顺序填进去：
+
+\run[cpp]{
+#include <print>    // C++23 头文件
+#include <string>
+
+int main() {
+    std::string name = "小明";
+    int age = 20;
+    double score = 95.5;
+
+    // {} 是占位符，参数按顺序填入
+    std::println("我叫{}，今年{}岁，考了{}分", name, age, score);
+
+    // std::print 和 println 一样，只是不自动换行
+    std::print("加载中");
+    std::print("...");
+    std::println("完成！");  // 这行才换行
+
+    // 还可以用索引重复使用参数
+    std::println("{0} + {0} = {1}", 3, 6);  // "3 + 3 = 6"
+
+    return 0;
+}
+}
+
+\tip{**选哪个？** 如果你的编译器支持 C++23，优先用 `std::println`，它更简洁、更安全、性能也更好。后面的教程我们会两种都用，但推荐 `std::println`。}
+
+// std::format —— 格式化的瑞士军刀（C++20）
+
+`std::format` 不直接输出，而是返回一个格式化好的**字符串（String）**——就像先把菜装好盘，端不端出去你自己决定：
+
+\code[cpp]{
+#include <format>
+#include <string>
+
+auto msg = std::format("第{}关，得分: {}", 3, 100);
+// msg 是 string: "第3关，得分: 100"
+
+// 你可以存起来、传给函数、写入文件……随你怎么用
+}
+
+\table{
+方式 | 优点 | 缺点 | 推荐度
+---
+`std::println` (C++23) | 类型安全、简洁、高性能 | 需 C++23 | ⭐⭐⭐⭐⭐
+`std::format` (C++20) | 类型安全、灵活 | 返回字符串需再输出 | ⭐⭐⭐⭐
+`std::cout <<` | 通用、无需特殊标准 | 语法冗长 | ⭐⭐⭐
+`printf` (C) | 格式简洁 | 不类型安全、可能崩溃 | ⭐⭐
+}
+
+// 格式说明符详解
+
+`{}` 占位符里可以加**格式说明符**（Format Specifier），语法是 `{:说明符}`。就像你告诉服务员"这道菜要几分熟"：
+
+\tabs{
+\tab[整数格式]{
+\code[cpp]{
+std::println("{:d}", 42);       // "42"   十进制（默认）
+std::println("{:x}", 255);      // "ff"   十六进制小写
+std::println("{:#x}", 255);     // "0xff" 带 0x 前缀
+std::println("{:08x}", 255);    // "000000ff" 补零到8位
+std::println("{:b}", 42);       // "101010" 二进制
+std::println("{:#010b}", 42);   // "0b00101010" 带前缀补零
+}
+}
+\tab[浮点格式]{
+\code[cpp]{
+std::println("{:.2f}", 3.14159);  // "3.14"        固定2位小数
+std::println("{:e}", 12345.6);    // "1.234560e+04" 科学计数法
+std::println("{:g}", 0.00123);    // "0.00123"      通用格式（自动选）
+}
+}
+\tab[对齐与填充]{
+\code[cpp]{
+// > 右对齐  < 左对齐  ^ 居中
+std::println("[{:>10}]", "hi");    // "[        hi]"
+std::println("[{:<10}]", "hi");    // "[hi        ]"
+std::println("[{:^10}]", "hi");    // "[    hi    ]"
+std::println("[{:*^10}]", "hi");   // "[****hi****]" 用 * 填充
+}
+}
+}
+
+// std::cin —— 程序的"耳朵"
+
+`std::cout` 是嘴巴，`std::cin` 就是耳朵。`>>` 叫做**提取运算符**（Extraction Operator），从输入流里"掏"数据出来：
+
+\code[cpp]{
+#include <iostream>
+#include <string>
+
+int main() {
+    int age;
+    std::string name;
+
+    std::cout << "请输入你的名字和年龄（用空格隔开）: ";
+    std::cin >> name >> age;
+    // 输入 "Pan 20" → name="Pan", age=20
+    // 注意：>> 以空白符（空格、换行、Tab）为分隔
+
+    return 0;
+}
+}
+
+如果想读一整行（包含空格），就要用 `std::getline`：
+
+\code[cpp]{
+std::string line;
+std::getline(std::cin, line);  // 读取一整行，直到回车
+}
+
+\danger{**经典坑：`cin >>` 和 `getline` 混用**——这是初学时被坑最多的地方！}
+
+想象 `cin` 的输入缓冲区是一条传送带。当你输入 `42` 再按回车，传送带上其实有 `42\n` 两样东西。`cin >> n` 拿走了 `42`，但那个 `\n` 还留在传送带上！
+
+\diagram[flow]{
+用户输入 "42\n" -> 缓冲区 [42][\n] -> cin >> n 取走 42 -> 缓冲区 [\n] 残留 -> getline 读到 \n -> 得到空字符串！
+}
+
+\steps{
+\step[错误写法——踩坑]{
+\code[cpp]{
+int n;
+std::cin >> n;         // 输入 "42\n"，读取42，'\n' 留在缓冲区
+
+std::string line;
+std::getline(std::cin, line); // 读到残留的 '\n'，line 是空的！
+std::cout << "line = [" << line << "]" << '\n';
+// 输出: line = []  ← 完全不是你想要的！
+}
+}
+\step[正确写法——先清理缓冲区]{
+\code[cpp]{
+int n;
+std::cin >> n;
+
+// 关键一步：用 ignore() 清除缓冲区中残留的 '\n'
+std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+std::string line;
+std::getline(std::cin, line); // 现在能正常读取了！
+}
+}
+}
+
+\collapse[🤔 为什么 ignore() 的参数这么长？]{
+`std::cin.ignore(count, delimiter)` 的意思是：最多跳过 `count` 个字符，或者遇到 `delimiter` 就停下来。
+
+- `std::numeric_limits<std::streamsize>::max()` 就是一个超级大的数，意思是"不管缓冲区里有多少垃圾，统统跳过"。
+- `'\n'` 是停止标志，遇到换行就停。
+
+合在一起就是："跳过缓冲区里所有东西，直到（包含）第一个换行符。" 这是清理输入缓冲区最安全的写法。需要 `#include <limits>` 头文件。
+}
+
+// 流状态与错误处理
+
+如果用户在该输入数字的地方输入了 `"abc"`，会发生什么？`cin` 会进入**失败状态**（Fail State），之后所有的输入操作都会失败——就像一个人被噎住了，什么都吞不下去了，你得先帮他清理：
+
+\run[cpp]{
+#include <iostream>
+#include <limits>
+
+int main() {
+    int x;
+    std::cout << "请输入一个整数: ";
+    std::cin >> x;
+
+    if (std::cin.fail()) {
+        // 输入格式不对！
+        std::cin.clear();  // 第一步：清除错误标志（"解除噎住"）
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        // 第二步：丢弃缓冲区里的错误输入
+        std::cerr << "无效输入！请输入整数。\n";
+    } else {
+        std::cout << "你输入了: " << x << '\n';
+    }
+
+    return 0;
+}
+}
+
+\code[cpp]{
+// 流状态的四个标志
+std::cin.good();   // 一切正常
+std::cin.fail();   // 格式错误或提取失败
+std::cin.bad();    // 严重 I/O 错误（硬件级别）
+std::cin.eof();    // 到达文件末尾（End Of File）
+
+// 惯用法：直接把流当条件来判断
+if (std::cin >> x) {
+    // 读取成功
+} else {
+    // 读取失败
+}
+
+// 循环读取直到 EOF（常用于竞赛和批处理文件）
+while (std::cin >> x) {
+    process(x);
+}
+}
+
+// 文件读写 —— 给程序装上"冰箱"
+
+文件操作和 `cin`/`cout` 几乎一模一样！只不过数据的来源/去向从"键盘/屏幕"变成了"文件"：
+
+- `std::ifstream`（Input File Stream）—— 从文件读数据，相当于 `cin` 的文件版
+- `std::ofstream`（Output File Stream）—— 向文件写数据，相当于 `cout` 的文件版
+- `std::fstream` —— 可读可写
+
+\run[cpp]{
+#include <fstream>
+#include <iostream>
+#include <string>
+
+int main() {
+    // ===== 写文件 =====
+    {
+        std::ofstream out("demo.txt");  // 打开（或创建）文件
+        if (!out) {
+            std::cerr << "无法打开文件！\n";
+            return 1;
+        }
+        out << "第一行：Hello, File!\n";
+        out << "第二行：分数 = " << 100 << '\n';
+    } // out 离开作用域，文件自动关闭（RAII 机制）
+
+    // ===== 读文件 =====
+    {
+        std::ifstream in("demo.txt");
+        if (!in) {
+            std::cerr << "无法打开文件！\n";
+            return 1;
+        }
+
+        // 逐行读取——最常用的方式
+        std::string line;
+        while (std::getline(in, line)) {
+            std::cout << "读到: " << line << '\n';
+        }
+    } // in 离开作用域，文件自动关闭
+
+    return 0;
+}
+}
+
+\tip{**文件操作务必使用 RAII（Resource Acquisition Is Initialization，资源获取即初始化）：**让 `fstream` 对象在作用域结束时自动关闭文件。不要手动调用 `.close()`，除非你需要在关闭后检查错误状态。还没学 RAII？别急，后面面向对象章节会详细讲。}
+
+\code[cpp]{
+// 一次读取整个文件——适合小文件
+std::string readAll(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Cannot open: " + path);
+    return std::string(
+        std::istreambuf_iterator<char>(in),  // 从文件头
+        std::istreambuf_iterator<char>()     // 到文件尾
+    );
+}
+
+// 追加模式——不覆盖原有内容，在末尾添加
+std::ofstream log("app.log", std::ios::app);  // app = append
+log << "新的日志条目\n";
+}
+
+// 二进制文件
+
+文本文件是给"人"看的，二进制文件是给"机器"看的。二进制文件直接把内存中的数据原样写入磁盘，不做任何转换，所以更快、更紧凑：
+
+\code[cpp]{
+#include <fstream>
+#include <iostream>
+
+struct Record {
+    int32_t id;       // 用固定大小的类型
+    float score;
+    char name[32];    // 固定长度的字符数组
+};
+
+int main() {
+    // 写入二进制
+    {
+        std::ofstream out("data.bin", std::ios::binary);
+        Record r{1, 95.5f, "Pan"};
+        out.write(reinterpret_cast<const char*>(&r), sizeof(r));
+        // reinterpret_cast 把 Record* 当作 char* 看待
+        // sizeof(r) 告诉需要写入多少字节
+    }
+
+    // 读取二进制
+    {
+        std::ifstream in("data.bin", std::ios::binary);
+        Record r;
+        in.read(reinterpret_cast<char*>(&r), sizeof(r));
+        std::cout << "ID: " << r.id
+                  << ", Score: " << r.score
+                  << ", Name: " << r.name << '\n';
+    }
+
+    return 0;
+}
+}
+
+\warning{**二进制文件跨平台不可移植！** 不同平台的字节序（Endianness，大端 vs 小端）、struct 内存对齐（Alignment）、`int` 大小可能都不同。跨平台数据交换应使用序列化库（Protocol Buffers、FlatBuffers）或文本格式（JSON、TOML）。这是个进阶话题，先了解即可。}
+
+// std::filesystem —— 文件管理员（C++17）
+
+以前想创建目录、遍历文件夹、获取文件大小……每个操作系统都有自己的一套 API。C++17 的 `<filesystem>` 库（文件系统库）终于统一了这些操作：
+
+\code[cpp]{
+#include <filesystem>
+#include <iostream>
+namespace fs = std::filesystem;  // 缩写，不然每次打 std::filesystem 太长了
+
+// 路径拼接——用 / 运算符，不用手动拼字符串
+fs::path p = "/home/pan/project";
+auto full = p / "src" / "main.cpp";  // "/home/pan/project/src/main.cpp"
+
+// 路径分解
+p.filename();      // "project"
+p.extension();     // "" （无扩展名）
+p.parent_path();   // "/home/pan"
+
+// 文件系统查询
+fs::exists(p);              // 文件/目录是否存在？
+fs::is_regular_file(p);     // 是普通文件吗？
+fs::is_directory(p);        // 是目录吗？
+fs::file_size("data.bin");  // 文件大小（字节）
+}
+
+\code[cpp]{
+// 遍历目录——就像打开文件夹看看里面有什么
+for (const auto& entry : fs::directory_iterator("./src")) {
+    if (entry.is_regular_file()) {
+        std::cout << entry.path().filename().string()
+                  << " (" << entry.file_size() << " bytes)\n";
+    }
+}
+
+// 递归遍历——连子文件夹也不放过
+for (const auto& entry : fs::recursive_directory_iterator(".")) {
+    std::cout << entry.path().string() << '\n';
+}
+
+// 常用文件操作
+fs::create_directories("output/logs");           // 创建多级目录
+fs::copy_file("src.txt", "dst.txt",
+    fs::copy_options::overwrite_existing);        // 复制文件
+fs::remove("temp.txt");                          // 删除文件
+fs::rename("old.txt", "new.txt");                // 重命名/移动
+}
+
+// std::stringstream —— 在字符串上玩 I/O
+
+`std::stringstream`（字符串流）把字符串当成一个虚拟的"文件"来读写。这在解析文本数据的时候特别好用：
+
+\code[cpp]{
+#include <sstream>
+#include <string>
+#include <iostream>
+
+int main() {
+    // 字符串 → 数据（解析）
+    std::istringstream iss("42 3.14 hello");
+    int n; double d; std::string s;
+    iss >> n >> d >> s;  // 和 cin >> 用法一模一样！
+    // n=42, d=3.14, s="hello"
+
+    // 数据 → 字符串（传统方式）
+    std::ostringstream oss;
+    oss << "Value: " << 42 << ", Pi: " << 3.14;
+    std::string result = oss.str();  // 取出构建好的字符串
+
+    // 现代替代：std::format 更简洁
+    auto result2 = std::format("Value: {}, Pi: {}", 42, 3.14);
+
+    return 0;
+}
+}
+
+\collapse[🤔 什么时候用 stringstream 而不是 format？]{
+`std::format` 适合"已经知道格式"的场景——你清楚要输出什么。
+
+`std::stringstream` 适合"需要逐步解析"的场景——比如从一行 CSV 数据里依次提取各个字段：
+
+\code[cpp]{
+std::string csv_line = "Pan,20,95.5";
+std::istringstream iss(csv_line);
+std::string name, age_str, score_str;
+std::getline(iss, name, ',');       // 以逗号为分隔符
+std::getline(iss, age_str, ',');
+std::getline(iss, score_str, ',');
+}
+
+简单来说：**输出用 `format`，解析用 `stringstream`。**
+}
+
+/// 新旧标准差异
+
+\compare{
+old: C++98/03 只有 `iostream` 和 `fstream`，格式化依赖 `printf`（不类型安全）或复杂的流操纵器（`std::setw`、`std::setprecision`、`std::hex`）。没有文件系统库，操作目录需要平台特定 API（Linux 的 `opendir`、Windows 的 `FindFirstFile`）。路径拼接只能手动用字符串。
+
+new: C++17 引入 `<filesystem>` 统一了文件系统操作。C++20 引入 `<format>` 提供类型安全的格式化。C++23 引入 `<print>` 直接输出格式化内容。**趋势：** `iostream` 仍然存在但日渐被 `<print>` 替代；`<filesystem>` 完全替代平台特定 API。
+}
+
+/// 常用方法速查
+
+\table{
+功能 | 推荐方式 | 头文件
+---
+格式化输出 | `std::println` (C++23) | `<print>`
+格式化字符串 | `std::format` (C++20) | `<format>`
+逐行读文件 | `std::getline` + `ifstream` | `<fstream>`
+读取整行输入 | `std::getline(cin, line)` | `<string>`
+路径操作 | `std::filesystem::path` | `<filesystem>`
+目录遍历 | `fs::directory_iterator` | `<filesystem>`
+字符串→数字 | `std::stoi` / `std::stod` | `<string>`
+二进制 I/O | `read()` / `write()` | `<fstream>`
+字符串解析 | `std::istringstream` | `<sstream>`
+}
+
+/// 难点易错点分析
+
+\danger{**`std::endl` vs `'\n'`：** `std::endl` = 输出换行 **+** 刷新缓冲区（Flush Buffer）。在循环中使用 `std::endl` 会导致性能急剧下降（每次都逼着系统写入磁盘/屏幕）。99% 的场景用 `'\n'` 就够了。只有在需要确保输出立即可见时才用 `std::endl`（比如调试崩溃前的最后一行输出）。}
+
+\danger{**`std::cin >>` 读字符串只读到空格：**}
+
+\code[cpp]{
+std::string input;
+std::cin >> input;
+// 输入 "Hello World"
+// input 只有 "Hello"！"World" 还留在缓冲区
+// 要读完整行请用 std::getline(std::cin, input)
+}
+
+\warning{**文件路径的跨平台问题：** Windows 用 `\`（反斜杠），Linux/macOS 用 `/`（正斜杠）。最佳实践：用 `std::filesystem::path` 自动处理，或者统一使用 `/`（Windows 也接受正斜杠）。}
+
+\quiz[choice]{
+Q: 以下代码执行后，`line` 的值是什么？
+\code[cpp]{
+int n;
+std::cin >> n;  // 用户输入: 42
+std::string line;
+std::getline(std::cin, line);
+}
+A: "42"
+B: 空字符串 ""
+C: 未定义行为
+D: 编译错误
+ANS: B
+EXP: `cin >> n` 读走了 `42`，但回车符 `\n` 仍留在缓冲区中。`std::getline` 读到这个残留的 `\n` 就停下来了，所以 `line` 是空字符串。需要在 `cin >>` 后用 `cin.ignore(...)` 清除残留的换行符。
+}
+
+\quiz[tf]{
+Q: `std::endl` 和 `'\n'` 的效果完全相同，可以随意替换。
+ANS: F
+EXP: `'\n'` 只输出换行符，而 `std::endl` 输出换行符**并且刷新缓冲区**。在循环中使用 `std::endl` 会显著降低性能，大多数场景应该用 `'\n'`。
+}
+
+\quiz[choice]{
+Q: 要打开一个文件进行**追加写入**（不覆盖原有内容），应该使用哪种方式？
+A: `std::ofstream out("log.txt");`
+B: `std::ofstream out("log.txt", std::ios::app);`
+C: `std::ifstream in("log.txt");`
+D: `std::ofstream out("log.txt", std::ios::binary);`
+ANS: B
+EXP: `std::ios::app`（append）标志表示追加模式，新写入的内容会加在文件末尾。选项 A 是覆盖模式（默认）；选项 C 是只读模式；选项 D 是二进制模式但仍会覆盖原有内容。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：安全输入与格式化输出
+
+编写一个程序：先让用户输入姓名（可以包含空格），再输入年龄（整数）。如果年龄输入不合法（比如输入了字母），提示错误并让用户重新输入。最终输出格式化的问候语。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <limits>
+
+int main() {
+    std::string name;
+    int age;
+
+    // TODO: 用 std::getline 读取姓名（可以包含空格）
+    std::cout << "请输入你的姓名: ";
+    /* TODO: 你的代码 */
+
+    // TODO: 用循环确保读入合法的整数年龄
+    //   提示：如果 cin >> age 失败，需要 clear() + ignore()
+    std::cout << "请输入你的年龄: ";
+    /* TODO: 你的代码 */
+
+    // TODO: 输出问候语，格式如 "你好, 张三! 你今年20岁。"
+    /* TODO: 你的代码 */
+
+    return 0;
+}
+}
+
+// 🟢 基础题 2：文件读写小练习
+
+编写一个程序，创建一个文件 `scores.txt` 写入 3 个学生的姓名和分数，然后重新打开文件读出来显示。
+
+\run[cpp]{
+#include <fstream>
+#include <iostream>
+#include <string>
+
+int main() {
+    // ===== 写文件 =====
+    {
+        std::ofstream out("scores.txt");
+        if (!out) {
+            std::cerr << "无法创建文件！\n";
+            return 1;
+        }
+        // TODO: 写入3个学生的数据，每行格式: "姓名 分数"
+        //   例如: out << "Alice 95" << '\n';
+        /* TODO: 你的代码 */
+    }
+
+    // ===== 读文件 =====
+    {
+        std::ifstream in("scores.txt");
+        if (!in) {
+            std::cerr << "无法打开文件！\n";
+            return 1;
+        }
+        // TODO: 逐行读取并输出到屏幕
+        //   提示：用 while (std::getline(in, line))
+        /* TODO: 你的代码 */
+    }
+
+    return 0;
+}
+}
+
+// 🟡 进阶题：简易配置文件解析器
+
+编写一个函数，读取如下格式的配置文件（`key = value`，每行一个），把所有键值对输出到控制台。要求：跳过空行和以 `#` 开头的注释行，正确处理 `=` 两边的空格。
+
+配置文件内容示例：
+\code[text]{
+# 这是注释
+name = Alice
+age = 20
+
+score = 95.5
+# 下面这行也要能处理
+level=Beginner
+}
+
+\collapse[💡 提示]{
+1. 用 `std::getline` 逐行读取文件
+2. 跳过空行：检查 `line.empty()`
+3. 跳过注释：检查 `line[0] == '#'`
+4. 分割键值：用 `line.find('=')` 找到等号位置，然后用 `substr` 分割
+5. 去除空格：可以手写一个 `trim` 函数，或者用 `std::string` 的 `find_first_not_of` 和 `find_last_not_of`
+}

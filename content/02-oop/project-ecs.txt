@@ -1,0 +1,345 @@
+/// 简介
+
+恭喜你走到了OOP板块的终点！前面几节，你学了类与访问控制、构造/析构、继承与虚函数、组合、运算符重载、拷贝/移动语义、静态成员——现在是时候把它们**全部**用上。
+
+本项目要构建一个 **Mini-ECS（Entity-Component-System，实体-组件-系统）** 框架原型。ECS是现代游戏引擎（Unity DOTS、Unreal Mass、EnTT）的主流架构，核心思想是"**组合优于继承**"——把能力拆成可插拔的组件自由拼装，不搞 `FlyingFireBreathingDragon` 式继承链。
+
+\note{这是教学简化版ECS，重点练习OOP技能。工业级高性能ECS（Archetype/SparseSet）在"引擎架构"板块展开。}
+
+\diagram[tree]{
+root: World（调度器）
+  L: EntityManager
+    L: ID分配与回收
+  R: ComponentPool<T>...
+    L: Position / Velocity / Sprite
+    R: ISystem
+      L: MovementSystem
+      R: RenderSystem
+}
+
+/// 项目需求
+
+\project{Mini-ECS 原型框架}{
+
+**核心理念：** Entity = 纯ID | Component = 纯数据 | System = 纯逻辑
+
+\diagram[flow]{
+创建Entity → 挂载Component → System遍历更新 → 每帧循环
+}
+
+**功能需求：**
+
+1. **EntityManager** — 分配/回收实体ID
+   - `create()` 分配新ID（优先复用回收ID），`destroy(id)` 回收
+   - `isAlive(id)` 判断存活；用 `std::queue` 存放可复用ID
+   - 静态成员追踪全局已创建实体总数
+
+2. **ComponentPool<T>** — 模板类，管理某类组件存储
+   - 用 `std::unordered_map<EntityID, T>` 存储
+   - 提供 `add`、`remove`、`get`（返回引用）、`has`、`all`（供遍历）
+
+3. **5种组件**（`struct`，只有数据成员）
+
+\code[cpp]{
+struct Position { float x = 0.f, y = 0.f; };
+struct Velocity { float dx = 0.f, dy = 0.f; };
+struct Sprite   { std::string texture; int layer = 0; };
+struct Health   { int current = 100; int max = 100; };
+struct Collider { float width = 1.f, height = 1.f; };
+}
+
+4. **ISystem 接口** + 具体System
+
+\code[cpp]{
+class ISystem {
+public:
+    virtual ~ISystem() = default;
+    virtual void update(float dt) = 0;
+    [[nodiscard]] virtual std::string name() const = 0;
+};
+}
+
+   - `MovementSystem`：Position + Velocity → 更新位置
+   - `RenderSystem`：Position + Sprite → 输出绘制信息
+   - `HealthSystem`：Health → 移除 `current <= 0` 的实体
+
+5. **World 调度器** — 持有EntityManager、所有ComponentPool、System列表
+   - `spawn()` / `destroy(id)` / `addComponent` / `getComponent` / `hasComponent`
+   - `addSystem(unique_ptr<ISystem>)` / `update(float dt)`
+}
+
+/// 技术要求
+
+// 必须运用的OOP特性
+
+\table{
+OOP知识点 | 在项目中的应用
+---
+类与访问控制 | 核心类 `private` 封装数据，`public` 暴露接口
+构造/析构 | EntityManager 初始化ID池；析构自动清理
+继承与虚函数 | ISystem 纯虚接口 → 具体System `override`
+组合优于继承 | World 持有 EntityManager + 多个 ComponentPool
+运算符重载 | Position 实现 `operator+=` 和 `operator<<`
+静态成员 | EntityManager 用 `static` 追踪全局实体计数
+拷贝/移动语义 | World 禁拷贝允移动；组件支持 `std::move`
+智能指针 | `unique_ptr<ISystem>` 管理System所有权
+const正确性 | 只读方法全部标 `const`
+}
+
+// 项目目录结构
+
+\code[bash]{
+mini-ecs/
+├── CMakeLists.txt
+├── include/          # types.h, components.h, entity_manager.h,
+│                     # component_pool.h, system.h, world.h
+├── src/              # main.cpp, entity_manager.cpp, system.cpp, world.cpp
+└── README.md
+}
+
+\code[cmake]{
+cmake_minimum_required(VERSION 3.20)
+project(mini-ecs LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+add_executable(mini-ecs src/main.cpp src/entity_manager.cpp src/system.cpp src/world.cpp)
+target_include_directories(mini-ecs PRIVATE include)
+}
+
+/// 实现提示
+
+四个阶段推进，每阶段都是可编译的里程碑——别一口气写完。
+
+\steps{
+\step[阶段一：Entity管理]{
+
+\code[cpp]{
+class EntityManager {
+    EntityID nextID_ = 1;            // 0保留为NULL_ENTITY
+    std::queue<EntityID> recycled_;   // 已回收可复用的ID
+    std::unordered_set<EntityID> alive_;
+    static inline uint32_t totalCreated_ = 0;  // C++17 inline变量
+public:
+    [[nodiscard]] EntityID create();   // 优先从recycled_取
+    void destroy(EntityID id);         // alive_移除，推入recycled_
+    [[nodiscard]] bool isAlive(EntityID id) const;
+    [[nodiscard]] static uint32_t getTotalCreated();
+};
+}
+
+**验收：** 建5个实体，销毁#2和#4，再建2个——新ID应复用回收值。
+}
+\step[阶段二：ComponentPool模板]{
+
+模板类，头文件需包含完整实现。
+
+\code[cpp]{
+template<typename T>
+class ComponentPool {
+    std::unordered_map<EntityID, T> data_;
+public:
+    void add(EntityID id, T comp) { data_.insert_or_assign(id, std::move(comp)); }
+    void remove(EntityID id)      { data_.erase(id); }
+    [[nodiscard]] T& get(EntityID id) {
+        auto it = data_.find(id);
+        if (it == data_.end()) throw std::runtime_error("Component not found");
+        return it->second;
+    }
+    [[nodiscard]] bool has(EntityID id) const { return data_.contains(id); }
+    [[nodiscard]] auto& all()             { return data_; }
+    [[nodiscard]] const auto& all() const { return data_; }
+};
+}
+
+**验收：** 给3个实体添加 Position + Velocity，查询/修改/移除均正确。
+}
+\step[阶段三：System实现]{
+
+每个System持有 `World&` 引用访问组件池。
+
+\warning{System不要缓存实体ID列表——每次 `update()` 动态遍历，因为实体随时增删。}
+
+\collapse[MovementSystem::update 实现思路]{
+遍历 positions 池，检查实体是否也有 velocity。两者都有就 `pos += vel * dt`——运算符重载派上用场。
+
+\code[cpp]{
+void MovementSystem::update(float dt) {
+    for (auto& [id, pos] : world_.getPool<Position>().all()) {
+        if (world_.hasComponent<Velocity>(id)) {
+            auto& vel = world_.getComponent<Velocity>(id);
+            pos.x += vel.dx * dt;
+            pos.y += vel.dy * dt;
+        }
+    }
+}
+}
+}
+
+**验收：** Position{0,0} + Velocity{10,5}，`update(1.0f)` 后 = {10, 5}。
+}
+\step[阶段四：World调度器]{
+
+组装一切。用 `if constexpr` + `std::is_same_v` 分发组件池访问。
+
+\warning{World 必须**禁止拷贝、允许移动**——`= delete` 拷贝，`= default` 移动。}
+
+\code[cpp]{
+class World {
+public:
+    World() = default;
+    World(const World&) = delete;
+    World& operator=(const World&) = delete;
+    World(World&&) = default;
+    World& operator=(World&&) = default;
+
+    template<typename T> ComponentPool<T>& getPool() {
+        if constexpr (std::is_same_v<T, Position>) return positions_;
+        // ... 其余组件类型同理
+    }
+    void update(float dt) { for (auto& s : systems_) s->update(dt); }
+};
+}
+
+**验收：** 能跑通下方 `\run` 演示，输出每帧实体状态。
+}
+}
+
+// 运算符重载参考
+
+\code[cpp]{
+struct Position {
+    float x = 0.f, y = 0.f;
+    Position& operator+=(const Position& rhs) { x += rhs.x; y += rhs.y; return *this; }
+    friend std::ostream& operator<<(std::ostream& os, const Position& p) {
+        return os << "(" << p.x << ", " << p.y << ")";
+    }
+};
+}
+
+// 完整可运行演示
+
+下面是单文件集成版——你的项目应拆分为多文件结构。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
+#include <cstdint>
+#include <type_traits>
+using EntityID = uint32_t;
+
+struct Position {
+    float x=0,y=0;
+    friend std::ostream& operator<<(std::ostream& os,const Position& p){return os<<"("<<p.x<<","<<p.y<<")";}
+};
+struct Velocity { float dx=0,dy=0; };
+struct Sprite { std::string texture; int layer=0; };
+
+class EntityManager {
+    EntityID next_=1; std::queue<EntityID> free_; std::unordered_set<EntityID> alive_;
+    static inline uint32_t total_=0;
+public:
+    EntityID create(){EntityID id=free_.empty()?next_++:free_.front();if(!free_.empty())free_.pop();alive_.insert(id);++total_;return id;}
+    void destroy(EntityID id){if(alive_.erase(id))free_.push(id);}
+    static uint32_t getTotal(){return total_;}
+};
+
+template<typename T> class ComponentPool {
+    std::unordered_map<EntityID,T> d_;
+public:
+    void add(EntityID id,T c){d_.insert_or_assign(id,std::move(c));}
+    void remove(EntityID id){d_.erase(id);}
+    T& get(EntityID id){return d_.at(id);}
+    bool has(EntityID id)const{return d_.contains(id);}
+    auto& all(){return d_;}
+};
+
+class World;
+class ISystem{public:virtual ~ISystem()=default;virtual void update(float dt)=0;};
+
+class World {
+    EntityManager em_;
+    ComponentPool<Position> pos_; ComponentPool<Velocity> vel_; ComponentPool<Sprite> spr_;
+    std::vector<std::unique_ptr<ISystem>> sys_;
+public:
+    World()=default; World(const World&)=delete; World& operator=(const World&)=delete;
+    EntityID spawn(){return em_.create();}
+    void destroy(EntityID id){pos_.remove(id);vel_.remove(id);spr_.remove(id);em_.destroy(id);}
+    template<typename T> void add(EntityID id,T c){pool<T>().add(id,std::move(c));}
+    template<typename T> T& get(EntityID id){return pool<T>().get(id);}
+    template<typename T> bool has(EntityID id)const{return pool<T>().has(id);}
+    template<typename T> ComponentPool<T>& pool(){
+        if constexpr(std::is_same_v<T,Position>)return pos_;
+        else if constexpr(std::is_same_v<T,Velocity>)return vel_;
+        else return spr_;
+    }
+    template<typename T> const ComponentPool<T>& pool()const{
+        if constexpr(std::is_same_v<T,Position>)return pos_;
+        else if constexpr(std::is_same_v<T,Velocity>)return vel_;
+        else return spr_;
+    }
+    void addSystem(std::unique_ptr<ISystem> s){sys_.push_back(std::move(s));}
+    void update(float dt){for(auto& s:sys_)s->update(dt);}
+};
+
+class MovementSystem:public ISystem{World& w_;public:
+    explicit MovementSystem(World& w):w_(w){}
+    void update(float dt)override{
+        for(auto&[id,p]:w_.pool<Position>().all())
+            if(w_.has<Velocity>(id)){auto&v=w_.get<Velocity>(id);p.x+=v.dx*dt;p.y+=v.dy*dt;}
+    }};
+class RenderSystem:public ISystem{World& w_;public:
+    explicit RenderSystem(World& w):w_(w){}
+    void update(float)override{
+        for(auto&[id,p]:w_.pool<Position>().all())
+            if(w_.has<Sprite>(id))std::cout<<"  [Render] #"<<id<<" "<<w_.get<Sprite>(id).texture<<" at "<<p<<"\n";
+    }};
+
+int main(){
+    World world;
+    world.addSystem(std::make_unique<MovementSystem>(world));
+    world.addSystem(std::make_unique<RenderSystem>(world));
+    auto player=world.spawn();
+    world.add(player,Position{100,200}); world.add(player,Velocity{5,0}); world.add(player,Sprite{"hero.png",1});
+    auto enemy=world.spawn();
+    world.add(enemy,Position{300,200}); world.add(enemy,Velocity{-3,1}); world.add(enemy,Sprite{"goblin.png",1});
+    for(int f=1;f<=3;++f){std::cout<<"=== Frame "<<f<<" ===\n";world.update(1.0f);}
+    std::cout<<"Total created: "<<EntityManager::getTotal()<<"\n";
+}
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 详细标准
+---
+ECS架构设计 | 25分 | Entity纯ID、Component纯数据、System纯逻辑；职责分离清晰
+OOP特性运用 | 25分 | 虚函数+override、运算符重载、static成员、const正确性全到位
+资源管理 | 20分 | unique_ptr管理System；World禁拷贝允移动；无内存泄漏
+代码质量 | 20分 | 命名规范、接口合理、编译零警告、注释解释"为什么"
+可扩展性 | 10分 | 添加新Component/System不需修改已有System代码
+}
+
+\tip{用 `valgrind` 或 AddressSanitizer（`-fsanitize=address`）检测内存问题。确认 World 析构时 `unique_ptr<ISystem>` 自动释放。}
+
+/// 扩展挑战
+
+\list{
+- **组件位掩码**：用 `std::bitset` 给实体维护"组件签名"，System通过签名快速筛选代替逐个 `has()`
+- **事件系统**：实现 `EventBus`，System通过事件通信（如 `CollisionEvent`）而非直接调用
+- **序列化**：实现 `World::save/load`，导出/导入所有实体和组件状态
+- **System优先级**：`addSystem` 增加优先级参数，`update()` 按优先级排序执行
+- **模板化World**：用可变参数模板自动管理任意 ComponentPool（预告：第6章模板）
+}
+
+/// 参考资源
+
+\list{
+- cppreference.com — `unique_ptr`、`unordered_map`、`if constexpr`
+- 《Game Programming Patterns》— Robert Nystrom（gameprogrammingpatterns.com 免费在线）
+- EnTT 库源码 — 现代C++ ECS工业级参考
+- 本课程"引擎架构"板块 — 高性能ECS完整实现
+}

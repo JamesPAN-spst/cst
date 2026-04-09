@@ -1,0 +1,486 @@
+/// 简介
+
+上一节的可变参数模板让我们写出了接受任意参数的代码。但有时候你不只想要"任意多个参数"，还想要"只接受某些类型的参数"——比如一个 `serialize` 函数只接受可序列化的类型，传入不支持的类型时应该编译失败而非运行时崩溃。
+
+**SFINAE（Substitution Failure Is Not An Error，替换失败不是错误）** 是C++模板的一个关键规则：当编译器尝试用具体类型替换模板参数时，如果替换导致无效代码，编译器不会报错，而是静默跳过这个候选。搭配**类型萃取（Type Traits）**——一组在编译期查询和变换类型属性的工具——你可以在编译期根据类型选择不同的代码路径。
+
+C++20 的**概念（Concepts）** 在很多场景下替代了 SFINAE，但理解 SFINAE 仍然是读懂标准库源码和遗留代码的必要技能。
+
+/// 知识点列表
+
+\list{
+- SFINAE 原则详解
+- `std::enable_if`
+- 标准类型萃取（`is_same`, `is_integral`, `is_base_of`, `decay` 等）
+- 自定义类型萃取
+- `std::void_t` 技巧
+- `if constexpr`（C++17）替代 SFINAE
+- Concepts（C++20）替代 SFINAE
+- 检测惯用法（Detection Idiom）
+}
+
+/// 知识点详解
+
+// SFINAE 原则
+
+SFINAE 的核心思想很简单：模板参数替换失败时，编译器不报错，只是把这个模板从候选集中移除。看个例子：
+
+\code[cpp]{
+// 版本A：要求 T 有 value_type 成员类型
+template<typename T>
+typename T::value_type getFirst(const T& container) {
+    return *container.begin();
+}
+
+// 版本B：通用回退
+template<typename T>
+T getFirst(T value) {
+    return value;
+}
+
+std::vector<int> v = {1, 2, 3};
+getFirst(v);   // 版本A：T=vector<int>, T::value_type=int ✓
+getFirst(42);  // 版本A：T=int, int::value_type → 替换失败 → 移除（不报错）
+               // 版本B：T=int ✓
+}
+
+\note{SFINAE 只在**直接上下文（Immediate Context）** 中生效——即函数签名（返回类型、参数类型、模板参数默认值）。如果替换失败发生在函数体内部，那不是 SFINAE，而是**硬错误（Hard Error）**：}
+
+\code[cpp]{
+template<typename T>
+void bad(T x) {
+    x.nonexistent();  // 硬错误！不是 SFINAE
+    // SFINAE 只看签名，不看函数体
+}
+}
+
+// std::enable_if
+
+`std::enable_if` 是利用 SFINAE 进行条件编译的经典工具。当条件为 `true` 时，它定义一个 `type` 成员；条件为 `false` 时，没有 `type` → 替换失败 → SFINAE 排除：
+
+\run[cpp]{
+#include <iostream>
+#include <type_traits>
+#include <limits>
+
+// 只接受整型
+template<typename T>
+std::enable_if_t<std::is_integral_v<T>, T>
+safeAdd(T a, T b) {
+    if (a > 0 && b > std::numeric_limits<T>::max() - a)
+        std::cout << "overflow!\n";
+    return a + b;
+}
+
+// 只接受浮点型
+template<typename T>
+std::enable_if_t<std::is_floating_point_v<T>, T>
+safeAdd(T a, T b) {
+    return a + b;
+}
+
+int main() {
+    std::cout << safeAdd(100, 200) << '\n';   // 整型版本
+    std::cout << safeAdd(1.5, 2.5) << '\n';   // 浮点版本
+    // safeAdd("a", "b"); // 两个都 SFINAE 排除 → 编译错误
+}
+}
+
+`enable_if` 有几种常见的放置位置：
+
+\tabs{
+\tab[返回类型]{
+\code[cpp]{
+template<typename T>
+std::enable_if_t<std::is_integral_v<T>, void>
+process(T val) { /* 整型处理 */ }
+}
+}
+\tab[模板参数默认值]{
+\code[cpp]{
+template<typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+void process(T val) { /* 整型处理 */ }
+}
+}
+\tab[函数参数]{
+\code[cpp]{
+template<typename T>
+void process(T val, std::enable_if_t<std::is_integral_v<T>>* = nullptr) {
+    /* 整型处理 */
+}
+}
+}
+}
+
+// 标准类型萃取
+
+`<type_traits>` 头文件提供了大量编译期类型查询和变换工具。可以分为三大类：
+
+\table{
+类别 | 典型萃取 | 示例
+---
+类型性质查询 | `is_integral`, `is_floating_point`, `is_pointer`, `is_class`, `is_enum`, `is_const` | `is_integral_v<int>` → `true`
+类型关系查询 | `is_same`, `is_base_of`, `is_convertible`, `is_constructible` | `is_same_v<int, int32_t>` → `true`
+类型变换 | `remove_const`, `remove_reference`, `add_pointer`, `decay`, `conditional`, `common_type` | `decay_t<const int&>` → `int`
+}
+
+\code[cpp]{
+#include <type_traits>
+
+// 类型性质
+static_assert(std::is_integral_v<int>);
+static_assert(std::is_floating_point_v<double>);
+static_assert(std::is_pointer_v<int*>);
+static_assert(std::is_const_v<const int>);
+
+// 类型关系
+static_assert(std::is_same_v<int, int>);
+static_assert(std::is_convertible_v<int, double>);
+
+// 类型变换
+static_assert(std::is_same_v<std::remove_const_t<const int>, int>);
+static_assert(std::is_same_v<std::remove_reference_t<int&>, int>);
+static_assert(std::is_same_v<std::decay_t<const int&>, int>);
+static_assert(std::is_same_v<std::conditional_t<true, int, double>, int>);
+}
+
+\tip{**`_v` 和 `_t` 后缀** 是 C++14/17 引入的简写。`is_integral_v<T>` 等价于 `is_integral<T>::value`，`remove_const_t<T>` 等价于 `typename remove_const<T>::type`。始终用简写形式。}
+
+// 自定义类型萃取
+
+标准萃取不够用时，你可以写自己的。经典做法是用 `std::void_t`（C++17）实现**检测惯用法（Detection Idiom）**——检测一个类型是否有某个方法/成员/运算符：
+
+\code[cpp]{
+// void_t<Ts...> — 如果 Ts... 全部合法，结果是 void；否则 SFINAE 排除
+
+// 检测是否有 .size() 方法
+template<typename T, typename = void>
+struct has_size : std::false_type {};  // 默认：没有
+
+template<typename T>
+struct has_size<T, std::void_t<decltype(std::declval<T>().size())>>
+    : std::true_type {};  // 如果 T().size() 合法：有
+
+template<typename T>
+constexpr bool has_size_v = has_size<T>::value;
+
+static_assert(has_size_v<std::vector<int>>);  // true
+static_assert(has_size_v<std::string>);        // true
+static_assert(!has_size_v<int>);               // false
+}
+
+\steps{
+\step[继承 false_type 作为默认]{
+主模板继承 `std::false_type`，表示"条件不满足"。`false_type` 定义了 `static constexpr bool value = false`。
+}
+\step[偏特化 + void_t 做检测]{
+偏特化版本的第二个参数用 `std::void_t<检测表达式>`。如果表达式合法→`void_t` 得到 `void`→偏特化匹配成功→继承 `true_type`。如果表达式非法→SFINAE→使用主模板→`false_type`。
+}
+\step[declval 避免构造]{
+`std::declval<T>()` 在不构造 T 对象的情况下获取 T 的引用——只能在 `decltype`/`sizeof` 等不求值上下文中使用。如果 T 没有默认构造函数，直接 `T().size()` 会编译错误。
+}
+}
+
+// if constexpr（C++17 替代 SFINAE）
+
+`if constexpr` 是同一个函数内根据类型走不同分支的最佳方式——比 SFINAE 清晰得多：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <type_traits>
+
+template<typename T>
+std::string serialize(const T& val) {
+    if constexpr (std::is_integral_v<T>) {
+        return "int:" + std::to_string(val);
+    } else if constexpr (std::is_floating_point_v<T>) {
+        return "float:" + std::to_string(val);
+    } else if constexpr (std::is_same_v<T, std::string>) {
+        return "str:\"" + val + "\"";
+    } else {
+        // 不支持的类型
+        return "unknown";
+    }
+}
+
+int main() {
+    std::cout << serialize(42) << '\n';
+    std::cout << serialize(3.14) << '\n';
+    std::cout << serialize(std::string("hello")) << '\n';
+}
+}
+
+\note{`if constexpr` 的被丢弃分支中的代码**不会被实例化**。这意味着即使某个分支对当前类型编译不过，只要运行时不会走到那个分支，就没问题。这和普通 `if` 不同——普通 `if` 的所有分支都必须能编译。}
+
+// Concepts（C++20 替代 SFINAE）
+
+C++20 的 **Concepts** 是 SFINAE 的现代替代品。它让约束变得可读、可组合，错误信息也清晰得多：
+
+\code[cpp]{
+#include <concepts>
+
+// 定义 Concept
+template<typename T>
+concept Serializable = requires(T t) {
+    { t.serialize() } -> std::convertible_to<std::string>;
+};
+
+// 用 Concept 约束模板
+template<Serializable T>
+void save(const T& obj) {
+    auto data = obj.serialize();
+    // ... 保存到文件
+}
+
+// 或者用缩写语法
+void save(Serializable auto const& obj) {
+    auto data = obj.serialize();
+}
+
+// 错误信息对比
+// SFINAE: "no matching function for call to 'save'" + 几十行候选列表
+// Concepts: "constraints not satisfied: T does not satisfy Serializable"
+}
+
+\compare{
+old: SFINAE + `enable_if`：`template<typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0> void process(T);` — 语法晦涩，错误信息难读。
+
+new: Concepts：`void process(std::integral auto val);` — 一目了然，错误信息指向具体约束。
+}
+
+// 检测惯用法 (Detection Idiom)
+
+将上面的 `void_t` 技巧泛化，得到一个通用的检测框架：
+
+\code[cpp]{
+// 通用检测器
+template<typename, template<typename...> class Op, typename... Args>
+struct is_detected_impl : std::false_type {};
+
+template<template<typename...> class Op, typename... Args>
+struct is_detected_impl<std::void_t<Op<Args...>>, Op, Args...>
+    : std::true_type {};
+
+template<template<typename...> class Op, typename... Args>
+constexpr bool is_detected_v = is_detected_impl<void, Op, Args...>::value;
+
+// 使用：定义"操作"类型别名，然后检测
+template<typename T>
+using has_begin_t = decltype(std::declval<T>().begin());
+
+template<typename T>
+using has_end_t = decltype(std::declval<T>().end());
+
+template<typename T>
+constexpr bool is_iterable_v = is_detected_v<has_begin_t, T>
+                             && is_detected_v<has_end_t, T>;
+
+static_assert(is_iterable_v<std::vector<int>>);
+static_assert(!is_iterable_v<int>);
+}
+
+\collapse[🤔 C++20 用 Concepts 有多简洁？]{
+\code[cpp]{
+template<typename T>
+concept Iterable = requires(T t) {
+    t.begin();
+    t.end();
+};
+
+static_assert(Iterable<std::vector<int>>);
+static_assert(!Iterable<int>);
+// 就这么多。一个 requires 表达式搞定。
+}
+可读性和可维护性差距一目了然。C++20 项目强烈推荐用 Concepts 替代 SFINAE。
+}
+
+/// 工程实践
+
+\list{
+- **C++20 项目**：优先用 Concepts 约束模板，SFINAE 仅用于兼容旧代码
+- **C++17 项目**：`if constexpr` 用于函数内分支，`enable_if` 用于重载选择
+- **C++11/14 项目**：`enable_if` + `void_t`（手动实现）+ 标签分发
+- 自定义 type traits 集中放在 `traits.hpp` 头文件中
+- 用 `static_assert` + 清晰消息辅助模板错误诊断
+}
+
+/// 难点易错点分析
+
+\danger{**SFINAE 只在直接上下文生效！** 函数体里的替换失败是硬错误，不是 SFINAE：}
+
+\code[cpp]{
+// ❌ 错误：函数体内不是 SFINAE
+template<typename T>
+void f(T x) {
+    typename T::type y;  // 如果 T 没有 type 成员→硬错误
+}
+
+// ✅ 正确：放在签名中
+template<typename T>
+auto f(T x) -> typename T::type { /* ... */ }
+// 或用 enable_if
+}
+
+\danger{**`std::declval<T>()` 只能在不求值上下文中使用！** 如果你在实际执行的代码中调用它，会得到链接错误（`declval` 故意没有定义）。}
+
+\warning{**`is_same_v<T, int>` 不考虑 cv 限定和引用！** `is_same_v<const int, int>` 是 `false`。如果你想忽略这些修饰，先用 `decay_t`：`is_same_v<decay_t<T>, int>`。}
+
+\quiz[choice]{
+Q: 以下代码中 `process(42)` 调用哪个版本？
+\code[cpp]{
+template<typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
+void process(T) { std::cout << "A"; }
+
+template<typename T, std::enable_if_t<std::is_floating_point_v<T>, int> = 0>
+void process(T) { std::cout << "B"; }
+}
+A: 版本 A
+B: 版本 B
+C: 歧义错误
+D: SFINAE 全部排除
+ANS: A
+EXP: `42` 是 `int`，`is_integral_v<int>` 为 `true` → 版本 A 的 `enable_if` 成功。`is_floating_point_v<int>` 为 `false` → 版本 B 被 SFINAE 排除。
+}
+
+\quiz[tf]{
+Q: `if constexpr` 中被丢弃的分支完全不会被编译器检查。
+ANS: F
+EXP: 被丢弃分支的代码仍然需要是**语法正确**的（能通过第一阶段解析）。只是**不会被实例化**，所以依赖模板参数的表达式不会检查语义。对于不依赖模板参数的代码（如 `static_assert(false)`），C++23 前仍会报错。
+}
+
+\quiz[choice]{
+Q: `std::decay_t<const int(&)[5]>` 的结果是什么？
+A: `const int[5]`
+B: `int[5]`
+C: `const int*`
+D: `int*`
+ANS: C
+EXP: `decay` 模拟按值传递的类型变换：先移除引用 → `const int[5]`，然后数组退化为指针 → `const int*`。注意 `const` 描述的是元素类型，不会被移除。
+}
+
+/// 实战作业
+
+// 🟢 基础题：if constexpr 类型分发
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+#include <type_traits>
+
+// TODO: 用 if constexpr 实现 describe(val)
+// 整型 → "integer: 42"
+// 浮点 → "float: 3.14"
+// std::string → "string: hello"
+// 其他 → "unknown type"
+
+template<typename T>
+std::string describe(const T& val) {
+    /* TODO: 你的代码 */
+    return "unknown type";
+}
+
+int main() {
+    std::cout << describe(42) << '\n';
+    std::cout << describe(3.14) << '\n';
+    std::cout << describe(std::string("hello")) << '\n';
+}
+}
+
+// 🟢 基础题：type trait 判断
+
+\run[cpp]{
+#include <iostream>
+#include <type_traits>
+#include <vector>
+#include <string>
+
+// TODO: 实现 is_number_v<T>
+// 如果 T 是整型或浮点型返回 true，否则 false
+// 提示: 用 is_integral_v 和 is_floating_point_v 组合
+
+/* TODO: 你的代码 */
+
+int main() {
+    std::cout << std::boolalpha;
+    std::cout << "int: " << is_number_v<int> << '\n';            // true
+    std::cout << "double: " << is_number_v<double> << '\n';      // true
+    std::cout << "string: " << is_number_v<std::string> << '\n'; // false
+    std::cout << "bool: " << is_number_v<bool> << '\n';          // true
+}
+}
+
+// 🟡 进阶题：检测 has_serialize
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <type_traits>
+
+// TODO: 实现 has_serialize_v<T>
+// 检测 T 是否有 serialize() 方法返回 std::string
+// 用 void_t 或 C++20 Concepts 实现
+
+/* TODO: 你的代码 */
+
+struct Player {
+    std::string serialize() const { return "Player{}"; }
+};
+struct Enemy {
+    std::string serialize() const { return "Enemy{}"; }
+};
+struct Rock { int weight; };
+
+int main() {
+    std::cout << std::boolalpha;
+    std::cout << "Player: " << has_serialize_v<Player> << '\n';  // true
+    std::cout << "Enemy: " << has_serialize_v<Enemy> << '\n';    // true
+    std::cout << "Rock: " << has_serialize_v<Rock> << '\n';      // false
+    std::cout << "int: " << has_serialize_v<int> << '\n';        // false
+}
+}
+
+// 🟡 进阶题：universalPrint
+
+实现 `universalPrint(val)` 函数模板，根据类型自动选择打印策略：
+1. 可迭代（有 `begin()`/`end()`）→ 打印每个元素
+2. 可流插入（有 `operator<<`）→ 直接打印
+3. 都不满足 → 打印类型大小（`"[type size=N]"`）
+
+分别用 C++17（`if constexpr` + `void_t`）和 C++20（Concepts）两种方式实现。
+
+\collapse[参考思路]{
+\code[cpp]{
+// C++20 版本
+template<typename T>
+concept Iterable = requires(T t) { t.begin(); t.end(); };
+template<typename T>
+concept Printable = requires(T t, std::ostream& os) { os << t; };
+
+template<typename T>
+void universalPrint(const T& val) {
+    if constexpr (Iterable<T> && !std::is_same_v<T, std::string>) {
+        for (auto& e : val) std::cout << e << ' ';
+    } else if constexpr (Printable<T>) {
+        std::cout << val;
+    } else {
+        std::cout << "[type size=" << sizeof(T) << "]";
+    }
+    std::cout << '\n';
+}
+}
+}
+
+// 🔴 挑战题：编译期类型检测工具包
+
+实现一个 `traits.hpp`，包含以下自定义萃取，每个都用 `static_assert` 验证：
+1. `has_method<T, "name">` 风格的通用方法检测（用宏辅助）
+2. `is_iterable_v<T>` — 检测 begin/end
+3. `is_printable_v<T>` — 检测 operator<<
+4. `is_hashable_v<T>` — 检测 `std::hash<T>` 是否有效
+5. 提供 SFINAE 和 Concepts 两种实现，对比代码量
+
+\collapse[参考思路]{
+`is_hashable` 可以检测 `std::hash<T>{}(std::declval<T>())` 是否合法。用宏 `#define HAS_METHOD(name)` 生成对应的 `has_##name` 萃取模板。C++20 Concepts 版本每个通常只需 3-5 行。
+}

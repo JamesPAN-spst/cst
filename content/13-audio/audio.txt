@@ -1,0 +1,381 @@
+/// 简介
+
+关掉游戏的声音试玩十分钟——你会立刻感到世界"死"了。**游戏音频（Game Audio）** 不仅是背景点缀，更是玩家接收反馈的核心通道：脚步声暗示敌人方位，爆炸声强化打击感，环境音构建沉浸感。
+
+本章从数字音频的物理基础讲起，覆盖音频引擎架构、混音与优先级系统、3D 空间音效、流式加载策略、DSP 效果链，最后对比主流音频中间件的选型。理解这些原理后，无论是自研轻量级音频层还是集成 FMOD/Wwise，你都能做出合理的架构决策。
+
+/// 知识点列表
+
+\list{
+- 数字音频基础（采样率、位深、声道、PCM）
+- 音频 API 概览（OpenAL, FMOD, Wwise, miniaudio）
+- 音频引擎架构（回调模型、双缓冲）
+- 3D 空间音效（距离衰减、声像定位、HRTF）
+- 音频混合（Mixing）与优先级系统
+- 流式加载（Streaming）vs 预加载（Preloading）
+- DSP 效果（混响、低通滤波、压缩器）
+}
+
+/// 知识点详解
+
+// 数字音频基础
+
+声音是空气中的压力波。计算机通过 **脉冲编码调制（PCM, Pulse-Code Modulation）** 将连续波形离散化为数字采样。
+
+\table{
+参数 | 含义 | 典型值
+---
+采样率（Sample Rate） | 每秒采样次数 | 44100 Hz (CD), 48000 Hz (游戏)
+位深（Bit Depth） | 每个采样的精度 | 16-bit (整型), 32-bit (浮点)
+声道（Channels） | 同时记录的音轨数 | 1 (单声道), 2 (立体声)
+比特率 | 每秒数据量 | 48000×2B×2ch = 192 KB/s (16-bit立体声)
+}
+
+\code[cpp]{
+struct AudioBuffer {
+    std::vector<float> samples;  // 归一化到 [-1.0, 1.0]
+    uint32_t sampleRate;
+    uint16_t channels;
+
+    float durationSeconds() const {
+        return static_cast<float>(samples.size())
+             / (sampleRate * channels);
+    }
+
+    // 16-bit PCM → float 转换
+    static float pcm16ToFloat(int16_t sample) {
+        return static_cast<float>(sample) / 32768.0f;
+    }
+};
+}
+
+\note{**为什么游戏引擎内部统一用 float 采样？** 混音时多个声音相加可能超出 16-bit 范围 [-32768, 32767]，整型溢出导致刺耳爆音。float 有巨大的动态范围，混音后再 clamp 到 [-1, 1] 即可。所有专业音频引擎内部都使用 float 或 double。}
+
+// 音频 API 概览
+
+\table{
+库 / API | 类型 | 平台 | 特点
+---
+OpenAL Soft | 开源 API | 跨平台 | 类 OpenGL 接口，3D 音效，社区维护
+miniaudio | 单头文件库 | 跨平台 | 零依赖，C99，极易集成
+SDL_mixer | 简易库 | 跨平台 | 适合快速原型，功能有限
+FMOD | 商业中间件 | 跨平台 | 行业标准，独立游戏免费许可
+Wwise | 商业中间件 | 跨平台 | AAA 级制作，音频设计师友好的编辑器
+}
+
+\tip{**自研引擎推荐起步方案：** miniaudio 做底层音频输出（回调驱动、跨平台），自己实现混音层和资源管理。当需求变复杂后再评估集成 FMOD（提供完善的编辑器工具链和高级 DSP）。}
+
+// 音频引擎架构
+
+音频系统的核心是 **回调模型（Callback Model）**：操作系统/驱动定时向应用要数据——必须在截止时间前填满输出缓冲区。
+
+\diagram[flow]{
+游戏线程(播放/停止命令) -> 无锁命令队列(Lock-Free Queue) -> 音频线程(混音回调) -> 输出缓冲区 -> 音频驱动/DAC -> 扬声器
+}
+
+\code[cpp]{
+class AudioEngine {
+    static constexpr int MAX_VOICES = 32;
+
+    struct Voice {
+        const AudioBuffer* buffer = nullptr;
+        size_t position = 0;
+        float volume = 1.0f;
+        float pan = 0.0f;     // -1=左, 0=中, 1=右
+        bool looping = false;
+        bool active = false;
+        int priority = 0;     // 越高越不容易被抢占
+    };
+
+    std::array<Voice, MAX_VOICES> voices;
+
+public:
+    // 由音频驱动定时调用——硬实时约束！
+    void audioCallback(float* output, int frameCount) {
+        std::fill(output, output + frameCount * 2, 0.0f);
+
+        for (auto& v : voices) {
+            if (!v.active) continue;
+            for (int i = 0; i < frameCount; ++i) {
+                if (v.position >= v.buffer->samples.size()) {
+                    if (v.looping) v.position = 0;
+                    else { v.active = false; break; }
+                }
+                float sample = v.buffer->samples[v.position++] * v.volume;
+                // 等功率声像法（Equal-Power Panning）
+                float angle = (v.pan + 1.0f) * 0.25f * 3.14159f;
+                output[i * 2]     += sample * std::cos(angle);
+                output[i * 2 + 1] += sample * std::sin(angle);
+            }
+        }
+        // 限幅防爆音
+        for (int i = 0; i < frameCount * 2; ++i)
+            output[i] = std::clamp(output[i], -1.0f, 1.0f);
+    }
+};
+}
+
+\danger{**音频回调是硬实时约束（Hard Real-Time）。** 48kHz、1024 帧缓冲 → 回调必须在 ~21ms 内完成。在回调内执行 `new`、`mutex.lock()`、文件读取——任何一个都可能导致音频断续（glitch/underrun）。游戏线程通过 **无锁队列（Lock-Free Queue）** 发送播放/停止/音量变更命令到音频线程。}
+
+// 3D 空间音效
+
+\code[cpp]{
+struct AudioSource3D {
+    Vec3 position;
+    float volume = 1.0f;
+    float minDist = 1.0f;    // 小于此距离 → 全音量
+    float maxDist = 100.0f;  // 大于此距离 → 静音
+    float rolloff = 1.0f;    // 衰减指数
+};
+
+struct AudioListener {
+    Vec3 position;
+    Vec3 forward;
+    Vec3 right;
+    Vec3 up;
+};
+
+// 反比例距离衰减（Inverse Distance Attenuation）
+float calcAttenuation(const AudioSource3D& src, const AudioListener& ear) {
+    float dist = (src.position - ear.position).length();
+    dist = std::max(dist, src.minDist); // 防止过近时音量爆炸
+    return src.minDist / (src.minDist + src.rolloff * (dist - src.minDist));
+}
+
+// 声像定位：音源投影到听者的左右轴
+float calcPan(const AudioSource3D& src, const AudioListener& ear) {
+    Vec3 toSource = (src.position - ear.position).normalized();
+    return dot(toSource, ear.right); // -1=左, +1=右
+}
+}
+
+\collapse[HRTF：更真实的空间感]{
+**头部相关传输函数（HRTF, Head-Related Transfer Function）** 模拟声音经过头部、耳廓的传播差异，提供上下和前后方位感（普通立体声只能区分左右）。实现本质是对每个音源做一次短卷积——128~512 采样点的 FIR 滤波器。Steam Audio、Resonance Audio 提供现成的 HRTF 引擎。
+}
+
+// 音频混合与优先级
+
+当同时播放的声音超过 Voice 上限时，需要 **声音优先级管理（Voice Stealing）**。
+
+\code[cpp]{
+int AudioEngine::play(const AudioBuffer& buf, float vol, int priority) {
+    // 1. 找空闲 Voice
+    for (int i = 0; i < MAX_VOICES; ++i)
+        if (!voices[i].active)
+            return startVoice(i, buf, vol, priority);
+
+    // 2. 没有空闲 → 抢占优先级最低且音量最小的
+    int weakest = 0;
+    for (int i = 1; i < MAX_VOICES; ++i)
+        if (voices[i].priority < voices[weakest].priority ||
+            (voices[i].priority == voices[weakest].priority
+             && voices[i].volume < voices[weakest].volume))
+            weakest = i;
+
+    if (priority > voices[weakest].priority)
+        return startVoice(weakest, buf, vol, priority);
+
+    return -1; // 新声音优先级不够高，丢弃
+}
+}
+
+\tip{**优先级设计指南：** 玩家自身声音（脚步、攻击反馈）最高优先级，UI 音效次之，NPC 语音中等，远处环境音最低。距离越远自动降低优先级——反正听不清。}
+
+// 流式加载 vs 预加载
+
+\table{
+策略 | 内存占用 | 延迟 | 适用场景
+---
+预加载（Preload） | 高（整段驻留内存） | 零 | 短音效 (< 1~2s)
+流式加载（Streaming） | 低（只保留几个缓冲区） | 有初始延迟 | 背景音乐、语音
+}
+
+\code[cpp]{
+// 流式加载：双缓冲方案
+class StreamingSource {
+    static constexpr int BUF_SIZE = 4096;
+    float buffers[2][BUF_SIZE];
+    int activeBuffer = 0;
+    std::ifstream file;
+
+    // 后台线程：填充非活跃缓冲区
+    void fillNextBuffer() {
+        int next = 1 - activeBuffer;
+        // 从文件读取 PCM 数据 → 转换为 float → 写入 buffers[next]
+    }
+
+    // 音频回调中：读取活跃缓冲区
+    const float* getActiveBuffer() const { return buffers[activeBuffer]; }
+    void swapBuffers() { activeBuffer = 1 - activeBuffer; }
+};
+}
+
+// DSP 效果
+
+\tabs{
+\tab[低通滤波器]{
+\code[cpp]{
+// 一阶 RC 低通滤波（模拟"闷声"效果——水下、墙壁遮挡）
+class LowPassFilter {
+    float prevSample = 0.0f;
+    float alpha;  // 0~1, 越小截止频率越低
+public:
+    explicit LowPassFilter(float cutoffRatio) : alpha(cutoffRatio) {}
+    float process(float input) {
+        prevSample += alpha * (input - prevSample);
+        return prevSample;
+    }
+};
+}
+}
+\tab[简易混响]{
+\code[cpp]{
+// 延迟线混响（极简版——Schroeder 混响的单条延迟线）
+class SimpleReverb {
+    std::vector<float> delayLine;
+    size_t writePos = 0;
+    float decay;
+public:
+    SimpleReverb(int delaySamples, float decay)
+        : delayLine(delaySamples, 0.0f), decay(decay) {}
+
+    float process(float input) {
+        float delayed = delayLine[writePos];
+        float output = input + delayed * decay;
+        delayLine[writePos] = output;
+        writePos = (writePos + 1) % delayLine.size();
+        return output;
+    }
+};
+// 真实混响 = 多条不同长度延迟线 + 全通滤波器组合
+}
+}
+\tab[动态范围压缩]{
+\code[cpp]{
+// 压缩器（Compressor）：当信号超过阈值时降低增益
+class Compressor {
+    float threshold;    // dB 阈值
+    float ratio;        // 压缩比（如 4:1）
+    float envelope = 0; // 包络跟踪
+    float attackCoeff, releaseCoeff;
+public:
+    float process(float input) {
+        float inputLevel = std::abs(input);
+        // 包络跟踪
+        float coeff = inputLevel > envelope ? attackCoeff : releaseCoeff;
+        envelope += coeff * (inputLevel - envelope);
+        // 计算增益衰减
+        float dB = 20.0f * std::log10(envelope + 1e-6f);
+        float gain = 1.0f;
+        if (dB > threshold)
+            gain = std::pow(10.0f, (threshold + (dB-threshold)/ratio - dB) / 20.0f);
+        return input * gain;
+    }
+};
+}
+}
+}
+
+/// 工程实践
+
+\list{
+- 音频资源格式：短音效用 WAV/OGG 预加载，长音乐用 OGG/Opus 流式
+- 所有音频命令通过无锁队列从游戏线程发送到音频线程
+- 混音总线（Bus）分层：Master → Music / SFX / Voice / UI，独立音量控制
+- 音效触发去重：相同音效 50ms 内只播放一次（避免多次叠加爆音）
+- 淡入淡出（Fade In/Out）用线性或 S 曲线插值音量，场景切换时平滑过渡
+- 随机化：同一事件准备 3~5 个变体音效，随机选取，避免"机械感"
+}
+
+/// 难点易错点分析
+
+\danger{**混合后必须限幅。** 10 个音量 0.5 的声音叠加，峰值可达 5.0。不做 clamp 输出到 16-bit 设备 → 整型溢出 → 刺耳数字爆音。生产环境用 **压缩器（Compressor）** 比硬限幅更平滑自然。}
+
+\warning{**采样率不匹配导致音调异常。** 音频文件 44100Hz 但输出设备 48000Hz → 直接播放会变快变尖。需要做 **重采样（Resampling）**：线性插值适合游戏音效，高质量场景用 sinc 插值。}
+
+\quiz[choice]{
+Q: 音频引擎的回调函数中可以安全执行以下哪个操作？
+A: 用 `std::mutex` 加锁访问共享数据
+B: 调用 `new` 分配堆内存
+C: 从预加载的 `AudioBuffer` 中读取采样数据
+D: 打开磁盘文件读取音频流
+ANS: C
+EXP: 音频回调是硬实时约束，必须在固定时间内完成。mutex 可能阻塞等待、new 可能触发系统调用、文件 I/O 延迟不可预测——任何一个都会导致音频断续。只有读取已在内存中的数据是安全的。线程间通信必须使用无锁数据结构。
+}
+
+\quiz[tf]{
+Q: 流式加载（Streaming）适合所有类型的游戏音频。
+ANS: F
+EXP: 流式加载有初始延迟（需先填满缓冲区），不适合需要即时响应的短音效（枪声、脚步、UI 点击）。短音效应预加载到内存。流式加载适合数十秒到数分钟的背景音乐、环境音和语音对话。
+}
+
+\quiz[choice]{
+Q: 等功率声像法（Equal-Power Panning）相比线性声像法的优势是？
+A: 实现代码更简单
+B: 声音从左到右移动时感知音量恒定
+C: 支持 5.1 环绕声输出
+D: CPU 开销更低
+ANS: B
+EXP: 线性声像法中间位置左右各 0.5，总功率 = 0.5² + 0.5² = 0.5，只有极端位置的一半——听起来中间"凹下去"。等功率法用 cos/sin 曲线确保 cos²θ + sin²θ = 1，声像移动时感知音量恒定。
+}
+
+/// 实战作业
+
+// 🟢 基础：多声道混音器
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+
+struct Sound {
+    std::vector<float> samples;
+    float volume;
+};
+
+// TODO: 实现混音——将多个声音叠加到输出缓冲区并限幅
+void mixSounds(float* output, int frameCount,
+               const std::vector<Sound>& sounds) {
+    /* TODO: 你的代码
+       1. 清零输出缓冲区 (frameCount 个采样)
+       2. 遍历每个 Sound，叠加 samples[i] * volume 到 output[i]
+       3. 最终限幅到 [-1.0, 1.0]
+    */
+}
+
+int main() {
+    const int SR = 44100, FRAMES = SR; // 1 秒
+    Sound s1, s2;
+    s1.volume = 0.6f; s2.volume = 0.5f;
+    s1.samples.resize(FRAMES); s2.samples.resize(FRAMES);
+    for (int i = 0; i < FRAMES; ++i) {
+        s1.samples[i] = std::sin(2.0f * 3.14159f * 440.0f * i / SR);
+        s2.samples[i] = std::sin(2.0f * 3.14159f * 880.0f * i / SR);
+    }
+
+    std::vector<float> output(FRAMES);
+    mixSounds(output.data(), FRAMES, {s1, s2});
+
+    float maxVal = *std::max_element(output.begin(), output.end());
+    float minVal = *std::min_element(output.begin(), output.end());
+    std::cout << "Mix range: [" << minVal << ", " << maxVal << "]\n";
+    std::cout << (maxVal <= 1.0f && minVal >= -1.0f
+                  ? "PASS: clamp OK" : "FAIL: clamp missing") << "\n";
+}
+}
+
+// 🟡 进阶：3D 空间音效系统
+
+实现 `SpatialAudioMixer`：支持 3D 音源位置、Listener 朝向、反比例距离衰减、等功率声像定位。用生成的测试音频验证：一个音源从左侧匀速移动到右侧时，左右声道音量平滑切换。
+
+// 🔴 挑战：带 DSP 效果链的音频引擎
+
+\collapse[参考思路]{
+1. 实现 `AudioEngine`：32 Voice 混音、优先级抢占、无锁命令队列
+2. DSP 效果链：低通滤波 → 混响 → 压缩器，串联处理
+3. 流式加载：双缓冲，后台线程预读
+4. 混音总线层级：SFX Bus + Music Bus → Master Bus
+5. 用 miniaudio 做实际音频输出
+6. 用 ImGui 面板实时调节效果参数
+}

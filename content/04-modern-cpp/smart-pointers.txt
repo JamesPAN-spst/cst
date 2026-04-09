@@ -1,0 +1,720 @@
+/// 简介
+
+上一节我们学了右值引用与移动语义，知道了如何高效转移资源。但一个根本问题还没解决：谁来负责释放这些资源？
+
+在 C 和早期 C++ 中，你 `new` 了一块内存，就必须记得 `delete`。听起来不难——但实际项目中，指针在函数之间传来传去、存进容器、在异常路径上提前返回……漏 `delete` 几乎是必然的。更糟糕的是，`delete` 了之后还有人用那个指针（**悬空指针，Dangling Pointer**），或者同一块内存被 `delete` 两次（**双重释放，Double Free**），这些 bug 往往在上线后才暴露。
+
+**智能指针（Smart Pointer）** 是现代 C++ 给出的回答：把资源的生命周期绑定到对象的生命周期上——**RAII（Resource Acquisition Is Initialization）**。对象销毁时自动释放资源，不需要你手动 `delete`，也不怕异常中断。C++11 提供了三个智能指针：`std::unique_ptr`（独占所有权）、`std::shared_ptr`（共享所有权）、`std::weak_ptr`（弱引用），它们配合使用几乎能覆盖所有动态内存管理场景。掌握它们，是从"能写 C++"到"能写安全的现代 C++"的关键一步。
+
+/// 知识点列表
+
+\list{
+- 裸指针的问题（动机）
+- std::unique_ptr — 独占所有权
+- std::shared_ptr — 共享所有权（引用计数）
+- std::weak_ptr — 打破循环引用
+- make_unique / make_shared（为什么优于 new）
+- 自定义删除器（Custom Deleter）
+- 智能指针与多态（unique_ptr<Base>）
+- 所有权语义与函数参数传递规范
+- enable_shared_from_this
+}
+
+/// 知识点详解
+
+// 裸指针的问题
+
+在引入智能指针之前，先看看裸指针（Raw Pointer）到底有多少坑。这不是在讲历史——理解这些问题，才能理解智能指针的每个设计决策。
+
+\code[cpp]{
+void loadLevel() {
+    Enemy* boss = new Enemy("Dragon");
+    boss->init();
+
+    if (!boss->isValid()) {
+        return;  // ← 内存泄漏！忘了 delete boss
+    }
+
+    battle(boss);   // 如果 battle 抛异常呢？同样泄漏
+    delete boss;    // 即使走到这里，之后不小心再用 boss 就是悬空指针
+}
+}
+
+这段代码有三个典型问题：**内存泄漏（Memory Leak）**（提前 return 忘记释放）、**异常不安全**（异常跳过 `delete`）、**悬空指针**（`delete` 后还能访问 `boss`）。裸指针看不出"谁拥有这块内存"，编译器帮不了你任何忙。智能指针的核心思想就是：**让所有权关系在类型系统中表达出来，让编译器替你管理资源的生死。**
+
+// std::unique_ptr — 独占所有权
+
+`std::unique_ptr` 表示"我是这块资源唯一的拥有者"。当 `unique_ptr` 被销毁（离开作用域、被 reset、被移动走），它指向的对象就立刻被释放。
+
+\code[cpp]{
+#include <memory>
+
+// 创建（推荐 make_unique）
+auto boss = std::make_unique<Enemy>("Dragon");
+auto scores = std::make_unique<int[]>(100);  // 数组版本
+
+// 基本操作
+boss->init();             // 像裸指针一样使用 -> 和 *
+Enemy* raw = boss.get();  // 获取裸指针（不转移所有权）
+boss.reset();             // 立即释放并置空
+boss.reset(new Enemy("Slime"));  // 释放旧的，接管新的
+Enemy* released = boss.release();  // 放弃所有权，返回裸指针（你负责 delete）
+
+// 独占所有权：不能拷贝，只能移动
+auto boss2 = std::move(boss);  // boss 变为 nullptr，boss2 接管
+// auto boss3 = boss2;          // 编译错误！unique_ptr 禁止拷贝
+
+// 空检查
+if (boss2) { /* 非空 */ }
+}
+
+\tip{**`unique_ptr` 是零开销抽象（Zero-overhead Abstraction）**——默认删除器版本和裸指针大小相同、性能相同。没有任何理由在新代码中使用裸 `new`/`delete`。}
+
+再看上面那个漏洞百出的 `loadLevel`，用 `unique_ptr` 改写后：
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <stdexcept>
+
+struct Enemy {
+    std::string name;
+    Enemy(std::string n) : name(std::move(n)) {
+        std::cout << name << " 被创建\n";
+    }
+    ~Enemy() { std::cout << name << " 被销毁\n"; }  // ← 自动调用！
+    bool isValid() const { return name != "Bug"; }
+};
+
+void battle(Enemy& e) {
+    std::cout << "与 " << e.name << " 战斗！\n";
+}
+
+void loadLevel() {
+    auto boss = std::make_unique<Enemy>("Dragon");
+    if (!boss->isValid()) {
+        return;  // 提前返回？boss 离开作用域自动销毁，无泄漏
+    }
+    battle(*boss);
+    // 函数结束，boss 自动销毁——即使中间有异常也一样安全
+}
+
+int main() {
+    loadLevel();
+    std::cout << "关卡结束\n";
+    return 0;
+}
+}
+
+无论函数从哪条路径返回、是否有异常，`unique_ptr` 都保证资源被释放。这就是 RAII 的力量。
+
+// std::shared_ptr — 共享所有权
+
+有些场景下，一个资源需要被多个地方同时持有——比如游戏里一张纹理被多个精灵共享。这时候用 `unique_ptr` 不行（独占不让拷贝），需要 `std::shared_ptr`。
+
+`shared_ptr` 内部维护一个**引用计数（Reference Count）**：每多一个 `shared_ptr` 指向同一对象，计数 +1；每销毁一个，计数 -1；计数归零时，对象被释放。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+
+struct Texture {
+    std::string name;
+    Texture(std::string n) : name(std::move(n)) {
+        std::cout << "[加载] " << name << "\n";
+    }
+    ~Texture() { std::cout << "[释放] " << name << "\n"; }
+};
+
+int main() {
+    auto tex = std::make_shared<Texture>("hero.png");
+    std::cout << "引用计数: " << tex.use_count() << "\n";  // 1
+
+    {
+        auto sprite1 = tex;   // 拷贝，引用计数 +1
+        auto sprite2 = tex;   // 再拷贝，引用计数 +1
+        std::cout << "引用计数: " << tex.use_count() << "\n";  // 3
+    }
+    // sprite1、sprite2 离开作用域，引用计数回到 1
+    std::cout << "引用计数: " << tex.use_count() << "\n";  // 1
+
+    tex.reset();  // 最后一个 shared_ptr 也放弃 → 对象被释放
+    std::cout << "程序结束\n";
+    return 0;
+}
+}
+
+\warning{`shared_ptr` 不是免费的。它有额外开销：**控制块（Control Block）**（存引用计数、弱引用计数、删除器）需要独立内存分配；引用计数的增减是**原子操作（Atomic Operation）**，线程安全但有性能代价。默认首选 `unique_ptr`，只在确实需要共享所有权时才用 `shared_ptr`。}
+
+\diagram[memory]{
+stack:
+  [0x7ff0] shared_ptr tex → ctrl_block
+  [0x7fe0] shared_ptr sprite1 → ctrl_block
+  [0x7fd0] shared_ptr sprite2 → ctrl_block
+heap:
+  [0x4000] Control Block { ref_count=3, weak_count=0 }
+  [0x4040] Texture { name="hero.png" }
+arrow: tex -> 0x4000
+arrow: sprite1 -> 0x4000
+arrow: sprite2 -> 0x4000
+arrow: 0x4000 -> 0x4040
+}
+
+// std::weak_ptr — 打破循环引用
+
+`shared_ptr` 有一个致命缺陷：**循环引用（Circular Reference）**。如果对象 A 持有 B 的 `shared_ptr`，B 也持有 A 的 `shared_ptr`，两者的引用计数永远不会归零——永久泄漏。
+
+这在游戏开发中很常见：场景图中父节点引用子节点，子节点也要引用父节点。
+
+`std::weak_ptr` 就是用来打破这种循环的。它指向 `shared_ptr` 管理的对象，但**不增加引用计数**。使用时需要先调用 `lock()` 转换为 `shared_ptr`，如果对象已被销毁则返回空。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+
+struct SceneNode {
+    std::string name;
+    std::shared_ptr<SceneNode> child;
+    std::weak_ptr<SceneNode> parent;  // ← weak_ptr 打破循环！
+
+    SceneNode(std::string n) : name(std::move(n)) {
+        std::cout << name << " 创建\n";
+    }
+    ~SceneNode() { std::cout << name << " 销毁\n"; }
+
+    void printParent() {
+        if (auto p = parent.lock()) {  // ← 先 lock()，再使用
+            std::cout << name << " 的父节点是 " << p->name << "\n";
+        } else {
+            std::cout << name << " 没有父节点（已销毁）\n";
+        }
+    }
+};
+
+int main() {
+    auto root = std::make_shared<SceneNode>("World");
+    auto player = std::make_shared<SceneNode>("Player");
+
+    root->child = player;         // 父 → 子：shared_ptr
+    player->parent = root;        // 子 → 父：weak_ptr（不增加引用计数）
+
+    player->printParent();
+    std::cout << "root 引用计数: " << root.use_count() << "\n";  // 1，不是2！
+
+    return 0;
+    // root 和 player 正常析构，无内存泄漏
+}
+}
+
+\collapse[🤔 如果把 parent 也改成 shared_ptr 会怎样？]{
+把 `weak_ptr<SceneNode> parent` 改成 `shared_ptr<SceneNode> parent`，你会发现程序结束时**没有任何 "销毁" 输出**——`root` 和 `player` 互相持有对方的 `shared_ptr`，引用计数始终 >= 1，两者都不会被释放。这就是循环引用导致的内存泄漏。
+}
+
+// make_unique / make_shared
+
+你可能注意到了，前面的例子全部用 `std::make_unique` 和 `std::make_shared` 创建智能指针，而不是直接用 `new`。为什么？
+
+\tabs{
+\tab[用 new 的问题]{
+\code[cpp]{
+// 问题1：异常安全
+// C++17 之前，函数参数求值顺序未定义
+process(std::shared_ptr<Widget>(new Widget), computePriority());
+// 可能的执行顺序：
+// 1. new Widget         ← 分配内存
+// 2. computePriority()  ← 如果这里抛异常……
+// 3. shared_ptr 构造    ← 还没执行到！Widget 泄漏了！
+
+// 问题2：性能（仅 shared_ptr）
+std::shared_ptr<Widget> sp(new Widget);
+// 先 new Widget（一次堆分配），再分配控制块（又一次堆分配）
+// 共 2 次堆分配
+}
+}
+\tab[用 make 函数]{
+\code[cpp]{
+// make_shared：一次堆分配同时放置对象和控制块
+auto sp = std::make_shared<Widget>();  // 只有 1 次堆分配
+
+// make_unique：语义更清晰，异常安全
+auto up = std::make_unique<Widget>();
+// 即使参数求值顺序不确定，也不会泄漏
+
+// 传参
+process(std::make_shared<Widget>(), computePriority());
+// make_shared 是单个表达式，不会被拆开 → 异常安全
+}
+}
+}
+
+\tip{**经验法则：永远用 `make_unique` / `make_shared` 代替 `new`。** 只有两种例外：需要自定义删除器时（make 函数不支持）；以及大对象搭配长寿命 `weak_ptr` 时（`make_shared` 的合并分配会延迟内存回收）。}
+
+// 自定义删除器
+
+智能指针默认用 `delete`（或 `delete[]`）释放资源。但如果你管理的不是 `new` 出来的内存——比如 C 风格的文件句柄、OpenGL 纹理 ID、第三方库返回的原始指针——就需要**自定义删除器（Custom Deleter）**。
+
+\code[cpp]{
+#include <memory>
+#include <cstdio>
+
+// unique_ptr 自定义删除器——删除器类型是模板参数的一部分
+auto fileDeleter = [](FILE* fp) {
+    if (fp) {
+        std::fclose(fp);
+        std::puts("文件已关闭");
+    }
+};
+std::unique_ptr<FILE, decltype(fileDeleter)> file(
+    std::fopen("data.txt", "r"), fileDeleter
+);
+// file 离开作用域时自动调用 fclose
+
+// shared_ptr 自定义删除器——删除器不影响类型签名！
+std::shared_ptr<FILE> logFile(
+    std::fopen("log.txt", "w"),
+    [](FILE* fp) { if (fp) std::fclose(fp); }
+);
+// shared_ptr<FILE> 不管用什么删除器，类型都一样
+// 这意味着你可以把不同删除器的 shared_ptr<FILE> 放进同一个 vector
+}
+
+注意一个重要区别：`unique_ptr` 的删除器是类型的一部分（`unique_ptr<T, Deleter>`），不同删除器的 `unique_ptr` 是不同类型；而 `shared_ptr` 的删除器通过**类型擦除（Type Erasure）** 藏在控制块里，不影响外部类型。
+
+// 智能指针与多态
+
+在游戏开发中，你经常需要用基类指针管理派生类对象（多态）。`unique_ptr` 和 `shared_ptr` 都天然支持这一点。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <vector>
+
+struct Shape {
+    virtual void draw() const = 0;
+    virtual ~Shape() = default;  // ← 虚析构函数必须有！
+};
+
+struct Circle : Shape {
+    float radius;
+    Circle(float r) : radius(r) {}
+    void draw() const override {
+        std::cout << "绘制圆形 (r=" << radius << ")\n";
+    }
+};
+
+struct Rect : Shape {
+    float w, h;
+    Rect(float w, float h) : w(w), h(h) {}
+    void draw() const override {
+        std::cout << "绘制矩形 (" << w << "x" << h << ")\n";
+    }
+};
+
+int main() {
+    // unique_ptr<Derived> 可以隐式转换为 unique_ptr<Base>
+    std::vector<std::unique_ptr<Shape>> shapes;
+    shapes.push_back(std::make_unique<Circle>(5.0f));
+    shapes.push_back(std::make_unique<Rect>(3.0f, 4.0f));
+    shapes.push_back(std::make_unique<Circle>(1.5f));
+
+    for (const auto& s : shapes) {
+        s->draw();  // 多态调用
+    }
+    // shapes 销毁时，每个子对象通过虚析构函数正确释放
+    return 0;
+}
+}
+
+\danger{**基类必须有虚析构函数！** 如果 `Shape` 没有 `virtual ~Shape()`，通过 `unique_ptr<Shape>` 删除 `Circle` 对象时只会调用 `Shape` 的析构函数，`Circle` 的成员不会被正确清理——这是**未定义行为（Undefined Behavior, UB）**。}
+
+// 所有权语义与函数参数传递规范
+
+函数参数怎么传智能指针，直接反映了函数对所有权的意图。这是一套被广泛接受的约定（来自 C++ Core Guidelines）：
+
+\table{
+参数类型 | 含义 | 使用场景
+--- 
+`unique_ptr<T>` 值传递 | "把所有权给我" | 工厂函数的调用者向 sink 函数转移资源
+`shared_ptr<T>` 值传递 | "和我共享所有权" | 函数需要延长对象生命周期
+`const T&` 或 `T&` | "我只是用一下" | 函数不关心对象的所有权
+`T*` 裸指针参数 | "我用一下，可能是 null" | 可选参数或返回指向内部的指针
+`unique_ptr<T>` 返回值 | "我创建了一个新对象给你" | 工厂函数
+}
+
+\code[cpp]{
+// ✅ 转移所有权：值传递 unique_ptr（调用者必须 std::move）
+void addEntity(std::unique_ptr<Entity> entity);
+
+// ✅ 共享所有权：值传递 shared_ptr
+void registerObserver(std::shared_ptr<Observer> obs);
+
+// ✅ 只是使用：引用或裸指针
+void update(const Entity& entity);
+void tryUpdate(Entity* entity);  // 可能为 null
+
+// ✅ 工厂函数：返回 unique_ptr
+std::unique_ptr<Entity> createEntity(const Config& cfg);
+
+// ❌ 不要这样做：
+// void f(const std::unique_ptr<Entity>& e);  // 多此一举，用 const Entity& 代替
+}
+
+// enable_shared_from_this
+
+有时候一个对象需要在自己的方法里获取指向自己的 `shared_ptr`——比如把自己注册到回调系统、或者放进异步任务保证自己存活。直接 `shared_ptr<T>(this)` 是灾难（会创建独立的控制块，导致双重释放）。正确做法是继承 `std::enable_shared_from_this<T>`：
+
+\code[cpp]{
+#include <memory>
+
+class GameSystem : public std::enable_shared_from_this<GameSystem> {
+public:
+    std::shared_ptr<GameSystem> getPtr() {
+        return shared_from_this(); // 安全地获取指向自己的shared_ptr
+    }
+
+    void startAsyncTask() {
+        auto self = shared_from_this();
+        threadPool.submit([self]() {
+            // 即使外部的 shared_ptr 已经释放，
+            // lambda 捕获的 self 保证对象存活到任务完成
+            self->processData();
+        });
+    }
+};
+
+// 使用时必须通过 shared_ptr 管理！
+auto sys = std::make_shared<GameSystem>();
+sys->startAsyncTask();  // OK
+
+// GameSystem obj;
+// obj.registerSelf();  // ❌ UB！对象不是 shared_ptr 管理的
+}
+
+\danger{**不要在构造函数中调用 `shared_from_this()`！** 构造函数执行时，`shared_ptr` 的控制块还没有初始化完成，调用 `shared_from_this()` 会抛出 `std::bad_weak_ptr` 异常。}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11 引入了 `unique_ptr`、`shared_ptr`、`weak_ptr` 和 `make_shared`。但 `make_unique` 被遗漏了——C++11 中创建 `unique_ptr` 仍然需要写 `unique_ptr<T>(new T(...))`。C++14 补上了 `std::make_unique`。`auto_ptr` 在 C++11 被标记为废弃。
+
+new: **C++17** 正式删除了 `auto_ptr`；`shared_ptr` 新增数组类型支持 `shared_ptr<T[]>`。**C++20** 引入 `std::atomic<shared_ptr<T>>` 和 `std::atomic<weak_ptr<T>>`，解决了多线程下安全修改同一个 `shared_ptr` 变量的问题（注意：是 shared_ptr 变量本身的线程安全，不是所指对象的）。`make_unique_for_overwrite` / `make_shared_for_overwrite` 允许默认初始化（不清零）以提升性能。**C++23** 进一步细化了 `out_ptr` / `inout_ptr` 适配器，方便智能指针与 C 风格 API 交互。
+}
+
+\collapse[C++20 atomic<shared_ptr> 示例]{
+\code[cpp]{
+#include <atomic>
+#include <memory>
+
+// C++20 之前：多线程修改同一个 shared_ptr 变量需要外部加锁
+// C++20 之后：用 std::atomic<std::shared_ptr<T>>
+std::atomic<std::shared_ptr<Config>> globalConfig;
+
+// 线程1：更新配置
+auto newCfg = std::make_shared<Config>(loadFromFile());
+globalConfig.store(newCfg);
+
+// 线程2：读取配置
+auto cfg = globalConfig.load();
+cfg->apply();
+}
+}
+
+/// 工程实践
+
+\list{
+- **默认选 `unique_ptr`。** 只有在多个持有者确实需要共享同一资源的生命周期时，才切换到 `shared_ptr`。过度使用 `shared_ptr` 会让所有权图变成"谁都管、谁都不管"。
+- **函数参数不要传智能指针本身（除非涉及所有权转移）。** 只是用一下对象？传 `const T&`。需要可能为空？传 `T*`。
+- **善用 `make_unique` / `make_shared`。** 它们更安全、更高效、代码更短。
+- **在多态层次中始终声明虚析构函数。** 否则通过基类智能指针删除派生对象会 UB。
+- **`shared_ptr` 的引用计数是原子的，但指向的对象不是线程安全的。** 多线程读写同一个对象仍然需要加锁。
+- **循环引用是 `shared_ptr` 最常见的 bug。** 设计数据结构时先画所有权图，确认无环；必要时用 `weak_ptr` 打断。
+- **避免裸 `new` / `delete`。** 现代 C++ 代码中几乎唯一需要裸 `new` 的场景是自定义内存分配器内部。
+}
+
+/// 难点易错点分析
+
+\danger{**用同一个裸指针创建多个 `shared_ptr`——双重释放：**
+\code[cpp]{
+int* raw = new int(42);
+std::shared_ptr<int> sp1(raw);
+std::shared_ptr<int> sp2(raw);  // 灾难！各自有独立的控制块
+// sp1 和 sp2 析构时各 delete 一次 → double free → 崩溃
+}
+永远不要从裸指针构造第二个 `shared_ptr`。要共享就拷贝已有的 `shared_ptr`。
+}
+
+\danger{**`make_shared` 的内存延迟释放陷阱：** `make_shared` 把对象和控制块分配在同一块内存中。当所有 `shared_ptr` 都销毁了，对象的析构函数会被调用，但只要还有 `weak_ptr` 存在，控制块（连同那块内存）就不能释放。对于体积很大的对象 + 长生命周期的 `weak_ptr`，这会导致内存长时间得不到回收。此时应改用 `shared_ptr<T>(new T(...))` 分开分配。}
+
+\danger{**`shared_ptr` 不是万能的线程安全锁。** 引用计数本身的增减是原子的，但以下两种操作**不是**线程安全的：(1) 多线程同时读写同一个 `shared_ptr` 变量（不是所指对象）；(2) 多线程同时修改所指对象的数据。前者在 C++20 中可用 `std::atomic<shared_ptr<T>>` 解决，后者需要你自己加锁。}
+
+\quiz[choice]{
+Q: 以下代码中 `sp.use_count()` 的值是多少？
+\code[cpp]{
+auto sp = std::make_shared<int>(10);
+auto wp = std::weak_ptr<int>(sp);
+auto sp2 = wp.lock();
+}
+A: 1
+B: 2
+C: 3
+D: 编译错误
+ANS: B
+EXP: `weak_ptr` 不增加引用计数。但 `wp.lock()` 返回一个新的 `shared_ptr`（即 `sp2`），此时 `sp` 和 `sp2` 共享所有权，引用计数为 2。
+}
+
+\quiz[tf]{
+Q: `std::unique_ptr` 的大小始终和裸指针相同。
+ANS: F
+EXP: 使用默认删除器时大小与裸指针相同（零开销）。但如果使用有状态的自定义删除器（比如捕获了变量的 lambda 或自定义函数对象），`unique_ptr` 的大小会增加以存储删除器状态。无捕获 lambda 和函数指针删除器的情况因实现而异。
+}
+
+\quiz[choice]{
+Q: 在游戏场景图中，父节点持有子节点的 `shared_ptr`，子节点需要引用父节点。子节点应该用什么类型持有父节点？
+A: `shared_ptr<Parent>`
+B: `unique_ptr<Parent>`
+C: `weak_ptr<Parent>`
+D: `Parent*` 裸指针
+ANS: C
+EXP: 如果子节点也用 `shared_ptr` 持有父节点，会形成循环引用导致内存泄漏。`weak_ptr` 不增加引用计数，可以安全引用父节点且不阻止其销毁。裸指针虽然也不影响引用计数，但没有过期检测能力——父节点被销毁后你无法知道指针已悬空。
+}
+
+/// 实战作业
+
+// 🟢 基础题1：智能指针基本操作
+
+用 `unique_ptr` 和 `shared_ptr` 管理游戏角色对象，理解所有权转移与共享。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+struct Character {
+    std::string name;
+    int hp;
+    Character(std::string n, int h) : name(std::move(n)), hp(h) {
+        std::cout << "[创建] " << name << "\n";
+    }
+    ~Character() { std::cout << "[销毁] " << name << "\n"; }
+};
+
+int main() {
+    // TODO 1: 用 make_unique 创建一个名为 "Warrior"、hp 为 100 的角色
+    // auto warrior = ???
+
+    // TODO 2: 将 warrior 的所有权转移到 party 向量中
+    std::vector<std::unique_ptr<Character>> party;
+    // party.push_back(???);
+
+    // TODO 3: 用 make_shared 创建一个名为 "SharedBuff"、hp 为 0 的共享 buff
+    // auto buff = ???
+
+    // TODO 4: 创建 buff 的一份拷贝（共享所有权），打印引用计数
+    // auto buffCopy = ???
+    // std::cout << "buff 引用计数: " << ??? << "\n";
+
+    std::cout << "--- 程序结束 ---\n";
+    return 0;
+}
+}
+
+// 🟢 基础题2：weak_ptr 缓存
+
+实现一个简单的纹理缓存：用 `weak_ptr` 持有已加载的纹理，如果纹理仍被外部持有则复用，否则重新加载。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+struct Texture {
+    std::string path;
+    Texture(std::string p) : path(std::move(p)) {
+        std::cout << "[加载] " << path << "\n";
+    }
+    ~Texture() { std::cout << "[卸载] " << path << "\n"; }
+};
+
+class TextureCache {
+    std::unordered_map<std::string, std::weak_ptr<Texture>> cache;
+public:
+    std::shared_ptr<Texture> load(const std::string& path) {
+        // TODO: 检查缓存中是否有未过期的纹理
+        // 如果有，用 lock() 获取 shared_ptr 并返回
+        // 如果没有或已过期，创建新纹理、存入缓存并返回
+
+        return nullptr;  // 替换此行
+    }
+};
+
+int main() {
+    TextureCache cache;
+
+    auto t1 = cache.load("hero.png");      // 应该打印 [加载]
+    auto t2 = cache.load("hero.png");      // 应该复用，不打印 [加载]
+    std::cout << "t1 == t2? " << (t1 == t2 ? "是" : "否") << "\n";
+
+    t1.reset();
+    t2.reset();
+    // hero.png 应该被卸载
+
+    auto t3 = cache.load("hero.png");      // 应该重新加载
+    std::cout << "--- 结束 ---\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题1：所有权转移与多态
+
+设计一个小型实体组件系统（ECS）：`Entity` 用 `unique_ptr<Component>` 持有组件，`Scene` 用 `unique_ptr<Entity>` 持有实体。实现实体的创建、组件的添加和转移。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+struct Component {
+    virtual void update() = 0;
+    virtual ~Component() = default;
+};
+
+struct Transform : Component {
+    float x = 0, y = 0;
+    void update() override { std::cout << "  Transform (" << x << "," << y << ")\n"; }
+};
+
+struct Sprite : Component {
+    std::string texture;
+    Sprite(std::string t) : texture(std::move(t)) {}
+    void update() override { std::cout << "  Sprite [" << texture << "]\n"; }
+};
+
+class Entity {
+    std::string name;
+    std::vector<std::unique_ptr<Component>> components;
+public:
+    Entity(std::string n) : name(std::move(n)) {}
+    // TODO 1: 实现 addComponent，接受 unique_ptr<Component> 并存入 components
+    // TODO 2: 实现 update，打印实体名称并遍历所有组件调用 update()
+    const std::string& getName() const { return name; }
+};
+
+class Scene {
+    std::vector<std::unique_ptr<Entity>> entities;
+public:
+    // TODO 3: 实现 addEntity，接受 unique_ptr<Entity>（所有权转移）
+    // TODO 4: 实现 updateAll，遍历所有实体并调用 update
+};
+
+int main() {
+    Scene scene;
+    // TODO 5: 创建一个 "Player" Entity
+    // 添加 Transform（设 x=1, y=2）和 Sprite（"hero.png"）组件
+    // 将 Entity 移动到 Scene 中
+    // 调用 scene.updateAll()
+
+    return 0;
+}
+}
+
+// 🟡 进阶题2：自定义删除器
+
+为一个简化的 OpenGL 资源封装写自定义删除器。模拟 GPU 纹理的创建和销毁过程。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <functional>
+
+// 模拟 OpenGL C API
+using GLuint = unsigned int;
+static GLuint nextId = 1;
+GLuint glCreateTexture() {
+    GLuint id = nextId++;
+    std::cout << "[GPU] 创建纹理 ID=" << id << "\n";
+    return id;
+}
+void glDeleteTexture(GLuint id) {
+    std::cout << "[GPU] 释放纹理 ID=" << id << "\n";
+}
+
+// TODO 1: 用 unique_ptr + 自定义删除器封装 GLuint 纹理
+// 提示：可以用 unique_ptr<GLuint, ...> 管理堆上的 GLuint，
+// 删除器中调用 glDeleteTexture(*ptr) 再 delete ptr
+
+// TODO 2: 写一个 createTexture() 函数返回封装好的智能指针
+
+// TODO 3: 用 shared_ptr + 自定义删除器实现同样的功能（对比差异）
+
+int main() {
+    // TODO 4: 创建两个纹理，验证离开作用域时自动调用 glDeleteTexture
+    std::cout << "--- 作用域结束 ---\n";
+    return 0;
+}
+}
+
+// 🔴 挑战题：游戏资源管理器
+
+设计并实现一个游戏引擎中常见的 `ResourceManager`，综合运用所有智能指针知识：
+
+\list{
+- `ResourceManager` 维护一个缓存：`unordered_map<string, weak_ptr<Resource>>`
+- `loadResource<T>(path)` 返回 `shared_ptr<T>`：缓存命中且未过期则复用，否则创建新资源
+- `Texture` / `Mesh` / `Sound` 继承 `Resource` 基类，用 `unique_ptr` 管理各自的底层数据
+- 资源销毁时通过自定义删除器打印日志
+- 实现 `enable_shared_from_this`：资源可以安全地将自己注册到事件系统
+- 所有外部引用消失后，`weak_ptr` 自动过期，再次加载同路径触发重新创建
+- 提供简单的测试场景验证以上所有功能
+}
+
+**验收标准：**
+- 无内存泄漏（逻辑分析或用 AddressSanitizer 验证）
+- 能清晰解释每处 `unique_ptr` / `shared_ptr` / `weak_ptr` 的选择理由
+- 至少包含一个多态调用场景
+
+\collapse[参考思路]{
+核心结构：
+
+\code[cpp]{
+class Resource : public std::enable_shared_from_this<Resource> {
+public:
+    virtual ~Resource() = default;
+    virtual void reload() = 0;
+    const std::string& getPath() const { return path; }
+protected:
+    std::string path;
+};
+
+class ResourceManager {
+    std::unordered_map<std::string, std::weak_ptr<Resource>> cache;
+public:
+    template<typename T>
+    std::shared_ptr<T> load(const std::string& path) {
+        if (auto it = cache.find(path); it != cache.end()) {
+            if (auto sp = it->second.lock()) {
+                return std::dynamic_pointer_cast<T>(sp);
+            }
+        }
+        // 用自定义删除器记录日志
+        auto res = std::shared_ptr<T>(new T(path), [](T* p) {
+            std::cout << "[ResourceManager] 释放: " << p->getPath() << "\n";
+            delete p;
+        });
+        cache[path] = res;
+        return res;
+    }
+};
+}
+
+关键设计点：
+- 缓存用 `weak_ptr` 而不是 `shared_ptr`：`ResourceManager` 不延长资源寿命
+- `load` 返回 `shared_ptr`：调用者拥有共享所有权，多个系统可以持有同一资源
+- 派生类的底层数据用 `unique_ptr`：如 `Texture` 内部的像素数据独占所有
+- `enable_shared_from_this` 让资源可以在回调中安全引用自己
+}

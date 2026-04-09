@@ -1,0 +1,390 @@
+/// 简介
+
+游戏世界如果没有物理，角色会悬浮、子弹会穿墙、箱子不会倒塌——一切都只是贴图的拼贴画。**游戏物理引擎（Physics Engine）** 的职责是用近似但高效的数值方法，让虚拟世界中的物体表现出"符合直觉"的运动和碰撞行为。
+
+本章从刚体动力学的核心公式出发，依次讲解数值积分方案的选型、碰撞检测管线的分层设计、冲量法碰撞响应、约束与关节系统，最后给出一个可用的 2D 物理引擎骨架。掌握这些原理后，即便直接使用 Box2D 或 PhysX，你也能准确地调参、定位问题并做出正确的架构决策。
+
+/// 知识点列表
+
+\list{
+- 刚体动力学基础（力、加速度、速度、位移）
+- 数值积分：显式欧拉、半隐式欧拉、Verlet
+- 碰撞检测管线（Broad Phase → Narrow Phase）
+- 碰撞响应：冲量法（弹性/非弹性）
+- 摩擦力建模
+- 约束与关节（Constraints & Joints）
+- 物理引擎主循环架构
+- 商业引擎概览（Box2D, Bullet, PhysX, Jolt）
+}
+
+/// 知识点详解
+
+// 刚体动力学基础
+
+一个 **刚体（Rigid Body）** 是不可形变的物体。它的运动由 **牛顿第二定律（Newton's Second Law）** 驱动：$F = ma$。线性运动由力和质量决定，旋转运动由 **力矩（Torque）** 和 **转动惯量（Moment of Inertia）** 决定。
+
+\code[cpp]{
+struct RigidBody {
+    Vec2 position;        // 质心位置
+    Vec2 velocity;        // 线速度
+    Vec2 force;           // 当前帧累积的合力
+    float rotation;       // 角度（弧度）
+    float angularVel;     // 角速度
+    float torque;         // 力矩
+    float mass;
+    float invMass;        // 1/mass（0 = 静态物体，不受力影响）
+    float inertia;        // 转动惯量
+    float invInertia;     // 1/inertia
+    float restitution;    // 恢复系数 e（0=完全非弹性，1=完全弹性）
+    float friction;       // 摩擦系数
+};
+}
+
+\tip{将质量存为 `invMass` 是物理引擎的惯例。碰撞响应公式大量使用 $1/m$，这样静态物体令 `invMass = 0` 即可天然排除——无需 if 分支。}
+
+// 数值积分
+
+物理引擎的核心循环：每帧根据合力计算加速度 → 更新速度 → 更新位置。这一步叫 **数值积分（Numerical Integration）**。
+
+\tabs{
+\tab[显式欧拉]{
+\code[cpp]{
+// 先更新位置，再更新速度——最直觉，但最不稳定
+void explicitEuler(RigidBody& b, float dt) {
+    b.position += b.velocity * dt;
+    b.velocity += (b.force * b.invMass) * dt;
+}
+// 弹簧系统中能量会持续增加 → "爆炸"
+}
+}
+\tab[半隐式欧拉]{
+\code[cpp]{
+// 先更新速度，用新速度更新位置——游戏物理最常用
+void semiImplicitEuler(RigidBody& b, float dt) {
+    b.velocity += (b.force * b.invMass) * dt;
+    b.angularVel += b.torque * b.invInertia * dt;
+    b.position += b.velocity * dt;
+    b.rotation += b.angularVel * dt;
+    b.force = {0, 0};
+    b.torque = 0;
+}
+// 能量几乎守恒，O(n) 复杂度，一次力求值
+}
+}
+\tab[Verlet]{
+\code[cpp]{
+// 位置基积分，不显式存储速度——布料/绳索场景首选
+void verletIntegrate(Vec2& pos, Vec2& prevPos, Vec2 accel, float dt) {
+    Vec2 temp = pos;
+    pos = pos * 2.0f - prevPos + accel * (dt * dt);
+    prevPos = temp;
+}
+// 速度隐含在 pos - prevPos 中，约束求解天然兼容
+}
+}
+}
+
+\table{
+方法 | 力求值次数 | 稳定性 | 典型用途
+---
+显式欧拉 | 1 | 差（能量发散） | 几乎不用
+半隐式欧拉 | 1 | 好（辛方法） | 90% 的游戏物理
+Verlet | 1 | 好 | 布料、绳索、粒子
+RK4 | 4 | 极好 | 科学仿真、飞行器
+}
+
+\warning{**固定时间步长（Fixed Timestep）是必须的。** 可变 dt 会导致物理行为不一致：快机器弹跳更高，慢机器穿透地板。标准做法是积累 deltaTime，按 fixedDt（如 1/60s）步进物理，渲染帧之间做位置插值。}
+
+// 碰撞检测管线
+
+\diagram[flow]{
+所有刚体对 -> 宽相(Broad Phase) -> 候选碰撞对 -> 窄相(Narrow Phase) -> 碰撞信息(法线+深度+接触点) -> 碰撞响应(Resolution)
+}
+
+**宽相（Broad Phase）** 的目标是用廉价算法快速排除不可能碰撞的物体对，将 $O(n^2)$ 降到接近 $O(n \log n)$。
+
+\table{
+算法 | 原理 | 时间复杂度 | 适用
+---
+暴力枚举 | 全部两两检测 | O(n²) | n < 50
+空间网格 | 物体按网格桶分组 | O(n) 均摊 | 物体大小相近
+四叉树 / 八叉树 | 递归细分空间 | O(n log n) | 大小差异大
+SAP (扫掠剪枝) | 沿轴排序后扫描重叠 | O(n log n) | 大多数引擎
+}
+
+**窄相（Narrow Phase）** 对宽相输出的候选对做精确几何测试，返回碰撞法线、穿透深度和接触点。常用算法包括 **SAT（分离轴定理 Separating Axis Theorem）** 和 **GJK（Gilbert-Johnson-Keerthi）**。
+
+\collapse[SAT 算法核心思想]{
+将两个凸多边形分别投影到所有候选分离轴（每条边的法线）上。如果存在任意一条轴上的投影区间不重叠，则两形状不碰撞。若所有轴都有重叠，重叠最小的那条轴就是碰撞法线，重叠量就是穿透深度。2D 中两个矩形有 4 条候选轴（忽略平行轴后实际最多 4 条）。
+}
+
+// 碰撞响应——冲量法
+
+碰撞响应的目标：计算一个 **冲量（Impulse）** $j$，施加给两个物体使它们不再穿透且速度关系满足恢复系数。
+
+\code[cpp]{
+struct CollisionInfo {
+    Vec2 normal;        // 从 A 指向 B 的碰撞法线
+    float depth;        // 穿透深度
+    Vec2 contactPoint;  // 接触点
+};
+
+void resolveCollision(RigidBody& a, RigidBody& b, const CollisionInfo& info) {
+    float totalInvMass = a.invMass + b.invMass;
+    if (totalInvMass == 0.0f) return; // 两个都是静态物体
+
+    // 1. 穿透分离（位置修正）
+    Vec2 correction = info.normal * (info.depth / totalInvMass);
+    a.position -= correction * a.invMass;
+    b.position += correction * b.invMass;
+
+    // 2. 接触点相对速度
+    Vec2 ra = info.contactPoint - a.position;
+    Vec2 rb = info.contactPoint - b.position;
+    Vec2 velA = a.velocity + Vec2{-a.angularVel * ra.y, a.angularVel * ra.x};
+    Vec2 velB = b.velocity + Vec2{-b.angularVel * rb.y, b.angularVel * rb.x};
+    Vec2 relVel = velB - velA;
+
+    float velAlongNormal = dot(relVel, info.normal);
+    if (velAlongNormal > 0) return; // 正在分离
+
+    // 3. 计算法线冲量 j
+    float e = std::min(a.restitution, b.restitution);
+    float raCrossN = cross2D(ra, info.normal);
+    float rbCrossN = cross2D(rb, info.normal);
+    float denom = totalInvMass
+                + raCrossN * raCrossN * a.invInertia
+                + rbCrossN * rbCrossN * b.invInertia;
+
+    float j = -(1.0f + e) * velAlongNormal / denom;
+
+    // 4. 施加冲量
+    Vec2 impulse = info.normal * j;
+    a.velocity -= impulse * a.invMass;
+    b.velocity += impulse * b.invMass;
+    a.angularVel -= a.invInertia * cross2D(ra, impulse);
+    b.angularVel += b.invInertia * cross2D(rb, impulse);
+}
+}
+
+\note{**摩擦冲量（Friction Impulse）** 的计算类似法线冲量，但方向沿切线，大小受 **库仑摩擦定律（Coulomb Friction）** 约束：$|j_t| \le \mu \cdot j_n$。超出此范围就是动摩擦（滑动），否则是静摩擦（粘滞）。}
+
+// 约束与关节
+
+**约束（Constraint）** 是对两个刚体自由度的限制。距离约束让两点保持恒定距离（绳索），旋转约束限制关节角度范围（铰链门）。主流引擎用 **迭代冲量求解器（Sequential Impulse Solver）**：每帧多次遍历所有约束，每次施加微小修正冲量，迭代 4~8 次后收敛。
+
+\collapse[约束求解器伪代码]{
+\code[cpp]{
+// Sequential Impulse：每次迭代处理一个约束
+for (int iter = 0; iter < solverIterations; ++iter) {
+    for (auto& c : constraints) {
+        float error = c.computeError();       // 约束违反量
+        float lambda = -error / c.effectiveMass;
+        lambda = c.clampLambda(lambda);       // 限制修正幅度
+        c.applyCorrection(lambda);            // 施加冲量
+    }
+}
+// 迭代次数越多越精确但更昂贵。Box2D 默认 8 次。
+}
+}
+
+// 物理引擎主循环
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+
+struct Vec2 {
+    float x = 0, y = 0;
+    Vec2 operator+(Vec2 o) const { return {x+o.x, y+o.y}; }
+    Vec2 operator-(Vec2 o) const { return {x-o.x, y-o.y}; }
+    Vec2 operator*(float s) const { return {x*s, y*s}; }
+    float length() const { return std::sqrt(x*x + y*y); }
+};
+float dot(Vec2 a, Vec2 b) { return a.x*b.x + a.y*b.y; }
+
+struct Circle {
+    Vec2 pos, vel;
+    float radius, mass;
+};
+
+// 圆-圆碰撞检测 + 弹性碰撞响应
+void resolveCircles(Circle& a, Circle& b) {
+    Vec2 diff = b.pos - a.pos;
+    float dist = diff.length();
+    float minDist = a.radius + b.radius;
+    if (dist >= minDist || dist < 0.0001f) return;
+
+    Vec2 normal = {diff.x / dist, diff.y / dist};
+    float overlap = minDist - dist;
+
+    // 穿透分离
+    float totalMass = a.mass + b.mass;
+    a.pos = a.pos - normal * (overlap * b.mass / totalMass);
+    b.pos = b.pos + normal * (overlap * a.mass / totalMass);
+
+    // 1D 弹性碰撞
+    float vRel = dot(b.vel - a.vel, normal);
+    if (vRel > 0) return;
+    float j = -2.0f * vRel / (1.0f/a.mass + 1.0f/b.mass);
+    a.vel = a.vel - normal * (j / a.mass);
+    b.vel = b.vel + normal * (j / b.mass);
+}
+
+int main() {
+    Circle c1{{0,0}, {2,0}, 1.0f, 1.0f};
+    Circle c2{{3,0}, {-1,0}, 1.0f, 2.0f};
+    float dt = 1.0f / 60.0f;
+
+    for (int frame = 0; frame < 120; ++frame) {
+        resolveCircles(c1, c2);
+        c1.pos = c1.pos + c1.vel * dt;
+        c2.pos = c2.pos + c2.vel * dt;
+        if (frame % 30 == 0)
+            std::cout << "Frame " << frame
+                      << "  c1=(" << c1.pos.x << ", " << c1.pos.y << ")"
+                      << "  c2=(" << c2.pos.x << ", " << c2.pos.y << ")\n";
+    }
+}
+}
+
+// 商业引擎概览
+
+\table{
+引擎 | 维度 | 语言 | 许可 | 特点
+---
+Box2D | 2D | C | MIT | 最流行的 2D 物理库，Angry Birds 使用
+Chipmunk2D | 2D | C | MIT | 轻量级，易于嵌入
+Bullet | 3D | C++ | zlib | 开源，Blender 内置
+PhysX | 3D | C++ | BSD-3 | NVIDIA 维护，Unreal 默认
+Jolt | 3D | C++ | MIT | 新一代开源引擎，Horizon Forbidden West 采用
+Rapier | 2D/3D | Rust | Apache-2 | Rust 生态，WASM 友好
+}
+
+\compare{
+old: 早期游戏（90~2000 年代）多数手写简易碰撞——AABB 检测加像素碰撞。没有正式的物理引擎中间件。
+
+new: 现代引擎几乎都集成物理中间件。但理解积分、冲量、约束求解的原理，对正确调参（restitution、solver iterations、sleep threshold）和调试"穿透""抖动""爆炸"至关重要。
+}
+
+/// 工程实践
+
+\list{
+- 始终使用固定时间步长（1/60s 或 1/120s），渲染帧做位置插值
+- 静态物体（invMass=0）不参与积分和受力，大幅节省计算
+- 碰撞事件回调（OnCollisionEnter/Exit）用观察者模式分发，避免直接耦合
+- 休眠系统（Sleep）：速度低于阈值持续 N 帧 → 停止模拟，降低 CPU 占用
+- 连续碰撞检测（CCD）：高速物体可能"隧穿"薄墙，需 TOI（Time of Impact）扫掠
+- 调试渲染：用 Debug Draw 绘制碰撞体轮廓、接触点法线、速度箭头
+}
+
+/// 难点易错点分析
+
+\danger{**浮点精度陷阱：** 碰撞法线归一化时 `length()` 接近 0 会产生 NaN，然后通过加法传播到整个物理世界。永远检查除数：`if (dist < EPSILON) return;`。一个 NaN 足以毁掉整个模拟。}
+
+\danger{**穿透分离与冲量的顺序不能反。** 先分离位置再计算冲量。否则物体下一帧仍然穿透 → 产生反向冲量 → 无限震荡。}
+
+\warning{**不要在碰撞回调中修改物理世界。** 在回调中删除/添加刚体会破坏正在遍历的容器。正确做法：用延迟队列收集请求，在帧末统一执行。}
+
+\quiz[choice]{
+Q: 半隐式欧拉与显式欧拉的关键区别是什么？
+A: 半隐式欧拉的时间步长更小
+B: 半隐式欧拉先更新速度再用新速度更新位置
+C: 半隐式欧拉使用 4 次力求值
+D: 半隐式欧拉不需要计算加速度
+ANS: B
+EXP: 半隐式欧拉（Symplectic Euler）先更新速度 v += a*dt，再用更新后的速度更新位置 x += v*dt。这使它成为辛方法，能量近似守恒。显式欧拉先更新位置再更新速度，在振荡系统中能量持续增长导致"爆炸"。
+}
+
+\quiz[tf]{
+Q: 在 2D 物理引擎中，将 `invMass` 设为 0 即可让物体成为不可移动的静态物体。
+ANS: T
+EXP: `invMass = 0` 意味着质量无穷大。碰撞响应公式中所有涉及 `invMass` 的项都变为 0，冲量不会改变该物体的速度。同时将 `invInertia = 0` 可阻止其旋转。这是物理引擎的标准惯例。
+}
+
+\quiz[choice]{
+Q: 宽相碰撞检测（Broad Phase）的目的是？
+A: 精确计算碰撞法线和穿透深度
+B: 快速排除不可能碰撞的物体对，减少窄相计算量
+C: 计算碰撞冲量并施加到刚体上
+D: 进行连续碰撞检测防止穿透
+ANS: B
+EXP: 宽相用廉价的包围盒（AABB）检测快速筛出候选碰撞对，将 O(n²) 规模的精确检测降到少量候选对。精确的碰撞信息（法线、深度、接触点）由窄相（SAT、GJK 等）计算。
+}
+
+/// 实战作业
+
+// 🟢 基础：圆-圆弹性碰撞模拟
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec2 {
+    float x, y;
+    Vec2 operator+(Vec2 o) const { return {x+o.x, y+o.y}; }
+    Vec2 operator-(Vec2 o) const { return {x-o.x, y-o.y}; }
+    Vec2 operator*(float s) const { return {x*s, y*s}; }
+};
+float dot(Vec2 a, Vec2 b) { return a.x*b.x + a.y*b.y; }
+
+struct Ball { Vec2 pos, vel; float radius, mass; };
+
+// TODO: 实现圆-圆碰撞检测和弹性碰撞响应
+void collideAndResolve(Ball& a, Ball& b) {
+    /* TODO: 你的代码
+       1. 计算两圆心距离
+       2. 如果距离 < 两半径之和 → 碰撞
+       3. 穿透分离（按质量比分配）
+       4. 计算法线方向冲量并施加
+    */
+}
+
+int main() {
+    Ball a{{0,0}, {3,1}, 1.0f, 1.0f};
+    Ball b{{4,0}, {-1,0}, 1.5f, 2.0f};
+
+    float dt = 1.0f / 60.0f;
+    for (int i = 0; i < 180; ++i) {
+        collideAndResolve(a, b);
+        a.pos = a.pos + a.vel * dt;
+        b.pos = b.pos + b.vel * dt;
+    }
+    std::cout << "a=(" << a.pos.x << "," << a.pos.y
+              << ") b=(" << b.pos.x << "," << b.pos.y << ")\n";
+}
+}
+
+// 🟡 进阶：实现 SAT 碰撞检测
+
+实现 **分离轴定理（SAT）** 检测两个轴对齐矩形（AABB）的碰撞，返回碰撞法线和穿透深度。进一步扩展到旋转矩形（OBB）。
+
+\collapse[参考思路]{
+1. AABB：4 条候选轴（±x, ±y），投影每条轴上检查重叠
+2. OBB：每个矩形贡献 2 条唯一法线（边法线），共 4 条候选轴
+3. 最小穿透轴即为碰撞法线，穿透量为重叠值
+4. 测试：两个 2×2 矩形，中心分别在 (0,0) 和 (1.5,0)——应检测到碰撞，法线为 x 轴，深度 0.5
+}
+
+// 🔴 挑战：完整 2D 物理引擎
+
+实现包含以下功能的 2D 物理引擎：圆形+矩形碰撞体、宽相（空间网格）+窄相（SAT）、冲量法碰撞响应（含摩擦）、半隐式欧拉积分、距离约束（绳索/弹簧）、休眠系统。演示场景：20+ 个物体在重力下碰撞并稳定堆叠。
+
+\collapse[架构参考]{
+\code[text]{
+PhysicsWorld
+├── bodies: vector<RigidBody>
+├── constraints: vector<Constraint*>
+├── broadPhase() -> vector<pair<int,int>>
+├── narrowPhase(pair) -> optional<CollisionInfo>
+├── solveConstraints(iterations=8)
+└── step(fixedDt)
+    1. applyGravity()
+    2. broadPhase() → narrowPhase() → resolve()
+    3. solveConstraints()
+    4. integrate()
+    5. updateSleep()
+}
+}

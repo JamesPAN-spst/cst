@@ -1,0 +1,392 @@
+/// 简介
+
+C++ 执行速度快但迭代速度慢——每次修改都要编译等待。**脚本系统（Scripting System）** 的核心价值是在不重编译引擎的前提下修改游戏逻辑，让策划和设计师也能参与开发。Lua 是游戏行业最流行的嵌入式脚本语言，轻量、快速、嵌入 API 成熟。
+
+本章讲解脚本系统的设计动机、Lua 集成（通过 sol2/sol3 绑定库）、C++ ↔ Lua 双向通信、Python 绑定概念、脚本安全沙箱、热重载实现，以及可视化脚本的设计思路。
+
+/// 知识点列表
+
+\list{
+- 为什么游戏引擎需要脚本语言
+- Lua 语言特性速览
+- C++ ↔ Lua 绑定（Lua C API 与 sol2/sol3）
+- Python 绑定概念（pybind11）
+- 脚本安全与沙箱（Sandbox）
+- 脚本热重载（Hot Reload）
+- 可视化脚本概念（Blueprint 类比）
+}
+
+/// 知识点详解
+
+// 为什么需要脚本语言
+
+\table{
+对比维度 | C++ | Lua 脚本
+---
+执行速度 | 最快 | 约 10~50× 慢（通常够用）
+编译时间 | 秒~分钟 | 无需编译
+热重载 | 困难（需 DLL 热加载） | 简单（重新执行脚本文件）
+类型安全 | 编译期检查 | 运行时检查
+谁能写 | 程序员 | 程序员、策划、设计师
+适合写 | 引擎核心、性能热点 | 游戏逻辑、AI、UI、关卡配置
+}
+
+\note{**脚本的核心价值不是性能而是迭代速度。** 修改一个敌人的 AI 行为：C++ 需要编译（大型项目几分钟）→ 重启游戏 → 到达测试点。Lua 热重载：保存文件 → 立即生效，连游戏都不用重启。}
+
+**设计原则：** 性能关键路径（渲染、物理、内存管理）用 C++，游戏逻辑层（AI 决策、任务系统、UI 交互、关卡脚本）用脚本。
+
+// Lua 语言特性速览
+
+\collapse[Lua 核心语法快览]{
+\code[text]{
+-- 变量（动态类型）
+local health = 100
+local name = "Player"
+local alive = true
+
+-- 表（Table）—— Lua 唯一的数据结构，兼作数组/字典/对象
+local player = {
+    hp = 100,
+    position = {x = 0, y = 0},
+    takeDamage = function(self, dmg)
+        self.hp = self.hp - dmg
+    end
+}
+player:takeDamage(30)  -- 语法糖，等价于 player.takeDamage(player, 30)
+
+-- 函数是一等公民
+local function greet(name)
+    return "Hello, " .. name
+end
+
+-- 没有类，但可以用元表（Metatable）模拟继承
+local Enemy = {}
+Enemy.__index = Enemy
+function Enemy.new(hp)
+    return setmetatable({hp = hp}, Enemy)
+end
+function Enemy:update(dt)
+    -- AI 逻辑
+end
+}
+}
+
+// Lua C API 基础
+
+Lua C API 是基于 **栈（Stack）** 的交互接口。所有数据通过 Lua 栈在 C++ 和 Lua 之间传递。
+
+\code[cpp]{
+#include <lua.hpp>
+
+// 创建 Lua 虚拟机
+lua_State* L = luaL_newstate();
+luaL_openlibs(L);
+
+// 执行脚本文件
+luaL_dofile(L, "scripts/game.lua");
+
+// 调用 Lua 函数
+lua_getglobal(L, "onPlayerDamage");  // 函数推入栈
+lua_pushinteger(L, playerId);        // 参数 1
+lua_pushinteger(L, damage);          // 参数 2
+lua_pcall(L, 2, 1, 0);              // 2 参数，1 返回值
+int result = lua_tointeger(L, -1);   // 读取返回值
+lua_pop(L, 1);                      // 弹出返回值
+
+// 注册 C++ 函数给 Lua
+int lua_spawnEnemy(lua_State* L) {
+    float x = luaL_checknumber(L, 1);
+    float y = luaL_checknumber(L, 2);
+    const char* type = luaL_checkstring(L, 3);
+    int id = gameWorld.spawnEnemy(x, y, type);
+    lua_pushinteger(L, id);
+    return 1;  // 返回值个数
+}
+lua_register(L, "spawnEnemy", lua_spawnEnemy);
+
+lua_close(L);
+}
+
+\danger{**Lua 栈操作极易出错。** push 多了或少了一个值就会导致栈不平衡 → 后续所有操作读取到错误的值 → 难以调试的崩溃。这就是为什么推荐使用 sol3 而非裸 Lua C API。}
+
+// Sol3（推荐的 C++ 绑定库）
+
+**sol2/sol3** 是 header-only 的 C++ 绑定库，自动处理栈操作、类型转换和错误检查。
+
+\code[cpp]{
+#include <sol/sol.hpp>
+
+sol::state lua;
+lua.open_libraries(sol::lib::base, sol::lib::math, sol::lib::string);
+
+// 绑定 C++ 函数（自动类型转换）
+lua.set_function("spawnEnemy", [](float x, float y, std::string type) {
+    return gameWorld.spawnEnemy(x, y, type);
+});
+
+// 绑定 C++ 类
+lua.new_usertype<Player>("Player",
+    sol::constructors<Player(), Player(int)>(),
+    "hp",         &Player::hp,
+    "position",   &Player::position,
+    "takeDamage", &Player::takeDamage,
+    "heal",       &Player::heal,
+    "isAlive",    sol::property(&Player::isAlive)
+);
+
+// 执行 Lua 脚本
+lua.script(R"(
+    local p = Player.new(100)
+    p:takeDamage(30)
+    print("HP: " .. p.hp)
+    spawnEnemy(10, 20, "goblin")
+)");
+
+// 从 C++ 调用 Lua 函数
+sol::function onUpdate = lua["onUpdate"];
+if (onUpdate.valid()) {
+    onUpdate(deltaTime);
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <functional>
+#include <unordered_map>
+
+// 模拟简易脚本绑定系统（不依赖真实 Lua）
+class SimpleScriptEngine {
+    std::unordered_map<std::string, std::function<int(int,int)>> functions;
+    std::unordered_map<std::string, int> globals;
+
+public:
+    void registerFunc(const std::string& name,
+                      std::function<int(int,int)> fn) {
+        functions[name] = std::move(fn);
+    }
+    void setGlobal(const std::string& name, int val) { globals[name] = val; }
+    int getGlobal(const std::string& name) const {
+        auto it = globals.find(name);
+        return it != globals.end() ? it->second : 0;
+    }
+
+    int call(const std::string& name, int a, int b) {
+        auto it = functions.find(name);
+        if (it != functions.end()) return it->second(a, b);
+        std::cerr << "Function not found: " << name << "\n";
+        return 0;
+    }
+};
+
+int main() {
+    SimpleScriptEngine engine;
+
+    // C++ 侧注册函数
+    engine.registerFunc("add", [](int a, int b) { return a + b; });
+    engine.registerFunc("damage", [](int hp, int dmg) {
+        return std::max(0, hp - dmg);
+    });
+
+    // 模拟脚本调用
+    int result = engine.call("add", 10, 20);
+    std::cout << "add(10, 20) = " << result << "\n";
+
+    engine.setGlobal("playerHp", 100);
+    int newHp = engine.call("damage", engine.getGlobal("playerHp"), 35);
+    std::cout << "After damage: HP = " << newHp << "\n";
+}
+}
+
+// Python 绑定概念
+
+\collapse[pybind11 简介]{
+**pybind11** 是 C++ 绑定 Python 的 header-only 库，语法类似 sol3。适用于工具链（资产处理管线、测试自动化）而非游戏运行时（Python 的 GIL 和启动开销不适合嵌入游戏循环）。
+
+\code[cpp]{
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
+
+PYBIND11_MODULE(engine, m) {
+    py::class_<Vec3>(m, "Vec3")
+        .def(py::init<float, float, float>())
+        .def_readwrite("x", &Vec3::x)
+        .def("length", &Vec3::length);
+}
+// Python: import engine; v = engine.Vec3(1,2,3); print(v.length())
+}
+}
+
+// 脚本安全——沙箱
+
+\code[cpp]{
+// 限制 Lua 脚本的能力，防止恶意/错误脚本破坏系统
+void setupSandbox(sol::state& lua) {
+    // 移除危险函数
+    lua["os"] = sol::nil;         // 禁止操作系统调用
+    lua["io"] = sol::nil;         // 禁止文件 I/O
+    lua["loadfile"] = sol::nil;   // 禁止加载任意文件
+    lua["dofile"] = sol::nil;
+
+    // 限制执行时间（防死循环）
+    lua_sethook(lua.lua_state(), [](lua_State* L, lua_Debug*) {
+        luaL_error(L, "Script execution limit exceeded!");
+    }, LUA_MASKCOUNT, 1000000);   // 100 万条指令上限
+
+    // 限制内存使用
+    // lua_setallocf(L, customAllocator, userdata);
+    // 自定义分配器追踪总内存，超限时拒绝分配
+}
+}
+
+\warning{**脚本错误不应该崩溃引擎。** 永远用 `pcall`（保护调用）或 sol3 的 `safe_function` 捕获错误。开发时显示错误 overlay（红色文字覆盖在游戏画面上），打印完整堆栈信息但继续运行。}
+
+// 脚本热重载
+
+\code[cpp]{
+class ScriptSystem {
+    sol::state lua;
+    std::unordered_map<std::string, std::filesystem::file_time_type> watchList;
+
+public:
+    void loadScript(const std::string& path) {
+        auto result = lua.safe_script_file(path);
+        if (!result.valid()) {
+            sol::error err = result;
+            log::error("[Script] Load failed: {}", err.what());
+            return;
+        }
+        watchList[path] = std::filesystem::last_write_time(path);
+    }
+
+    void checkHotReload() {
+        for (auto& [path, lastTime] : watchList) {
+            auto curTime = std::filesystem::last_write_time(path);
+            if (curTime > lastTime) {
+                auto result = lua.safe_script_file(path);
+                if (result.valid()) {
+                    lastTime = curTime;
+                    log::info("[Script] Hot-reloaded: {}", path);
+                } else {
+                    sol::error err = result;
+                    log::error("[Script] Reload error: {}", err.what());
+                    // 保持旧版本运行
+                }
+            }
+        }
+    }
+};
+}
+
+\tip{**热重载的粒度设计：** 最简单的做法是重新执行整个脚本文件——旧的全局函数被新定义覆盖。但状态（如敌人当前血量）会丢失。更精细的方案：分离"定义"（函数、类方法）和"状态"（实例数据），热重载只替换定义。}
+
+// 可视化脚本概念
+
+\collapse[Blueprint 类比]{
+**可视化脚本（Visual Scripting）** 将逻辑表达为节点图——每个节点是一个操作（函数调用、条件判断、变量读写），连线表示数据流和执行流。
+
+优势：非程序员可直接使用；逻辑一目了然；不会出现语法错误。
+劣势：复杂逻辑时节点图变"意大利面"；版本控制（diff）困难；性能不如文本脚本。
+
+实现思路：
+1. 节点图的数据结构：有向图（DAG），节点有输入/输出端口
+2. 编译/解释：遍历图的拓扑序列，执行每个节点
+3. 或者：将节点图编译为 Lua/C++ 代码再执行
+4. 编辑器：用 ImGui + ImNodes 库实现节点编辑器
+
+Unreal Blueprint 就是这种系统的工业级实现。
+}
+
+/// 工程实践
+
+\list{
+- C++ 导出给脚本的 API 要做"最小权限"设计——只暴露必要的功能
+- 脚本 API 设计要稳定——频繁变更会破坏策划已写好的脚本
+- 用 `sol::protected_function` 而非 `sol::function`，始终处理错误
+- 脚本文件组织：按功能分目录（scripts/ai/、scripts/ui/、scripts/level/）
+- 热重载的文件监视频率：每 0.5~1s 检查一次即可，无需每帧
+- 调试支持：在 Lua 中用 `debug.traceback()` 获取完整栈信息
+}
+
+/// 难点易错点分析
+
+\danger{**C++ 对象生命周期 vs Lua GC。** 如果 C++ 侧销毁了一个对象，但 Lua 仍持有对它的引用 → 访问悬挂指针 → 崩溃。解决方案：1) 用 `shared_ptr` 让 Lua 共享所有权；2) 用句柄（ID）间接访问，Lua 拿到的只是数字。}
+
+\warning{**Lua 全局命名空间污染。** 所有脚本共享同一个 `lua_State` 时，一个脚本的全局变量可能覆盖另一个。用 `local` 限制作用域，或为每个脚本设置独立的环境表（`_ENV`）。}
+
+\quiz[choice]{
+Q: 为什么游戏引擎用 Lua 而不是 Python 作为运行时嵌入脚本？
+A: Lua 语法比 Python 更强大
+B: Lua 更小巧、嵌入友好、无 GIL 且启动开销极低
+C: Python 不支持面向对象编程
+D: Lua 执行速度比 C++ 更快
+ANS: B
+EXP: Lua 的解释器只有几百 KB，专为嵌入设计。Python 有 GIL（全局解释器锁）限制多线程，启动开销大（需要完整标准库），嵌入复杂度高。Lua 的 C API 极简，从创建虚拟机到执行第一行代码只需几行 C++ 代码。
+}
+
+\quiz[tf]{
+Q: 脚本热重载时，应该重新创建 `lua_State` 来确保状态干净。
+ANS: F
+EXP: 重新创建 lua_State 会销毁所有游戏状态（NPC 血量、任务进度等）。正确做法是在同一个 lua_State 上重新执行脚本文件——新的函数定义自动覆盖旧的，而数据（table 中的值）保持不变。
+}
+
+\quiz[choice]{
+Q: sol3 相比裸 Lua C API 的核心优势是？
+A: 执行速度更快
+B: 自动处理栈操作、类型转换和错误检查
+C: 支持更多编程语言
+D: 不需要 Lua 运行时
+ANS: B
+EXP: Lua C API 要求手动管理栈——push/pop 参数和返回值，错一个就栈不平衡导致崩溃。sol3 将这些封装为类型安全的 C++ 接口：`lua.set_function()` 自动处理参数绑定，`sol::protected_function` 自动捕获错误。性能几乎无额外开销（header-only，编译期展开）。
+}
+
+/// 实战作业
+
+// 🟢 基础：简易脚本引擎
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <functional>
+#include <unordered_map>
+#include <variant>
+
+// TODO: 实现一个简单的脚本引擎（无需真实 Lua）
+// 支持：注册函数、设置/读取全局变量、调用已注册的函数
+using Value = std::variant<int, float, std::string>;
+
+class MiniScript {
+    /* TODO: 你的代码
+       - 存储全局变量 (name → Value)
+       - 存储注册的函数 (name → callable)
+       - setGlobal(name, value)
+       - getGlobal(name) → Value
+       - registerFunc(name, callable)
+       - call(name, args...) → Value
+    */
+};
+
+int main() {
+    MiniScript script;
+    // script.registerFunc("add", ...);
+    // script.setGlobal("hp", 100);
+    // auto result = script.call("add", 10, 20);
+    std::cout << "Mini script engine ready\n";
+}
+}
+
+// 🟡 进阶：Lua 集成（使用 sol3）
+
+使用 sol3 将一个简单的游戏对象系统暴露给 Lua：绑定 Player 类（hp、position、takeDamage、heal），用 Lua 脚本编写敌人 AI 逻辑，在 C++ 游戏循环中每帧调用 Lua 的 `onUpdate(dt)` 函数。
+
+// 🔴 挑战：带热重载的完整脚本系统
+
+\collapse[参考思路]{
+1. 嵌入 Lua 到 C++ 项目，用 sol3 做绑定
+2. 绑定游戏对象（Player, Enemy, Item）的属性和方法
+3. 用 Lua 编写 3 种敌人 AI（追踪、巡逻、逃跑）
+4. 实现脚本热重载：修改 Lua 文件后不重启游戏即可看到改动
+5. 实现沙箱：禁止 os/io 库、限制执行指令数
+6. 用 Lua table 定义关卡配置（数据驱动设计）
+7. 错误处理：脚本出错时显示错误信息但不崩溃
+}

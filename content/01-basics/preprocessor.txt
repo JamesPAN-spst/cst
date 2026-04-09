@@ -1,0 +1,665 @@
+/// 简介
+
+上节课我们学了怎么把代码组织成函数，这节课往回退一步——在编译器真正读懂你的代码之前，有个"秘书"先帮你做一轮文本处理。这个秘书就是**预处理器（Preprocessor）**。
+
+你可以把它想象成一个**超级文本替换器**：你在代码里写的 `#include`、`#define`、`#ifdef` 这些以 `#` 开头的指令，全部由预处理器执行。它做完之后，才把处理好的文本交给编译器。编译器压根看不到任何 `#` 开头的东西！
+
+为什么要学这个？因为：
+- 你每天写的 `#include <iostream>` 就是预处理器指令，不懂它就不懂C++编译流程
+- 不懂头文件守卫（Include Guard），你会被"重定义错误"折腾到怀疑人生
+- 宏（Macro）的坑是面试和实际开发中的高频雷区
+- 条件编译是跨平台开发的基础技能
+
+虽然现代C++正通过 **Modules（模块）** 逐步替代 `#include`，但预处理器仍然是当前C++生态的基石，你绕不开它。
+
+\diagram[flow]{
+源代码(.cpp) -> 预处理器(#展开) -> 编译器(语法分析) -> 汇编器(机器码) -> 链接器(合并) -> 可执行文件(.exe)
+}
+
+/// 知识点列表
+
+\list{
+- #include 的工作机制：文件复制粘贴的真相
+- 头文件守卫（Include Guard）与 #pragma once
+- #define 对象式宏：文本替换的双刃剑
+- 带参数的宏（函数式宏）及其经典陷阱
+- 条件编译：#if / #ifdef / #ifndef / #elif / #endif
+- 预定义宏：__cplusplus、__FILE__、__LINE__ 等
+- #error 与 #warning
+- C++20 Modules 简介（展望）
+- 头文件设计最佳实践
+}
+
+/// 知识点详解
+
+// #include 机制
+
+`#include` 是你写C++代码时用得最多的预处理指令。它的原理简单到令人意外——**就是复制粘贴**。
+
+想象你在写笔记，某页写了"把《附录A》的全部内容抄到这里"。预处理器就是那个帮你抄的人。它把被包含文件的**全部文本**原封不动地插入到 `#include` 所在的位置。
+
+\code[cpp]{
+#include <iostream>      // 去"系统目录"找 iostream，把内容全部粘贴到这里
+#include "my_header.h"   // 先在"当前目录"找，找不到再去系统目录
+
+// 就是这么简单粗暴——文本复制粘贴！
+}
+
+\collapse[尖括号 <> 和双引号 "" 的搜索路径区别]{
+`<iostream>` — 只搜索**系统/标准库路径**（编译器安装目录下的 include 文件夹）。这是给标准库和第三方库用的。
+
+`"my_header.h"` — **先**搜索当前源文件所在目录，**再**搜索系统路径。这是给你自己写的头文件用的。
+
+你可以用编译器选项 `-I路径` 来添加额外的搜索目录。比如 `g++ -I./include main.cpp` 就会把 `./include` 加到搜索路径里。
+}
+
+这个"复制粘贴"有多夸张？一个只有一行 `#include <iostream>` 的文件，预处理后可能展开出**超过30000行**代码！
+
+\note{用 `g++ -E main.cpp | wc -l` 可以看到预处理后的行数。这就是C++编译慢的主要原因之一——预处理器要处理海量的文本。}
+
+来，我们亲自跑一个最简单的程序，感受一下 `#include` 的效果：
+
+\run[cpp]{
+#include <iostream>
+
+// 这一行 #include 背后，预处理器帮你粘贴了上万行代码
+// 包括 std::cout 的定义、std::string 的定义、各种工具类...
+// 你才能用下面这些东西：
+
+int main() {
+    std::cout << "Hello from preprocessor lesson!" << std::endl;
+    std::cout << "没有 #include <iostream>，这行都编译不了" << std::endl;
+    return 0;
+}
+}
+
+// 头文件守卫
+
+好，既然 `#include` 就是复制粘贴，那问题来了——如果一个头文件被**重复**包含怎么办？
+
+假设你有一个 `Vec2.h`，定义了一个结构体：
+
+\code[cpp]{
+// Vec2.h（没有任何保护措施）
+struct Vec2 {
+    float x, y;
+};
+}
+
+然后 `A.h` 和 `B.h` 都 include 了 `Vec2.h`，你的 `main.cpp` 又同时 include 了 `A.h` 和 `B.h`：
+
+\code[cpp]{
+// main.cpp
+#include "A.h"   // A.h 里面有 #include "Vec2.h" → Vec2 定义复制进来
+#include "B.h"   // B.h 里面也有 #include "Vec2.h" → Vec2 定义又复制一遍！
+
+// 编译器看到两份 struct Vec2 的定义 → 报错：重定义！
+}
+
+\danger{**没有头文件守卫会怎样？** 如果 `Vec2.h` 被多次包含（直接或间接），其中的定义会重复出现，导致"重定义"编译错误。这是新手最常见的编译错误之一。}
+
+解决方案？两种写法——
+
+\tabs{
+\tab[方法1：#ifndef 守卫（标准写法）]{
+\code[cpp]{
+// Vec2.h
+#ifndef VEC2_H      // 如果没有定义过 VEC2_H 这个宏
+#define VEC2_H      // 那就定义它（占个坑）
+
+struct Vec2 {
+    float x, y;
+};
+
+#endif // VEC2_H    // 结束
+
+// 第一次包含时：VEC2_H 没定义过 → 进入 → 定义 VEC2_H + 定义 Vec2
+// 第二次包含时：VEC2_H 已经定义了 → 跳过整个块 → 不会重复定义！
+}
+}
+\tab[方法2：#pragma once（简洁写法）]{
+\code[cpp]{
+// Vec2.h
+#pragma once         // 告诉编译器：这个文件只包含一次
+
+struct Vec2 {
+    float x, y;
+};
+
+// 就这么简单！编译器会记住这个文件已经被包含过了
+// 非标准，但所有主流编译器（GCC/Clang/MSVC）都支持
+}
+}
+}
+
+\table{
+方式 | 优点 | 缺点
+---
+`#ifndef` 守卫 | 标准C++、100%可移植 | 需要唯一的宏名、写法冗长
+`#pragma once` | 简洁、不会命名冲突 | 非标准（但实际全平台支持）
+}
+
+\tip{实际项目中 `#pragma once` 用得更多，因为简洁而且不会因为宏名冲突出问题。Google 和 LLVM 的编码规范用 `#ifndef` 守卫，但大多数游戏引擎用 `#pragma once`。你选哪个都行，关键是**每个头文件都必须有保护！**}
+
+// #define 对象式宏
+
+`#define` 做的事情就四个字：**文本替换**。你定义一个名字，预处理器在所有出现这个名字的地方，直接用你给的文本替换掉。
+
+就像你在 Word 里按 Ctrl+H 全局替换一样——它不懂语法，不管上下文，就是暴力替换。
+
+\code[cpp]{
+// 对象式宏（常量替换）
+#define MAX_ENTITIES 10000
+#define PI 3.14159265358
+
+int arr[MAX_ENTITIES];     // 预处理后变成：int arr[10000];
+double area = PI * r * r;  // 预处理后变成：double area = 3.14159265358 * r * r;
+}
+
+看起来挺方便？但它没有**类型**、没有**作用域**、不受**命名空间**限制。来看看这会闹出什么乱子：
+
+\code[cpp]{
+#define MAX 100
+
+namespace engine {
+    int MAX = 200;  // 预处理器暴力替换 → int 100 = 200; → 编译错误！
+    // 预处理器根本不认识 namespace，它只是文本替换
+}
+}
+
+\danger{**#define 没有作用域、没有类型检查！** 它只是纯粹的文本替换。现代C++中，定义常量请用 `constexpr`：}
+
+\code[cpp]{
+// ❌ 老派写法
+#define MAX_ENTITIES 10000
+#define PI 3.14159265358
+
+// ✅ 现代C++写法
+constexpr int MAX_ENTITIES = 10000;
+constexpr double PI = 3.14159265358;
+// constexpr 有类型、有作用域、可调试，全面优于 #define
+}
+
+// 带参数的宏（函数式宏）
+
+函数式宏看起来像函数，但它**不是函数**——还是文本替换！这是C++里最容易踩坑的地方之一。我们用一个经典例子来拆解：
+
+\steps{
+\step[写一个看起来没问题的宏]{
+\code[cpp]{
+#define SQUARE(x) x * x
+
+int a = SQUARE(3);     // 展开：3 * 3 = 9 ✓ 没毛病
+}
+看起来完美，对吧？别高兴太早——
+}
+\step[传个表达式进去试试]{
+\code[cpp]{
+int b = SQUARE(1 + 2);
+// 你期望：(1+2) * (1+2) = 9
+// 实际展开：1 + 2 * 1 + 2 = 1 + 2 + 2 = 5 ✗
+// 因为是文本替换，不会自动加括号！乘法优先级高于加法！
+}
+踩坑了——参数没有括号保护！
+}
+\step[加括号修复]{
+\code[cpp]{
+#define SQUARE(x) ((x) * (x))
+
+int c = SQUARE(1 + 2);   // ((1 + 2) * (1 + 2)) = 9 ✓
+}
+好了？还没完——
+}
+\step[传个有副作用的参数]{
+\code[cpp]{
+int i = 3;
+int result = SQUARE(i++);
+// 展开：((i++) * (i++)) → i 被自增了两次！未定义行为（UB）！
+// 即使加了括号也救不了，因为参数被"粘贴"了两次
+}
+}
+\step[真正的解决方案：用 constexpr 函数替代]{
+\code[cpp]{
+constexpr int square(int x) { return x * x; }
+
+int i = 3;
+int result = square(i++); // i 只自增一次，完全安全 ✓
+// constexpr 函数有类型检查、参数只求值一次、可调试
+}
+}
+}
+
+\danger{**函数式宏的三大坑：** 1）参数未加括号导致优先级错误；2）参数求值多次导致副作用；3）没有类型检查。现代C++中几乎没有理由使用函数式宏——用 `constexpr` 函数、`inline` 函数或模板替代。}
+
+来动手验证一下宏的坑：
+
+\run[cpp]{
+#include <iostream>
+
+#define SQUARE_BAD(x) x * x
+#define SQUARE_GOOD(x) ((x) * (x))
+
+constexpr int square(int x) { return x * x; }
+
+int main() {
+    // 坑1：优先级问题
+    std::cout << "SQUARE_BAD(1+2) = " << SQUARE_BAD(1+2) << std::endl;
+    std::cout << "SQUARE_GOOD(1+2) = " << SQUARE_GOOD(1+2) << std::endl;
+    std::cout << "square(1+2) = " << square(1+2) << std::endl;
+
+    std::cout << "---" << std::endl;
+
+    // 坑2：副作用问题
+    int a = 3, b = 3, c = 3;
+    std::cout << "宏(a++) = " << SQUARE_GOOD(a++) << ", a现在=" << a << std::endl;
+    // 注意: 上面那行是 UB，不同编译器结果可能不同！
+    std::cout << "函数(c++) = " << square(c++) << ", c现在=" << c << std::endl;
+
+    return 0;
+}
+}
+
+// 哪些宏还有用？
+
+说了这么多宏的坏话，但有些事情**只有宏能干**，`constexpr` 和模板都替代不了：
+
+\code[cpp]{
+// 1. 条件编译（无法替代！）
+#ifdef _WIN32
+    #include <windows.h>
+#elif defined(__linux__)
+    #include <unistd.h>
+#elif defined(__APPLE__)
+    #include <TargetConditionals.h>
+#endif
+
+// 2. 日志宏（利用 __FILE__ 和 __LINE__，C++20 前无法替代）
+#define LOG(msg) \
+    std::cout << "[" << __FILE__ << ":" << __LINE__ << "] " << msg << std::endl
+
+// 3. 断言
+#include <cassert>
+assert(ptr != nullptr); // Release 构建中 NDEBUG 会禁用 assert
+
+// 4. 头文件守卫（如上节所述）
+}
+
+\note{C++20 引入了 `std::source_location`，可以替代日志宏中的 `__FILE__` 和 `__LINE__`。但条件编译和头文件守卫目前仍然必须用宏。}
+
+// 条件编译
+
+条件编译就像代码世界的"如果...那么..."——根据条件决定哪些代码被编译、哪些被跳过。
+
+\code[cpp]{
+// 检测C++标准版本
+#if __cplusplus >= 202002L
+    // C++20 或更新的代码
+    #include <format>
+#elif __cplusplus >= 201703L
+    // C++17 代码
+#else
+    #error "需要 C++17 或更高版本"  // 不满足条件直接报编译错误
+#endif
+
+// 检测编译器
+#if defined(__clang__)
+    // Clang 编译器
+#elif defined(__GNUC__)
+    // GCC 编译器
+#elif defined(_MSC_VER)
+    // MSVC 编译器（Visual Studio）
+#endif
+
+// 调试/发布模式
+#ifdef NDEBUG
+    // Release 模式：assert 被禁用，优化开启
+#else
+    // Debug 模式：assert 生效，方便调试
+#endif
+
+// 自定义特性开关
+#ifdef ENABLE_PHYSICS
+    #include "physics_engine.h"
+#endif
+}
+
+\tip{`#ifdef X` 等价于 `#if defined(X)`。需要检测"没有定义"时用 `#ifndef X` 或 `#if !defined(X)`。多条件组合时 `defined()` 更灵活，比如 `#if defined(_WIN32) && !defined(_WIN64)`。}
+
+// 预定义宏
+
+编译器内置了一些宏，不用你定义就能直接用。它们在调试和跨平台开发中非常实用：
+
+\table{
+宏 | 含义 | 示例值
+---
+`__cplusplus` | C++标准版本 | `202302L`（C++23）
+`__FILE__` | 当前源文件名 | `"main.cpp"`
+`__LINE__` | 当前行号 | `42`
+`__func__` | 当前函数名（C++11） | `"main"`
+`__DATE__` | 编译日期 | `"Apr 09 2026"`
+`__TIME__` | 编译时间 | `"14:30:00"`
+`__has_include(<header>)` | 检查头文件是否可用（C++17） | `1` 或 `0`
+}
+
+我们跑个程序看看这些宏的实际输出：
+
+\run[cpp]{
+#include <iostream>
+
+void showInfo() {
+    std::cout << "当前文件: " << __FILE__ << std::endl;
+    std::cout << "当前行号: " << __LINE__ << std::endl;
+    std::cout << "当前函数: " << __func__ << std::endl;
+    std::cout << "编译日期: " << __DATE__ << std::endl;
+    std::cout << "编译时间: " << __TIME__ << std::endl;
+    std::cout << "C++标准: " << __cplusplus << std::endl;
+}
+
+int main() {
+    std::cout << "=== 预定义宏演示 ===" << std::endl;
+    showInfo();
+
+    std::cout << std::endl;
+    std::cout << "注意 __LINE__ 会随位置变化: 这里是第 " << __LINE__ << " 行" << std::endl;
+    return 0;
+}
+}
+
+\code[cpp]{
+// C++17: __has_include 检测库是否可用
+#if __has_include(<format>)
+    #include <format>
+    #define HAS_FORMAT 1
+#else
+    #define HAS_FORMAT 0
+#endif
+// 在不确定编译器支持情况时特别有用
+}
+
+// #error 与 #warning
+
+`#error` 和 `#warning` 让你主动向编译器"喊话"：
+
+\code[cpp]{
+// #error：直接终止编译并显示自定义错误信息
+#if __cplusplus < 201703L
+    #error "本项目需要 C++17 或更高版本，请检查编译器选项"
+#endif
+
+// #warning：发出警告但继续编译（非标准，但 GCC/Clang 支持）
+#ifdef USE_OLD_API
+    #warning "USE_OLD_API 已废弃，请迁移到新 API"
+#endif
+
+// 现代替代方案：static_assert（C++11）
+static_assert(__cplusplus >= 201703L, "需要 C++17 或更高版本");
+// static_assert 比 #error 更好：它在编译阶段检查且是标准C++
+}
+
+// C++20 Modules 简介
+
+\collapse[展望：C++20 Modules 会替代 #include 吗？]{
+Modules 是C++20引入的新特性，目标是彻底解决 `#include` 的问题：
+
+\code[cpp]{
+// 传统方式
+#include <vector>
+#include <string>
+
+// C++20/23 Modules 方式
+import std;          // 导入整个标准库（C++23）
+
+// 自定义模块
+// math.cppm（模块接口文件）
+export module math;
+export int add(int a, int b) { return a + b; }
+
+// main.cpp
+import math;
+int result = add(1, 2);
+}
+
+**Modules 的优势：**
+- 编译速度大幅提升（不需要重复解析头文件文本）
+- 没有宏泄露问题（模块内的 `#define` 不会影响外部）
+- 没有 include 顺序依赖
+- 更清晰的接口边界
+
+**现实情况：** 截至2026年，Modules 的编译器支持仍在演进中。GCC、Clang、MSVC 的支持程度各不相同，构建系统（CMake 等）的配套也还在完善。建议持续关注，但当前仍以头文件为主力。
+}
+
+// 头文件设计最佳实践
+
+写好头文件是C++工程能力的基本功，记住这几条规则：
+
+\list{
+- **每个头文件都要有保护**：用 `#pragma once` 或 `#ifndef` 守卫，无一例外
+- **头文件只放声明，不放定义**：`inline`、模板、`constexpr` 除外
+- **减少头文件中的 #include**：能用前向声明（Forward Declaration）就不要 include
+- **不要在头文件中 `using namespace`**：这会污染所有 include 这个头文件的源文件的命名空间
+- **头文件应该自给自足**：单独 include 它就能编译通过
+- **遵循 IWYU 原则**：Include What You Use，用了什么就 include 什么
+}
+
+\danger{**千万不要在头文件里写 `using namespace std;`！** 所有 include 了你这个头文件的文件都会被影响，可能导致名字冲突，而且排查起来极其痛苦。}
+
+/// 难点易错点分析
+
+// 宏名与普通标识符冲突
+
+\danger{**宏的文本替换是全局的，不讲道理：**}
+
+\code[cpp]{
+#define begin() start()
+
+std::vector<int> v;
+v.begin();  // 被暴力替换为 v.start() → 编译错误！
+
+// 这就是为什么宏名应该用全大写 + 前缀，比如 ENGINE_BEGIN()
+// 不要用常见单词或标准库已有的名字做宏名！
+}
+
+// #include 顺序问题
+
+\warning{**#include 顺序可能影响编译结果！** 如果某个头文件依赖另一个头文件中的宏定义或类型声明，顺序错误会导致编译失败。推荐的包含顺序：}
+
+\code[cpp]{
+// 推荐的 #include 顺序
+#include "this_file.h"   // 1. 对应的头文件（验证自给自足）
+
+#include <cstdio>        // 2. C 标准库
+#include <cstring>
+
+#include <iostream>      // 3. C++ 标准库
+#include <vector>
+
+#include <SDL2/SDL.h>    // 4. 第三方库
+
+#include "engine/core.h" // 5. 项目内部头文件
+#include "engine/math.h"
+// 每组之间空一行，便于阅读
+}
+
+// 多行宏的续行符
+
+\danger{**多行宏的 `\` 续行符后面不能有任何字符（包括空格）：**}
+
+\code[cpp]{
+#define MULTI_LINE_MACRO(x) \
+    do {                    \
+        process(x);         \
+        log(x);             \
+    } while(0)
+
+// do { ... } while(0) 技巧使宏在所有上下文中行为正确
+// 特别是在 if/else 中不会出问题：
+if (condition)
+    MULTI_LINE_MACRO(x);  // 没有 do-while(0) 包裹的话，else 会被错误匹配
+else
+    other();
+}
+
+// 自测区
+
+学完了以上内容，来检验一下你真的理解了没有：
+
+\quiz[choice]{
+Q: 下面这段代码预处理后会变成什么？\n`#define ADD(a, b) a + b`\n`int x = ADD(2, 3) * 4;`
+A: `int x = 20;`（先算 2+3=5，再算 5*4=20）
+B: `int x = 14;`（展开为 `2 + 3 * 4`，乘法优先，得 2+12=14）
+C: `int x = 24;`（先算 3*4=12，再加 2，再…不对）
+D: 编译错误
+ANS: B
+EXP: 宏是文本替换！`ADD(2, 3) * 4` 展开为 `2 + 3 * 4`。因为 `*` 优先级高于 `+`，所以先算 `3*4=12`，再算 `2+12=14`。这就是为什么函数式宏参数必须加括号：`#define ADD(a, b) ((a) + (b))`。
+}
+
+\quiz[tf]{
+Q: `#pragma once` 是C++标准的一部分。
+ANS: F
+EXP: `#pragma once` 不是C++标准的一部分，它是编译器扩展。但所有主流编译器（GCC、Clang、MSVC）都支持它，实际使用中完全没问题。标准的做法是用 `#ifndef` / `#define` / `#endif` 守卫。
+}
+
+\quiz[choice]{
+Q: 以下哪个不是编译器预定义的宏？
+A: `__FILE__`
+B: `__LINE__`
+C: `__FUNCTION_NAME__`
+D: `__cplusplus`
+ANS: C
+EXP: `__FILE__`（文件名）、`__LINE__`（行号）、`__cplusplus`（标准版本）都是标准预定义宏。`__FUNCTION_NAME__` 不存在，正确的是 `__func__`（C++11标准）。有些编译器提供 `__FUNCTION__` 或 `__PRETTY_FUNCTION__` 作为扩展，但那不是标准。
+}
+
+/// 常用方法与工具
+
+\table{
+工具/特性 | 用途 | 标准/来源
+---
+`#pragma once` | 防止头文件重复包含 | 编译器扩展（广泛支持）
+`#ifndef` / `#define` / `#endif` | 头文件守卫（标准写法） | C/C++ 标准
+`constexpr` | 替代 `#define` 常量 | C++11
+`inline` 函数 | 替代函数式宏 | C++17 `inline` 变量
+`__has_include` | 检测头文件是否可用 | C++17
+`std::source_location` | 替代 `__FILE__` / `__LINE__` | C++20
+`static_assert` | 编译期断言（替代 `#error`） | C++11
+`import` / `module` | 模块系统（替代 `#include`） | C++20
+}
+
+/// 新旧标准差异
+
+\compare{
+old: C++98/03 完全依赖预处理器和头文件。`#define` 是定义常量和"泛型"的主要手段。条件编译和平台检测全靠宏。没有 `__has_include`，无法检测库可用性。编译速度因头文件展开而缓慢。
+
+new: C++11 引入 `constexpr` 替代常量宏、`static_assert` 替代 `#error`。C++17 加入 `__has_include` 和 `inline` 变量。C++20 引入 `std::source_location` 替代 `__FILE__`/`__LINE__`、Modules 开始替代 `#include`。C++23 的 `import std;` 让导入标准库更简单。**趋势：预处理器的使用范围逐步缩小到条件编译和平台检测。**
+}
+
+/// 实战作业
+
+// 🟢 基础题1：预定义宏练习
+
+用预定义宏写一个简单的 `DEBUG_LOG` 宏，能打印文件名、行号和自定义消息。然后在 `main()` 中调用它。
+
+\run[cpp]{
+#include <iostream>
+
+// TODO: 定义 DEBUG_LOG(msg) 宏
+// 要求输出格式: [文件名:行号] 消息内容
+// 提示: 使用 __FILE__ 和 __LINE__
+
+/* TODO: 你的宏定义 */
+
+int main() {
+    DEBUG_LOG("程序启动");
+    
+    int x = 42;
+    DEBUG_LOG("x 的值已设置");
+    
+    // 如果你的宏写对了，应该能看到每行日志的行号都不一样
+    DEBUG_LOG("程序结束");
+    
+    return 0;
+}
+}
+
+// 🟢 基础题2：头文件守卫
+
+下面这段代码会编译错误（重定义），请用 `#ifndef` 守卫或 `#pragma once` 修复它。
+
+\run[cpp]{
+#include <iostream>
+
+// 模拟一个没有守卫的"头文件"内容 —— 被包含了两次
+// ===== "player.h" 的内容 START =====
+struct Player {
+    int hp;
+    int attack;
+};
+// ===== "player.h" 的内容 END =====
+
+// 模拟第二次包含同一个"头文件"
+// ===== "player.h" 的内容 START =====
+struct Player {
+    int hp;
+    int attack;
+};
+// ===== "player.h" 的内容 END =====
+
+// TODO: 用 #ifndef 守卫包裹上面的"头文件内容"，使得第二次包含时被跳过
+// 提示: 把两段 Player 定义替换为带守卫的版本
+
+int main() {
+    Player p{100, 25};
+    std::cout << "HP: " << p.hp << ", ATK: " << p.attack << std::endl;
+    return 0;
+}
+}
+
+// 🟡 进阶题：安全的 MIN/MAX
+
+把下面危险的 `MIN` 宏改写成 `constexpr` 函数版本，确保不会有副作用问题。
+
+\run[cpp]{
+#include <iostream>
+
+// 危险版本：函数式宏
+#define MIN_MACRO(a, b) ((a) < (b) ? (a) : (b))
+
+// TODO: 写一个 constexpr 函数版本的 min_safe
+// 要求：1) 参数只求值一次  2) 有类型检查
+// 提示：可以用模板让它支持任意类型
+
+/* TODO: 你的 constexpr 函数 */
+
+int main() {
+    // 测试1：基本功能
+    std::cout << "MIN_MACRO(3, 5) = " << MIN_MACRO(3, 5) << std::endl;
+    // std::cout << "min_safe(3, 5) = " << min_safe(3, 5) << std::endl;
+
+    // 测试2：副作用问题
+    int a = 3, b = 5;
+    std::cout << "MIN_MACRO(a++, b++) = " << MIN_MACRO(a++, b++) << std::endl;
+    std::cout << "a=" << a << ", b=" << b << std::endl;
+    // 注意看 a 和 b 的值——宏版本会让 a 自增两次！
+
+    // TODO: 取消下面的注释，用你的 min_safe 测试
+    // int c = 3, d = 5;
+    // std::cout << "min_safe(c++, d++) = " << min_safe(c++, d++) << std::endl;
+    // std::cout << "c=" << c << ", d=" << d << std::endl;
+
+    return 0;
+}
+}
+
+\collapse[🤔 进阶题参考思路]{
+用模板写一个通用的 `min_safe`：
+
+\code[cpp]{
+template<typename T>
+constexpr T min_safe(T a, T b) {
+    return a < b ? a : b;
+}
+}
+
+因为 `a` 和 `b` 是函数参数，传进来时已经求值完毕，所以 `min_safe(i++, j++)` 只会让 `i` 和 `j` 各自增一次。这就是函数比宏安全的根本原因——**函数参数只求值一次，宏参数会被粘贴多次。**
+}
+
+学完预处理器，你就理解了C++编译流程的第一站。下节课我们来做一个综合小项目，把这几节学到的基础知识全部串起来练一遍！

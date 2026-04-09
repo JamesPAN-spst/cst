@@ -1,0 +1,883 @@
+/// 简介
+
+上一节我们学了如何分配和释放内存（`new`/`delete`、自定义分配器），但分配只是故事的一半——另一半是"别搞砸它"。C++ 把内存管理的权力交给了程序员，但这份权力的代价是：一旦出错，后果从程序崩溃到安全漏洞，甚至可能被攻击者利用来执行任意代码。
+
+**内存安全（Memory Safety）** 指的是程序在运行时不会发生越界访问、悬空指针解引用、重复释放等违反内存规则的行为。在工业界，内存安全 bug 是软件安全漏洞的首要来源——微软和谷歌的统计均显示，约 70% 的安全漏洞根源是内存安全问题。
+
+本节的目标不是让你"害怕"C++ 的内存模型，而是教你**系统地识别、检测、预防**这些问题。我们会先认识常见的内存 bug 类型，再学习自动检测工具（Sanitizer、Valgrind），最后掌握 RAII 和现代 C++ 提供的防线。学完这节，你应该能在自己的代码中搭建起一套"内存安全防护网"。
+
+/// 知识点列表
+
+\list{
+- 常见内存 Bug 分类：泄漏、悬空指针、双重释放、缓冲区溢出、use-after-free
+- 内存泄漏检测工具：Valgrind、ASAN（LeakSanitizer）
+- AddressSanitizer（ASan）— 最常用的运行时检测器
+- MemorySanitizer（MSan）— 检测未初始化内存读取
+- UndefinedBehaviorSanitizer（UBSan）— 检测未定义行为
+- RAII 作为内存安全的核心策略
+- std::span（C++20）— 安全的数组视图，带边界信息
+- 边界检查与断言（Bounds Checking & Assertions）
+- 游戏引擎中的内存安全实践
+- 现代 C++ vs Rust 的内存安全模型对比（简述）
+}
+
+/// 知识点详解
+
+// 常见内存 Bug 分类
+
+在深入检测工具之前，我们先来建立一个"敌人清单"——知道常见的内存 bug 都长什么样，才能有针对性地防御。
+
+\table{
+Bug 类型 | 描述 | 典型后果
+---
+内存泄漏（Memory Leak） | 分配了内存但忘记释放 | 内存持续增长，最终耗尽
+悬空指针（Dangling Pointer） | 指针指向已释放的内存 | 读到垃圾数据或崩溃
+双重释放（Double Free） | 对同一块内存 delete 两次 | 堆结构损坏，可能被利用
+缓冲区溢出（Buffer Overflow） | 访问数组边界之外的内存 | 数据损坏、崩溃、安全漏洞
+Use-After-Free | 释放后继续使用该内存 | 与悬空指针类似，可被利用
+未初始化读取（Uninitialized Read） | 读取未赋值的变量 | 不确定行为（Undefined Behavior）
+}
+
+下面用一段代码展示每种 bug 的最小复现形式——注意，这些代码都是**故意写错的**，用来帮你建立"危险代码长什么样"的直觉：
+
+\run[cpp]{
+#include <iostream>
+#include <cstring>
+
+// 1. 内存泄漏 —— 分配了没释放
+void leak_example() {
+    int* p = new int(42);
+    // 函数结束，p 被销毁，但 p 指向的堆内存没有 delete
+    // 这块内存永远无法回收了
+    std::cout << "leak_example: 分配了 " << *p << "，但没释放\n";
+}
+
+// 2. 悬空指针 / Use-After-Free —— 释放后还在用
+void dangling_example() {
+    int* p = new int(100);
+    delete p;           // 内存已归还
+    // *p = 200;        // 取消注释 → use-after-free！读写已释放的内存
+    std::cout << "dangling_example: delete 后 p 仍指向 " << p << "（悬空！）\n";
+}
+
+// 3. 双重释放 —— 同一块内存 delete 两次
+void double_free_example() {
+    int* p = new int(50);
+    delete p;
+    // delete p;        // 取消注释 → double free！堆管理器崩溃
+    std::cout << "double_free_example: 已释放一次，第二次会崩溃\n";
+}
+
+// 4. 缓冲区溢出 —— 越界写入
+void overflow_example() {
+    int arr[5] = {1, 2, 3, 4, 5};
+    // arr[5] = 99;     // 取消注释 → 越界！写入了不属于 arr 的内存
+    std::cout << "overflow_example: arr 只有 5 个元素，arr[5] 越界\n";
+}
+
+int main() {
+    leak_example();
+    dangling_example();
+    double_free_example();
+    overflow_example();
+    std::cout << "\n（注释中的危险代码请配合 ASan 逐个测试）\n";
+    return 0;
+}
+}
+
+\tip{**学习建议：** 逐个取消上面代码中的注释，然后用 ASan 编译运行（下一节教你怎么用），观察每种 bug 的报错信息长什么样。亲手触发一次，比读十遍描述都管用。}
+
+// AddressSanitizer（ASan）— 最常用的运行时检测器
+
+知道了 bug 长什么样，下一个问题是：怎么**自动**发现它们？靠人眼审查代码效率太低，我们需要工具。
+
+**AddressSanitizer（地址消毒器，简称 ASan）** 是 Google 开发的编译器插桩工具。它在你的代码周围插入"哨兵"（Shadow Memory），让程序在运行时一旦触碰到非法内存就立刻报错——而不是像普通程序那样"侥幸"跑过去或在几千行之后莫名崩溃。
+
+\code[bash]{
+# 编译时启用 ASan（GCC 和 Clang 都支持）
+g++ -fsanitize=address -fno-omit-frame-pointer -g main.cpp -o main
+clang++ -fsanitize=address -fno-omit-frame-pointer -g main.cpp -o main
+
+# -fsanitize=address    启用 ASan
+# -fno-omit-frame-pointer 保留栈帧指针，让报错堆栈更完整
+# -g                    生成调试信息，报错时能显示源码行号
+}
+
+ASan 能检测以下问题：
+
+\list{
+- 堆缓冲区溢出（Heap Buffer Overflow）
+- 栈缓冲区溢出（Stack Buffer Overflow）
+- 全局缓冲区溢出（Global Buffer Overflow）
+- Use-After-Free（释放后使用）
+- Double-Free（重复释放）
+- 内存泄漏（通过内置的 LeakSanitizer，程序退出时检测）
+}
+
+下面用一个实际例子，看 ASan 如何捕获堆缓冲区溢出：
+
+\run[cpp]{
+#include <iostream>
+
+int main() {
+    // 分配 5 个 int 的数组
+    int* arr = new int[5];
+    for (int i = 0; i < 5; ++i) {
+        arr[i] = i * 10;
+    }
+
+    // 越界写入第 6 个元素 —— ASan 会在这里报错
+    // 普通编译可能"恰好"不崩溃，但内存已经被破坏了
+    arr[5] = 999;
+
+    std::cout << "arr[5] = " << arr[5] << "\n";
+    delete[] arr;
+    return 0;
+}
+// 用 ASan 编译运行：
+// g++ -fsanitize=address -g thisfile.cpp -o test && ./test
+// 你会看到 "heap-buffer-overflow" 错误报告
+}
+
+\collapse[ASan 错误报告解读指南]{
+ASan 报错信息看起来很长，但结构是固定的，按以下三步阅读：
+
+**第一步——看错误类型（第一行）：**
+`==12345==ERROR: AddressSanitizer: heap-buffer-overflow`
+告诉你这是"堆缓冲区溢出"。
+
+**第二步——看出错位置（#0 行）：**
+`#0 0x4a3b2c in main /home/user/test.cpp:12`
+告诉你出错代码在 test.cpp 第 12 行。
+
+**第三步——看内存分配信息：**
+`allocated by thread T0 here: ... in main /home/user/test.cpp:5`
+告诉你这块内存是在第 5 行分配的。
+
+还会告诉你"越界了多少"：
+`0x602000000028 is located 0 bytes to the right of 20-byte region`
+意思是刚好越过了 20 字节区域的右边界（5 个 int = 20 字节）。
+}
+
+// 内存泄漏检测：LeakSanitizer 与 Valgrind
+
+ASan 内置了 **LeakSanitizer（LSan，泄漏消毒器）**，在程序正常退出时自动扫描所有未释放的堆内存。在 Linux 上默认开启，无需额外 flag。
+
+另一个经典工具是 **Valgrind**——它不需要重新编译，直接"套"在可执行文件外面运行：
+
+\tabs{
+\tab[ASan/LSan]{
+\code[bash]{
+# ASan 自带 LeakSanitizer（Linux 默认开启）
+g++ -fsanitize=address -g main.cpp -o main
+./main
+# 程序退出时会报告所有泄漏的内存块及其分配位置
+
+# 如果只想检测泄漏（不检测越界等），可以单独用 LSan：
+g++ -fsanitize=leak -g main.cpp -o main
+}
+}
+\tab[Valgrind]{
+\code[bash]{
+# 编译时只需要 -g（调试信息），无需特殊 flag
+g++ -g main.cpp -o main
+
+# 用 Valgrind 的 Memcheck 工具运行
+valgrind --leak-check=full --track-origins=yes ./main
+
+# --leak-check=full    详细报告每个泄漏的分配位置
+# --track-origins=yes  追踪未初始化值的来源
+
+# 缺点：运行速度降低 10-50 倍，仅支持 Linux
+# 优点：不需要重新编译，检测范围比 ASan 更广
+}
+}
+}
+
+\table{
+工具 | 检测内容 | 速度开销 | 平台 | 使用方式
+---
+ASan | 越界、UAF、泄漏 | ~2x | 全平台 | 编译 flag
+LSan | 仅内存泄漏 | ~1x | Linux/Mac | 编译 flag
+Valgrind | 全面内存检测 | 10-50x | Linux | 运行时包装
+}
+
+// MemorySanitizer（MSan）— 未初始化读取检测
+
+有一种特别隐蔽的 bug：变量声明了但没赋值就拿来用。编译器不一定会警告，程序也不一定崩溃——它可能"碰巧"跑出一个看起来合理的结果，直到某天换个编译器或换台机器才暴露。
+
+**MemorySanitizer（MSan，内存消毒器）** 专门检测这种"未初始化内存读取（Uninitialized Read）"：
+
+\code[bash]{
+# 仅 Clang 支持，GCC 不支持 MSan
+clang++ -fsanitize=memory -fno-omit-frame-pointer -g main.cpp -o main
+}
+
+\code[cpp]{
+#include <iostream>
+
+int main() {
+    int x;          // 声明了但没赋初值
+    if (x > 0) {   // MSan 报错：use of uninitialized value
+        std::cout << "x is positive\n";
+    }
+    return 0;
+}
+}
+
+\warning{**ASan 和 MSan 不能同时使用！** 它们的内存映射方式冲突。如果你需要两种检测，请分别编译运行。类似地，ASan 和 **ThreadSanitizer（TSan，线程消毒器）** 也互斥。建议在 CI 中设置多个构建配置。}
+
+// UndefinedBehaviorSanitizer（UBSan）
+
+C++ 中有一类错误叫**未定义行为（Undefined Behavior, UB）**——标准说"编译器可以做任何事"，包括看起来"正常运行"。这比崩溃更危险，因为它让你误以为代码是对的。
+
+**UBSan（未定义行为消毒器）** 在运行时捕获常见的 UB：
+
+\run[cpp]{
+#include <iostream>
+#include <climits>
+
+int main() {
+    // 有符号整数溢出 —— C++ 标准定义为 UB
+    int x = INT_MAX;
+    // int y = x + 1;  // UBSan 会报：signed integer overflow
+
+    // 除以零
+    int a = 10;
+    // int b = a / 0;  // UBSan 会报：division by zero
+
+    // 数组越界（也被 ASan 检测，但 UBSan 从 UB 角度报告）
+    int arr[3] = {1, 2, 3};
+    // int c = arr[5]; // UBSan 报告
+
+    std::cout << "INT_MAX = " << INT_MAX << "\n";
+    std::cout << "取消注释上面的代码，用 -fsanitize=undefined 编译试试\n";
+    return 0;
+}
+// 编译命令：
+// g++ -fsanitize=undefined -g thisfile.cpp -o test && ./test
+// 也可以组合 ASan：g++ -fsanitize=address,undefined -g ...
+}
+
+\tip{**ASan + UBSan 是最佳拍档。** 它们可以同时启用（`-fsanitize=address,undefined`），开发阶段建议始终开启。性能开销合计约 2-3 倍，对于调试构建完全可以接受。}
+
+// RAII — 内存安全的核心策略
+
+工具能帮你**发现** bug，但更好的办法是**从源头避免** bug。C++ 提供的核心防御机制叫 **RAII（Resource Acquisition Is Initialization，资源获取即初始化）**。
+
+RAII 的核心思想：把资源的生命周期绑定到对象的生命周期。对象构造时获取资源，析构时释放资源。因为 C++ 保证离开作用域时自动调用析构函数，所以资源释放不可能被遗忘。
+
+\diagram[memory]{
+stack:
+  [scope开始] unique_ptr<int> p 构造 → 堆上分配 int
+  [scope中间] 使用 *p
+  [scope结束] p 析构 → 自动 delete 堆上的 int
+heap:
+  [0x5500] int 值
+arrow: p -> int 值
+}
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <string>
+
+// ❌ 非 RAII 写法 —— 容易泄漏
+void unsafe_function() {
+    int* data = new int[100];
+    // 如果这里抛出异常，下面的 delete 永远不会执行 → 泄漏！
+    // ... 可能抛异常的操作 ...
+    delete[] data;
+}
+
+// ✅ RAII 写法 —— 无论正常返回还是异常，都会自动释放
+void safe_function() {
+    auto data = std::make_unique<int[]>(100);
+    // unique_ptr 的析构函数保证：离开作用域时自动 delete[]
+    // 即使中途抛异常，栈展开（Stack Unwinding）也会触发析构
+    data[0] = 42;
+    std::cout << "safe_function: data[0] = " << data[0] << "\n";
+}
+
+// ✅ vector 也是 RAII —— 内部的堆内存由 vector 析构函数管理
+void vector_example() {
+    std::vector<std::string> names;
+    names.push_back("Alice");
+    names.push_back("Bob");
+    std::cout << "vector_example: " << names.size() << " names\n";
+    // 离开作用域后 vector 自动释放所有内存
+}
+
+int main() {
+    safe_function();
+    vector_example();
+    std::cout << "所有内存已自动释放，零泄漏\n";
+    return 0;
+}
+}
+
+\note{**RAII 不只是"用智能指针"。** `std::vector`、`std::string`、`std::fstream`、`std::lock_guard` 全都是 RAII 的体现。原则很简单：**资源 = 对象**，让析构函数替你善后。}
+
+// std::span（C++20）— 安全的数组视图
+
+传统 C++ 中传递数组通常用"指针 + 长度"两个参数，但调用者很容易搞错长度，或者忘记传长度：
+
+\code[cpp]{
+// 危险：调用者可能传错 size
+void process(int* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        data[i] *= 2;     // 如果 size 传大了 → 越界！
+    }
+}
+}
+
+C++20 引入了 **`std::span`（跨度/视图）**，它把"指针 + 长度"封装成一个对象，像一副"不拥有内存的眼镜"——看得到数据和边界，但不负责分配释放：
+
+\run[cpp]{
+#include <iostream>
+#include <span>
+#include <vector>
+#include <array>
+
+// 用 span 代替 "指针 + 长度" —— 类型安全，不会搞错大小
+void print_all(std::span<const int> data) {
+    std::cout << "[ ";
+    for (int val : data) {       // span 支持范围 for 循环
+        std::cout << val << " ";
+    }
+    std::cout << "] (size=" << data.size() << ")\n";
+}
+
+void double_values(std::span<int> data) {
+    for (int& val : data) {
+        val *= 2;
+    }
+}
+
+int main() {
+    // span 可以从多种数据源构造
+    int c_arr[] = {1, 2, 3, 4, 5};
+    std::vector<int> vec = {10, 20, 30};
+    std::array<int, 4> std_arr = {100, 200, 300, 400};
+
+    print_all(c_arr);       // C 数组 → span 自动推导大小
+    print_all(vec);         // vector → span
+    print_all(std_arr);     // std::array → span
+
+    // 子视图：取前 3 个元素
+    print_all(std::span(c_arr).first(3));
+
+    // 修改原数据
+    double_values(vec);
+    print_all(vec);
+
+    return 0;
+}
+}
+
+\warning{**`std::span` 不拥有数据，不做自动边界检查。** 它只是一个"视图"。如果底层数据被释放了，span 就变成悬空引用。同时 `operator[]` 默认不检查越界——安全的做法是在访问前手动检查 `.size()`。}
+
+// 边界检查与断言
+
+即使有了 span 和 vector，手动边界检查仍然是防御性编程的重要一环。C++ 提供两种主要机制：
+
+**`assert` 宏（断言）**——调试期有效，Release 中被移除（定义了 `NDEBUG` 后 assert 变成空操作）：
+
+\code[cpp]{
+#include <cassert>
+
+void access(int* arr, int size, int index) {
+    assert(index >= 0 && index < size);  // Debug 模式下越界会终止程序
+    arr[index] = 42;
+}
+}
+
+**手动边界检查 + 异常/错误码**——Release 中也有效：
+
+\run[cpp]{
+#include <iostream>
+#include <stdexcept>
+#include <vector>
+
+// 安全的数组访问：越界时抛 out_of_range 而非 UB
+template<typename T>
+T& safe_at(std::vector<T>& v, size_t index) {
+    if (index >= v.size()) {
+        throw std::out_of_range("Index " + std::to_string(index)
+            + " out of range [0, " + std::to_string(v.size()) + ")");
+    }
+    return v[index];
+}
+
+int main() {
+    std::vector<int> data = {10, 20, 30};
+
+    // vector::at() 自带边界检查（比 operator[] 慢但安全）
+    try {
+        std::cout << "data.at(1) = " << data.at(1) << "\n";   // 正常
+        std::cout << "data.at(5) = " << data.at(5) << "\n";   // 抛异常
+    } catch (const std::out_of_range& e) {
+        std::cout << "捕获异常: " << e.what() << "\n";
+    }
+
+    // 自定义 safe_at 同理
+    try {
+        safe_at(data, 10);
+    } catch (const std::out_of_range& e) {
+        std::cout << "safe_at 异常: " << e.what() << "\n";
+    }
+    return 0;
+}
+}
+
+\quiz[choice|单选]{
+Q: 以下哪种方式在 Release 构建中**仍然有效**？
+A: `assert(index < size);`
+B: `vector::at(index)`
+C: 两者都有效
+D: 两者都无效
+ANS: B
+EXP: `assert` 在定义了 `NDEBUG` 的 Release 构建中被预处理器移除，变成空操作。`vector::at()` 的边界检查在任何构建模式下都有效，越界时抛出 `std::out_of_range` 异常。
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17：std::optional 避免空指针
+
+**`std::optional<T>`（可选值）** 用类型系统表达"可能没有值"，替代裸指针的 `nullptr` 语义：
+
+\code[cpp]{
+#include <optional>
+#include <string>
+#include <iostream>
+
+// 用 optional 代替 "返回 nullptr 表示失败"
+std::optional<std::string> find_user(int id) {
+    if (id == 1) return "Alice";
+    return std::nullopt;        // 明确表示"无结果"
+}
+
+// 调用者必须检查 has_value() 再使用
+void demo() {
+    auto user = find_user(99);
+    if (user.has_value()) {
+        std::cout << *user << "\n"; // 安全访问
+    }
+}
+}
+
+// C++20：std::span 与 Contracts（提案中）
+
+C++20 带来了 `std::span`（上面已详细介绍）。此外，**契约编程（Contracts）** 正在推进中（C++26 目标），它可以让编译器在函数入口/出口自动检查前置/后置条件：
+
+\code[cpp]{
+// C++26 契约语法（提案阶段，非正式标准）
+int safe_divide(int a, int b)
+    pre(b != 0)                // 前置条件：b 不为零
+    post(r: r * b == a)        // 后置条件：结果乘 b 等于 a
+{
+    return a / b;
+}
+}
+
+// C++23：进一步的安全改进
+
+\list{
+- `std::mdspan`（多维 span）：为矩阵/张量等多维数据提供安全视图
+- `std::expected<T, E>`：替代异常的错误处理，用类型表达"成功值或错误"
+- `std::print` / `std::println`：类型安全的格式化输出，替代 `printf` 的格式串漏洞
+}
+
+\compare{
+old: C++11/14 时代，防内存 bug 主要靠智能指针和 vector。数组传递仍用"指针 + 长度"，边界检查靠程序员自觉。Sanitizer 工具刚起步。
+
+new: C++20/23 提供 `span`、`optional`、`expected` 等类型级安全工具。Sanitizer 已成为工业级标准配置。C++26 的 Contracts 将把前置/后置条件纳入语言。整体趋势：**编译期能防的不留到运行期，运行期能检的不靠人眼审查**。
+}
+
+/// 工程实践
+
+// 项目中的 Sanitizer 配置策略
+
+在真实项目中，Sanitizer 不能只在本地偶尔开开，而应该集成到**持续集成（Continuous Integration, CI）** 流水线中：
+
+\code[cmake]{
+# CMakeLists.txt 中添加 Sanitizer 支持
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer" OFF)
+
+if(ENABLE_ASAN)
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+endif()
+
+if(ENABLE_UBSAN)
+    add_compile_options(-fsanitize=undefined)
+    add_link_options(-fsanitize=undefined)
+endif()
+
+# CI 命令：
+# cmake -B build -DENABLE_ASAN=ON -DENABLE_UBSAN=ON
+# cmake --build build && ctest --test-dir build
+}
+
+// 推荐的编译警告级别
+
+编译器警告是最轻量的"静态分析"——零运行时开销，开了就能抓到一批低级错误：
+
+\code[bash]{
+# 推荐最低级别
+g++ -Wall -Wextra -Wpedantic -Wshadow main.cpp
+
+# 进阶级别（大型项目推荐）
+g++ -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror main.cpp
+# -Wconversion  隐式窄化转换警告
+# -Werror       把所有警告升级为错误，强制修复
+}
+
+// 安全编码清单
+
+\list{
+- 永远不使用裸 `new`/`delete`——用 `std::make_unique` / `std::make_shared`
+- 数组用 `std::vector` 或 `std::array`，不用 C 风格数组
+- 字符串用 `std::string` / `std::string_view`，不用 `char*`
+- 传递数组范围时用 `std::span` 而非"指针 + 长度"
+- 开发/测试构建始终启用 ASan + UBSan
+- CI 中设置 ASan、UBSan、（可选）MSan 三套构建配置
+- Release 构建启用 `-fstack-protector-strong` 和 `-D_FORTIFY_SOURCE=2`
+}
+
+// 游戏引擎中的内存安全实践
+
+游戏引擎对性能要求极高，不能用"到处 try-catch"的方式保证安全。常见策略：
+
+\list{
+- **句柄系统（Handle System）**：不直接暴露裸指针给游戏逻辑层，用**版本化句柄（Versioned Handle）**间接引用。句柄包含 [索引 + 版本号]，访问时检查版本——已删除的对象版本号已递增，访问会失败而非崩溃
+- **Arena/帧分配器（Frame Allocator）**：每帧结束时一次性重置，不会出现"忘记 delete"的问题
+- **Debug 模式强制边界检查**：在 Debug 构建中对自定义容器的 `operator[]` 加入断言，Release 中去掉以保证性能
+- **内存标记（Memory Tagging）**：释放后用特殊值（如 `0xDEADBEEF`）覆写内存，帮助检测 use-after-free
+}
+
+\diagram[memory]{
+stack:
+  [游戏代码] Handle {index=3, version=5}
+heap:
+  [对象池] slot[0]={version=1, data...}
+  [对象池] slot[1]={version=3, data...}
+  [对象池] slot[2]={version=2, data...}  ← 已删除(version不匹配)
+  [对象池] slot[3]={version=5, data...}  ← 有效
+arrow: Handle -> slot[3]
+}
+
+// C++ vs Rust 内存安全模型（简述）
+
+\collapse[C++ vs Rust 内存安全对比]{
+Rust 语言从设计之初就将内存安全作为核心目标。两者的策略差异如下：
+
+\table{
+维度 | C++ | Rust
+---
+安全保证时机 | 主要靠运行时工具（Sanitizer）+ 编码规范 | 编译期强制检查（所有权 + 借用检查器）
+裸指针 | 自由使用 | 必须在 unsafe 块中使用
+悬空引用 | 可能发生（编译器不阻止） | 编译器保证不会发生
+数据竞争 | 靠 TSan 检测 | 编译器用 Send/Sync trait 静态阻止
+学习曲线 | 较低（但安全编码需要纪律） | 较高（借用检查器限制多）
+性能 | 零成本抽象 | 零成本抽象（与 C++ 相当）
+}
+
+**核心差异：** Rust 用编译器强制的"所有权系统"在编译期拒绝不安全的代码；C++ 把选择权留给程序员，依赖工具和规范做补偿。两种策略各有取舍——C++ 更灵活但更易出错，Rust 更安全但有时需要与借用检查器"搏斗"。
+
+对于游戏引擎等性能敏感场景，目前 C++ 生态更成熟，但 Rust 正在追赶。**学好 C++ 的内存安全实践，日后转 Rust 也会更轻松——底层概念是相通的。**
+}
+
+/// 难点易错点分析
+
+\danger{**Sanitizer 不是银弹！** ASan 不检测未初始化读取（需要 MSan），不检测数据竞争（需要 TSan），不检测逻辑错误。而且 Sanitizer 只能检测到**被执行到的**代码路径中的问题——没被测试覆盖的代码路径上的 bug 照样漏掉。必须配合高覆盖率的测试用例。}
+
+\danger{**`assert` 在 Release 中消失！** 很多人在 Debug 中测试通过就放心了，但 Release 构建定义了 `NDEBUG`，所有 `assert` 变成空操作。如果你的 assert 保护了关键的安全检查（比如数组边界），Release 中就裸奔了。安全关键的检查应该用 `if + throw` 或自定义的 `ALWAYS_ASSERT` 宏。}
+
+\danger{**"能跑通 ≠ 没有 bug"——未定义行为的隐蔽性。** 缓冲区溢出在你的机器上可能"恰好"没崩溃（因为越界的内存恰好没被其他东西使用），换台机器或换个编译器就炸了。**永远不要因为"能跑"就认为代码是对的。** 开 ASan 跑一遍，零报错才算安全。}
+
+\quiz[tf|判断]{
+Q: `std::span` 拥有它所指向的数据，当 span 被销毁时会自动释放底层内存。
+ANS: F
+EXP: `std::span` 是**非拥有**的视图（Non-owning View），它只存储指针和长度，不管理底层内存的生命周期。底层数据必须由其他对象（如 vector、array）管理。如果底层数据先于 span 被销毁，span 就变成悬空引用。
+}
+
+\quiz[choice|单选]{
+Q: 你想同时检测堆越界和有符号整数溢出，应该使用哪组编译选项？
+A: `-fsanitize=address -fsanitize=memory`
+B: `-fsanitize=address,undefined`
+C: `-fsanitize=thread,undefined`
+D: `-fsanitize=memory,undefined`
+ANS: B
+EXP: ASan 检测内存越界/UAF，UBSan 检测 UB（包括有符号整数溢出）。它们可以组合使用。选项 A 中 ASan 和 MSan 互斥不能同时用；选项 C 中 TSan 不检测越界；选项 D 中 MSan 不检测越界。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：用 RAII 修复内存泄漏
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <string>
+
+struct Player {
+    std::string name;
+    int health;
+    Player(const std::string& n, int h) : name(n), health(h) {
+        std::cout << "Player " << name << " created\n";
+    }
+    ~Player() {
+        std::cout << "Player " << name << " destroyed\n";
+    }
+};
+
+// 任务：下面的函数有内存泄漏，请用 RAII（智能指针 / vector）修复
+// 要求：函数结束后所有 Player 都被正确析构
+void create_team() {
+    /* TODO: 用 std::vector<std::unique_ptr<Player>> 重写下面的代码 */
+
+    Player* p1 = new Player("Alice", 100);
+    Player* p2 = new Player("Bob", 90);
+    Player* p3 = new Player("Charlie", 80);
+
+    std::cout << "Team size: 3\n";
+
+    // 忘记 delete → 内存泄漏！
+}
+
+int main() {
+    create_team();
+    std::cout << "--- 如果修复正确，上面应该看到 3 条 destroyed 消息 ---\n";
+    return 0;
+}
+}
+
+// 🟢 基础题 2：安全的数组访问
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <stdexcept>
+
+// 任务：实现 safe_sum，对 vector 中 [from, to) 范围内的元素求和
+// 要求：如果 from 或 to 越界，抛出 std::out_of_range 异常
+// 提示：检查 from >= 0, to <= v.size(), from <= to
+int safe_sum(const std::vector<int>& v, int from, int to) {
+    /* TODO: 你的代码 */
+    return 0;
+}
+
+int main() {
+    std::vector<int> data = {10, 20, 30, 40, 50};
+
+    // 正常情况
+    try {
+        std::cout << "sum [0,3) = " << safe_sum(data, 0, 3) << "\n";  // 期望 60
+        std::cout << "sum [1,4) = " << safe_sum(data, 1, 4) << "\n";  // 期望 90
+        std::cout << "sum [0,5) = " << safe_sum(data, 0, 5) << "\n";  // 期望 150
+    } catch (const std::out_of_range& e) {
+        std::cout << "意外异常: " << e.what() << "\n";
+    }
+
+    // 越界情况
+    try {
+        std::cout << "sum [0,10) = " << safe_sum(data, 0, 10) << "\n"; // 应该抛异常
+    } catch (const std::out_of_range& e) {
+        std::cout << "正确捕获: " << e.what() << "\n";
+    }
+
+    try {
+        std::cout << "sum [-1,3) = " << safe_sum(data, -1, 3) << "\n"; // 应该抛异常
+    } catch (const std::out_of_range& e) {
+        std::cout << "正确捕获: " << e.what() << "\n";
+    }
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：实现版本化句柄系统
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <cstdint>
+#include <optional>
+#include <string>
+
+// 版本化句柄：用 [index + generation] 间接引用对象
+// 当对象被删除后 generation 递增，旧句柄通过版本检查判定失效
+struct Handle {
+    uint32_t index;
+    uint32_t generation;
+};
+
+template<typename T>
+class HandlePool {
+    struct Slot {
+        uint32_t generation = 0;
+        bool alive = false;
+        T data;
+    };
+    std::vector<Slot> slots_;
+    std::vector<uint32_t> free_list_;    // 可复用的空闲槽位
+
+public:
+    HandlePool(size_t capacity) : slots_(capacity) {
+        for (uint32_t i = 0; i < capacity; ++i) {
+            free_list_.push_back(i);
+        }
+    }
+
+    // TODO: 实现 allocate —— 从 free_list_ 取一个空闲 slot，
+    //       设置 alive=true，返回 Handle{index, generation}
+    Handle allocate(const T& value) {
+        /* TODO: 你的代码 */
+        return {0, 0};
+    }
+
+    // TODO: 实现 release —— 通过 Handle 验证 generation 后标记为 dead，
+    //       generation 递增，index 回到 free_list_
+    bool release(Handle h) {
+        /* TODO: 你的代码 */
+        return false;
+    }
+
+    // TODO: 实现 get —— 通过 Handle 验证 generation + alive 后返回数据
+    //       无效时返回 std::nullopt
+    std::optional<T> get(Handle h) const {
+        /* TODO: 你的代码 */
+        return std::nullopt;
+    }
+};
+
+int main() {
+    HandlePool<std::string> pool(4);
+
+    Handle h1 = pool.allocate("Enemy_A");
+    Handle h2 = pool.allocate("Enemy_B");
+
+    std::cout << "h1 valid? " << pool.get(h1).has_value() << "\n";   // 1
+    std::cout << "h2 valid? " << pool.get(h2).has_value() << "\n";   // 1
+
+    pool.release(h1);  // 删除 Enemy_A
+
+    std::cout << "h1 valid after release? " << pool.get(h1).has_value() << "\n"; // 0
+    std::cout << "h2 still valid? " << pool.get(h2).has_value() << "\n";         // 1
+
+    // 重新分配 —— 复用 h1 的 slot，但 generation 不同
+    Handle h3 = pool.allocate("Enemy_C");
+    std::cout << "h3 valid? " << pool.get(h3).has_value() << "\n";   // 1
+    std::cout << "h1 still invalid? " << pool.get(h1).has_value() << "\n"; // 0
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：用 span 实现安全的矩阵视图
+
+\run[cpp]{
+#include <iostream>
+#include <span>
+#include <vector>
+#include <stdexcept>
+#include <string>
+
+// 任务：实现 MatrixView —— 用 span 实现一个非拥有的二维矩阵视图
+// 底层数据存储为一维 vector，MatrixView 提供 (row, col) 访问
+// 要求：at(row, col) 进行边界检查，越界抛 std::out_of_range
+class MatrixView {
+    std::span<int> data_;
+    size_t rows_, cols_;
+
+public:
+    MatrixView(std::span<int> data, size_t rows, size_t cols)
+        : data_(data), rows_(rows), cols_(cols)
+    {
+        if (data.size() < rows * cols) {
+            throw std::invalid_argument("Data too small for matrix dimensions");
+        }
+    }
+
+    size_t rows() const { return rows_; }
+    size_t cols() const { return cols_; }
+
+    // TODO: 实现 at(row, col) —— 边界检查 + 返回引用
+    int& at(size_t row, size_t col) {
+        /* TODO: 你的代码 */
+        return data_[0]; // placeholder
+    }
+
+    // TODO: 实现 row_span(row) —— 返回某一行的 span<int>
+    std::span<int> row_span(size_t row) {
+        /* TODO: 你的代码 */
+        return {};
+    }
+};
+
+int main() {
+    std::vector<int> storage(12);
+    // 初始化为 1..12
+    for (int i = 0; i < 12; ++i) storage[i] = i + 1;
+
+    MatrixView mat(storage, 3, 4);  // 3行4列矩阵
+
+    // 打印矩阵
+    for (size_t r = 0; r < mat.rows(); ++r) {
+        for (size_t c = 0; c < mat.cols(); ++c) {
+            std::cout << mat.at(r, c) << "\t";
+        }
+        std::cout << "\n";
+    }
+
+    // 测试边界检查
+    try {
+        mat.at(3, 0);  // row=3 越界（只有0,1,2行）
+    } catch (const std::out_of_range& e) {
+        std::cout << "正确捕获越界: " << e.what() << "\n";
+    }
+
+    // 测试行视图
+    auto row1 = mat.row_span(1);
+    std::cout << "第 1 行: ";
+    for (int v : row1) std::cout << v << " ";
+    std::cout << "\n";
+
+    return 0;
+}
+}
+
+// 🔴 挑战题：构建内存安全检测测试套件
+
+你的任务是构建一个"内存 Bug 检测实验室"——编写包含多种故意 bug 的代码，分别用 ASan、UBSan、Valgrind 检测，记录哪个工具能抓到哪些 bug。
+
+**要求：**
+
+\list{
+- 编写至少 6 个函数，每个包含一种不同的内存 bug：堆越界、栈越界、use-after-free、double-free、内存泄漏、有符号整数溢出
+- 通过命令行参数选择运行哪个 bug（`./test 1` 运行第一个 bug，`./test 2` 运行第二个，以此类推）
+- 分别用 `-fsanitize=address`、`-fsanitize=undefined`、`valgrind` 编译/运行每个 bug
+- 记录一张表格：每行是一种 bug，每列是一个工具，单元格标 ✅ 能检测 / ❌ 不能检测
+- 最后用 RAII 和现代 C++ 技术修复所有 bug，确保所有工具零报错
+}
+
+\collapse[参考思路]{
+程序结构：
+1. `main(argc, argv)` 解析第一个命令行参数
+2. 用 `switch` 跳转到不同的 bug 函数
+3. 每个 bug 函数内部只写最小的复现代码
+4. 修复版本放在同名函数末尾（用 `#ifdef FIXED` 条件编译）
+
+编译命令参考：
+- ASan：`g++ -fsanitize=address -g -o test test.cpp`
+- UBSan：`g++ -fsanitize=undefined -g -o test test.cpp`
+- ASan+UBSan：`g++ -fsanitize=address,undefined -g -o test test.cpp`
+- Valgrind：`g++ -g -o test test.cpp && valgrind --leak-check=full ./test 5`
+- 修复版：`g++ -DFIXED -fsanitize=address,undefined -g -o test test.cpp`
+
+预期结论：ASan 能检测大部分内存 bug 但不能检测 UB（如整数溢出），UBSan 检测 UB 但不检测内存越界，Valgrind 最全面但最慢。组合使用才能覆盖所有类型。
+}

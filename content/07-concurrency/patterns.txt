@@ -1,0 +1,396 @@
+/// 简介
+
+前面章节讲了线程、锁、条件变量、原子操作——这些都是**原语（Primitive）**。实际工程中，你不会每次从零开始组合它们，而是使用经过验证的**并发模式（Concurrency Pattern）**。本节汇总游戏引擎和高性能系统中最常用的并发模式：线程池、生产者-消费者、双缓冲、任务图、并行算法。
+
+每种模式解决一类特定问题。选错模式比不用模式更危险——本节的核心是帮你建立**场景→模式**的映射。
+
+/// 知识点列表
+
+\list{
+- 线程池（Thread Pool）
+- 生产者-消费者队列（Producer-Consumer）
+- 读写锁模式（Reader-Writer）
+- 双缓冲 / 三缓冲（Double/Triple Buffering）
+- 任务图（Task Graph / DAG Scheduling）
+- 并行算法（std::execution 策略）
+- 游戏引擎 Job System 概念
+}
+
+/// 知识点详解
+
+// 线程池
+
+**为什么需要线程池？** 反复创建/销毁线程的开销远大于把任务放入队列由固定线程执行。线程池是"任务 vs 线程"解耦的核心模式。
+
+\code[cpp]{
+class ThreadPool {
+    std::vector<std::jthread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+
+public:
+    explicit ThreadPool(size_t n) {
+        for (size_t i = 0; i < n; ++i)
+            workers_.emplace_back([this](std::stop_token st) {
+                while (!st.stop_requested()) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock lock(mtx_);
+                        cv_.wait(lock, [&]{ return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty()) return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task(); // 在锁外执行
+                }
+            });
+    }
+
+    template<typename F>
+    auto submit(F&& f) -> std::future<std::invoke_result_t<F>> {
+        using R = std::invoke_result_t<F>;
+        auto pt = std::make_shared<std::packaged_task<R()>>(std::forward<F>(f));
+        auto fut = pt->get_future();
+        {
+            std::lock_guard lock(mtx_);
+            tasks_.emplace([pt]{ (*pt)(); });
+        }
+        cv_.notify_one();
+        return fut;
+    }
+
+    ~ThreadPool() {
+        { std::lock_guard lock(mtx_); stop_ = true; }
+        cv_.notify_all();
+    }
+};
+}
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <future>
+#include <queue>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+
+class SimplePool {
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool stop = false;
+public:
+    SimplePool(size_t n) {
+        for (size_t i = 0; i < n; ++i)
+            workers.emplace_back([this]{
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock lk(mtx);
+                        cv.wait(lk, [this]{ return stop || !tasks.empty(); });
+                        if (stop && tasks.empty()) return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+    }
+    void submit(std::function<void()> f) {
+        { std::lock_guard lk(mtx); tasks.push(std::move(f)); }
+        cv.notify_one();
+    }
+    ~SimplePool() {
+        { std::lock_guard lk(mtx); stop = true; }
+        cv.notify_all();
+        for (auto& w : workers) w.join();
+    }
+};
+
+int main() {
+    SimplePool pool(4);
+    for (int i = 0; i < 8; ++i)
+        pool.submit([i]{ std::cout << "Task " << i << " on thread "
+                         << std::this_thread::get_id() << "\n"; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return 0;
+}
+}
+
+// 工作窃取（Work Stealing）
+
+线程池的常见瓶颈是**全局队列锁竞争**。工作窃取模式让每个线程有自己的本地队列——空闲时从别人的队列尾部"偷"任务。
+
+\diagram[flow]{
+WorkerA.localQueue: [T1][T2][T3] <-- WorkerA 从头部取
+WorkerB.localQueue: [] (空)
+WorkerB 从 WorkerA 的尾部偷取 T3
+}
+
+\table{
+属性 | 全局队列线程池 | 工作窃取线程池
+---
+锁竞争 | 所有线程竞争同一锁 | 大多数操作无竞争（本地队列）
+负载均衡 | 天然均衡（FIFO） | 空闲线程主动窃取
+实现复杂度 | 低 | 高（需 lock-free deque）
+适用场景 | 通用 | 大量小任务、递归并行
+}
+
+\note{**Intel TBB、Tokio（Rust）、Go 的 goroutine 调度器都基于工作窃取。** 如果你不打算自己实现，直接用 TBB 或 C++23 的 `std::execution` 提案。}
+
+// 双缓冲 / 三缓冲
+
+游戏引擎经典模式：主线程准备帧数据，渲染线程读取上一帧的数据。两者通过交换缓冲区来通信，不需要对数据本身加锁。
+
+\code[cpp]{
+template<typename T>
+class DoubleBuffer {
+    T buffers_[2];
+    std::atomic<int> readIdx_{0};
+    std::atomic<int> writeIdx_{1};
+public:
+    T& writeBuffer()             { return buffers_[writeIdx_.load()]; }
+    const T& readBuffer() const  { return buffers_[readIdx_.load()]; }
+
+    void swap() {
+        int w = writeIdx_.load(std::memory_order_relaxed);
+        int r = readIdx_.load(std::memory_order_relaxed);
+        writeIdx_.store(r, std::memory_order_release);
+        readIdx_.store(w, std::memory_order_release);
+    }
+};
+// 主线程：填 writeBuffer → swap() → 渲染线程读 readBuffer
+}
+
+\collapse[为什么三缓冲在某些场景更好？]{
+双缓冲中，如果渲染线程慢于主线程，主线程必须等到渲染完成才能 swap——产生阻塞。三缓冲引入第三个 buffer：主线程总是可以写入"空闲 buffer"，渲染线程读"最新完成的 buffer"。代价是多一倍内存和一帧延迟。在帧率敏感的游戏中通常用双缓冲（低延迟），在视频流/VR 中考虑三缓冲（防卡顿）。
+}
+
+// 任务图（Task Graph / DAG Scheduling）
+
+当任务之间有依赖关系时，平坦的线程池不够——需要**有向无环图（DAG）调度器**。
+
+\code[cpp]{
+// 概念模型：
+// LoadMesh ─┐
+//            ├──→ BuildMaterial ──→ Render
+// LoadTex  ─┘
+//
+// LoadMesh 和 LoadTex 可并行；BuildMaterial 需等二者完成
+
+struct Task {
+    std::function<void()> work;
+    std::atomic<int> depCount{0};   // 未完成依赖数
+    std::vector<Task*> successors;  // 完成后通知谁
+};
+
+// 当 depCount 降为 0 时，将 task 放入 ready queue
+void onDependencyComplete(Task* t) {
+    if (t->depCount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        pool.enqueue(t); // 所有依赖满足，可以执行了
+    }
+}
+}
+
+\diagram[flow]{
+[LoadMesh] -> [BuildMaterial]
+[LoadTexture] -> [BuildMaterial]
+[BuildMaterial] -> [Render]
+[Physics] -> [AI] -> [Render]
+}
+
+// 并行算法（C++17 std::execution）
+
+C++17 为标准算法添加了**执行策略（Execution Policy）**，一行代码实现并行化。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <execution>
+#include <chrono>
+
+int main() {
+    std::vector<int> data(10'000'000);
+    std::iota(data.begin(), data.end(), 1);
+
+    auto t1 = std::chrono::steady_clock::now();
+    long long sum_seq = std::reduce(std::execution::seq, data.begin(), data.end(), 0LL);
+    auto t2 = std::chrono::steady_clock::now();
+    long long sum_par = std::reduce(std::execution::par, data.begin(), data.end(), 0LL);
+    auto t3 = std::chrono::steady_clock::now();
+
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
+    std::cout << "Sequential: " << sum_seq << " in " << ms(t1, t2) << "ms\n";
+    std::cout << "Parallel:   " << sum_par << " in " << ms(t2, t3) << "ms\n";
+    return 0;
+}
+}
+
+\table{
+执行策略 | 含义 | 注意事项
+---
+`std::execution::seq` | 顺序执行 | 与普通算法等价
+`std::execution::par` | 多线程并行 | 操作必须线程安全
+`std::execution::par_unseq` | 并行 + SIMD 向量化 | 不能有互斥锁/系统调用
+`std::execution::unseq` (C++20) | 单线程 SIMD | 不能有 goto/异常
+}
+
+\warning{**并行算法中的操作必须线程安全。** `std::for_each(par, ...)` 中的 lambda 不能裸操作共享变量。需要 atomic 或线程局部累加器。}
+
+// 游戏引擎 Job System 概念
+
+现代游戏引擎（如 Unreal、Unity DOTS）的并发模型已经从"几个固定线程"演化为 **Job System**——本质是线程池 + 任务图 + 帧同步的组合。
+
+\table{
+组件 | 作用
+---
+Job / Task | 一小块可并行的工作（如更新 100 个粒子）
+Worker Thread Pool | 固定数量的后台线程执行 Job
+Dependency Graph | Job 之间的先后关系，保证不乱序
+Frame Sync Barrier | 每帧结束时所有 Job 完成才进入下一帧
+Main Thread | 提交 Job 图、处理输入、协调帧节奏
+}
+
+\code[cpp]{
+// 伪代码：典型游戏帧
+void gameFrame() {
+    auto physicsJob  = jobSystem.submit(updatePhysics);
+    auto aiJob       = jobSystem.submit(updateAI, after(physicsJob));
+    auto animJob     = jobSystem.submit(updateAnim, after(physicsJob));
+    auto renderJob   = jobSystem.submit(prepareRender, after(aiJob, animJob));
+    jobSystem.waitAll();  // 帧同步——所有 Job 完成后继续
+}
+}
+
+\quiz[choice|单选]{
+Q: 游戏引擎中"物理更新 → AI 更新 → 渲染准备"的依赖关系最适合用哪种模式实现？
+A: 全局互斥锁 + 条件变量
+B: 任务图（Task Graph / DAG）
+C: 读写锁
+D: 双缓冲
+ANS: B
+EXP: 任务之间有明确的先后依赖（DAG），任务图调度器能自动在依赖满足后并行执行无依赖的任务。全局锁无法表达依赖关系，读写锁是数据访问模式而非任务调度模式。
+}
+
+\quiz[tf|判断]{
+Q: `std::execution::par` 对任何标准算法都能保证加速。
+ANS: F
+EXP: 并行化有开销（线程同步、数据分发）。对于小数据集或本身计算量极小的操作，并行版本可能反而更慢。只有当工作量足够大（通常 > 10000 元素）时并行才有意义。
+}
+
+/// 工程实践
+
+\list{
+- **线程池是默认选择**——不要为每个任务创建线程
+- 生产者-消费者队列选择：单生产-单消费用无锁 SPSC，多对多用 mutex+CV
+- 双缓冲用于"读写频率不同且需要解耦"的场景（帧数据交换）
+- 任务图用于"有依赖关系的可并行工作"（资源加载管线、渲染图）
+- `std::execution::par` 是最简单的并行化入口——数据量够大、操作无副作用时直接用
+- 复杂的 Job System 建议使用成熟库：Intel TBB、EnTT、taskflow
+}
+
+/// 常用方法速查
+
+\table{
+模式 | 核心组件 | 典型场景
+---
+线程池 | CV + queue + jthread | 通用异步任务
+生产者-消费者 | CV + 有界队列 | 流式数据处理
+工作窃取 | lock-free deque + 本地队列 | 大量小任务、递归
+双缓冲 | atomic swap + 两个 buffer | 帧数据、渲染命令
+任务图 | DAG + atomic depCount | 有依赖的任务调度
+并行算法 | std::execution 策略 | transform/reduce/sort 等
+}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11/14 提供了 thread、mutex、condition_variable、future 等原语，但没有标准线程池、任务图或工作窃取。并行算法需要第三方库（TBB、OpenMP）。
+
+new: C++17 引入 `std::execution` 并行策略。C++20 引入 `latch`/`barrier` 简化帧同步和阶段同步。C++23 `std::execution`（sender/receiver）提案为标准化异步调度打下基础。
+}
+
+/// 难点易错点分析
+
+\danger{**线程池中的任务依赖死锁：** 任务 A 在线程池中执行，A 提交任务 B 并等待 B 完成。若线程池已满，B 无法被调度→A 永远等不到→死锁。解决：用任务图而非在任务内部 wait future。}
+
+\danger{**双缓冲的 swap 时机：** 必须保证 swap 时读线程不在读旧的 writeBuffer。通常用 fence/barrier 在帧边界同步。}
+
+\danger{**并行算法中的 reduce 运算符必须满足结合律和交换律：** `std::reduce(par, ...)` 不保证操作顺序。浮点加法不严格满足结合律，因此并行 reduce 的结果可能与顺序版本有微小差异。}
+
+/// 实战作业
+
+🟢 **基础：简易线程池**
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <functional>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <vector>
+
+class MiniPool {
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+public:
+    MiniPool(size_t n) {
+        for (size_t i = 0; i < n; ++i)
+            workers_.emplace_back([this]{
+                /* TODO: 循环：加锁等待任务 → 取出任务 → 解锁 → 执行 */
+            });
+    }
+    void submit(std::function<void()> f) {
+        /* TODO: 加锁放入队列，通知一个 worker */
+    }
+    ~MiniPool() {
+        { std::lock_guard lk(mtx_); stop_ = true; }
+        cv_.notify_all();
+        for (auto& w : workers_) w.join();
+    }
+};
+
+int main() {
+    MiniPool pool(4);
+    for (int i = 0; i < 16; ++i)
+        pool.submit([i]{ std::cout << "Task " << i << "\n"; });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return 0;
+}
+}
+
+🟡 **进阶：任务图调度器**
+
+实现简易 `TaskGraph`：
+- `createTask(func)` 返回 TaskId
+- `addDependency(dependent, dependency)` 声明先后关系
+- `execute(pool)` 提交到线程池，依赖满足后自动执行
+- 用 `atomic<int>` 管理 depCount，`latch` 实现 waitAll
+- 测试：A/B 并行 → C 依赖 A/B → D 依赖 C
+
+🔴 **挑战：并行 merge sort**
+
+实现递归分治的并行归并排序：
+- 递归拆分到阈值（如 1024）后切换为串行 `std::sort`
+- 递归时将子任务提交到线程池，用 future 等待子结果
+- 对比 `std::sort` / `std::sort(par)` / 自定义并行归并排序 三者性能
+- 注意避免线程池任务依赖死锁（递归深度过大时子任务填满池）
+
+\collapse[避免递归并行的线程池死锁]{
+方法1：使用工作窃取——被 wait 阻塞的线程可以继续偷取、执行其他任务。
+方法2：设置递归深度上限——超过深度后改用串行。
+方法3：使用 `std::async(std::launch::deferred | std::launch::async)` 让运行时决定是否创建新线程。
+}

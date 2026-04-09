@@ -1,0 +1,427 @@
+/// 简介
+
+程序运行中总会遇到意料之外的状况——文件找不到、网络断开、用户输入非法。上一节我们学习了智能指针来管理资源，但如果资源获取本身就失败了呢？这就是**错误处理（Error Handling）**要解决的问题。
+
+C++ 提供了多种错误处理手段：从 C 时代的**错误码（Error Code）**，到 C++ 引入的**异常（Exception）**，再到 C++17 的 `std::optional` 和 C++23 的 `std::expected`。每种方式都有适用场景和代价。选择正确的策略是写出健壮程序的关键——尤其在游戏引擎这类性能敏感领域，这个选择直接影响架构设计。
+
+/// 知识点列表
+
+\list{
+- 错误码 vs 异常 vs std::optional vs std::expected：策略定位与取舍
+- C++ 异常机制：throw、try-catch、栈展开
+- 异常安全级别：四个等级的含义
+- noexcept 规范：承诺不抛异常及其优化影响
+- 标准异常类层次：std::exception 家族
+- RAII 与异常安全：异常安全的基石
+- std::error_code / std::error_category：系统级错误处理
+- std::expected（C++23）：值-或-错误返回类型
+- 游戏引擎中的错误处理策略
+}
+
+/// 知识点详解
+
+// 错误码 vs 异常 vs optional vs expected
+
+在动手写代码之前，先理解这四种策略分别在什么场景下最合适。它们不是互相替代的关系，而是各自服务于不同类型的错误。
+
+\table{
+策略 | 适用场景 | 优点 | 缺点
+---
+错误码 | 系统调用、C 接口 | 零开销，控制流清晰 | 容易被忽略，传播繁琐
+异常 | 不可恢复/罕见错误 | 分离正常与错误逻辑 | 抛出时开销大，控制流隐式
+std::optional | "可能没有值" | 轻量，语义清晰 | 无法携带错误原因
+std::expected | "值或错误"（C++23） | 强类型错误，零异常开销 | 需 C++23 支持
+}
+
+一条实用的决策规则：**编程错误**用 `assert`（如数组越界），**可恢复错误**用 `expected` / `optional`（如解析失败），**不可恢复的运行时错误**用异常（如内存耗尽）。
+
+// C++ 异常机制
+
+**异常（Exception）**是 C++ 处理运行时错误的内建机制。核心语法有三个关键字：`throw` 抛出异常，`try` 划定可能出错的区域，`catch` 捕获并处理。
+
+当 `throw` 执行时，运行时系统开始**栈展开（Stack Unwinding）**：从 `throw` 所在函数逐层退出调用栈，销毁每层的局部对象（调用析构函数），直到找到匹配的 `catch` 块。找不到则调用 `std::terminate()` 终止程序。
+
+\run[cpp]{
+#include <iostream>
+#include <stdexcept>
+
+double divide(double a, double b) {
+    if (b == 0.0) {
+        throw std::invalid_argument("除数不能为零");
+    }
+    return a / b;
+}
+
+int main() {
+    try {
+        std::cout << "10 / 3 = " << divide(10.0, 3.0) << "\n";
+    } catch (const std::invalid_argument& e) {
+        std::cout << "参数错误: " << e.what() << "\n";
+    }
+
+    try {
+        double r = divide(10.0, 0.0);
+        std::cout << "不会执行到这里\n";
+    } catch (const std::invalid_argument& e) {
+        // 始终用 const 引用捕获，避免对象切片
+        std::cout << "捕获到: " << e.what() << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "其他异常: " << e.what() << "\n";
+    } catch (...) {
+        std::cout << "未知异常\n";
+    }
+    return 0;
+}
+}
+
+`catch` 块的匹配顺序是从上到下的——更具体的类型放前面，更宽泛的放后面。`catch(...)` 作为终极兜底放最后。
+
+// 标准异常类层次
+
+C++ 标准库提供了一套异常类继承体系，根类是 `std::exception`（定义在 `<exception>` 头文件中）。了解这棵树有助于你选择合适的异常类型。
+
+\diagram[tree]{
+root: std::exception
+  L: std::logic_error
+    L: std::invalid_argument
+    R: std::out_of_range
+  R: std::runtime_error
+    L: std::overflow_error
+    R: std::system_error
+}
+
+**逻辑错误（logic_error）**表示程序本身的缺陷，理论上可在编码阶段避免。**运行时错误（runtime_error）**表示只有在运行时才能发现的问题。你也可以从标准类派生自定义异常：
+
+\code[cpp]{
+class FileNotFoundError : public std::runtime_error {
+public:
+    explicit FileNotFoundError(const std::string& path)
+        : std::runtime_error("文件未找到: " + path), path_(path) {}
+    const std::string& path() const { return path_; }
+private:
+    std::string path_;
+};
+}
+
+// 异常安全级别
+
+当函数执行到一半时抛了异常，对象和资源处于什么状态？**异常安全（Exception Safety）**回答的就是这个问题。C++ 社区定义了四个等级：
+
+\table{
+等级 | 保证 | 含义
+---
+无保证（No guarantee） | 无 | 异常后对象可能损坏
+基本保证（Basic guarantee） | 无泄漏 + 对象有效 | 状态可能改变但合法可用
+强保证（Strong guarantee） | 事务性 | 全部成功或回滚到调用前
+不抛保证（Nothrow guarantee） | 不抛异常 | 操作保证不抛出任何异常
+}
+
+大多数标准库操作至少提供**基本保证**。`std::vector::push_back` 扩容失败时提供强保证。析构函数和 `swap` 操作应提供不抛保证。实现强保证的经典手法是 **copy-and-swap 惯用法**：先在临时副本上完成所有可能失败的操作，再用不抛异常的 `swap` 交换到目标对象。
+
+// noexcept 规范
+
+`noexcept` 是对编译器和调用者的**承诺**："这个函数绝不抛异常"。违反承诺的结果是 `std::terminate()`——没有栈展开，没有第二次机会。
+
+为什么要用 `noexcept`？两个关键原因：一是**编译器优化**——不需要生成异常处理代码；二是 **STL 容器依赖它**——`std::vector` 扩容时，只有移动构造标记了 `noexcept` 才会用移动而非拷贝。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+
+struct Movable {
+    int id;
+    Movable(int d) : id(d) {}
+    Movable(Movable&& o) noexcept : id(o.id) {
+        std::cout << "移动 " << id << "\n";
+    }
+    Movable(const Movable& o) : id(o.id) {
+        std::cout << "拷贝 " << id << "\n";
+    }
+};
+
+struct NotNoexcept {
+    int id;
+    NotNoexcept(int d) : id(d) {}
+    NotNoexcept(NotNoexcept&& o) : id(o.id) {  // 没有noexcept!
+        std::cout << "移动(unsafe) " << id << "\n";
+    }
+    NotNoexcept(const NotNoexcept& o) : id(o.id) {
+        std::cout << "拷贝 " << id << "\n";
+    }
+};
+
+int main() {
+    std::cout << "=== 有 noexcept ===\n";
+    std::vector<Movable> v1;
+    v1.reserve(2);
+    v1.emplace_back(1);
+    v1.emplace_back(2);
+    std::cout << "-- 扩容 --\n";
+    v1.emplace_back(3);
+
+    std::cout << "\n=== 无 noexcept ===\n";
+    std::vector<NotNoexcept> v2;
+    v2.reserve(2);
+    v2.emplace_back(1);
+    v2.emplace_back(2);
+    std::cout << "-- 扩容 --\n";
+    v2.emplace_back(3); // 退化为拷贝！
+    return 0;
+}
+}
+
+`noexcept` 也支持**条件形式**：`noexcept(expr)` 在 `expr` 为 `true` 时才生效，模板代码中尤其有用：
+
+\code[cpp]{
+template<typename T>
+void my_swap(T& a, T& b) noexcept(std::is_nothrow_move_constructible_v<T>) {
+    T tmp = std::move(a);
+    a = std::move(b);
+    b = std::move(tmp);
+}
+}
+
+// RAII 与异常安全
+
+**RAII（Resource Acquisition Is Initialization，资源获取即初始化）**是 C++ 实现异常安全的核心武器。原理直接：资源获取在构造函数中，释放在析构函数中。栈展开时局部对象的析构函数被自动调用，资源不会泄漏。
+
+\tabs{
+\tab[不安全：裸指针]{
+\code[cpp]{
+void unsafe() {
+    int* p = new int(42);
+    might_throw();    // 抛异常 → 内存泄漏！
+    delete p;
+}
+}
+}
+\tab[安全：RAII]{
+\code[cpp]{
+void safe() {
+    auto p = std::make_unique<int>(42);
+    might_throw();    // 抛异常也没事
+    // unique_ptr 析构自动释放
+}
+}
+}
+}
+
+智能指针、`std::lock_guard`、`std::fstream` 这些 RAII 封装是异常安全代码的基石。
+
+// std::error_code 与 std::error_category
+
+对于操作系统交互场景（文件 I/O、网络、线程），C++11 引入了 `std::error_code` 和 `std::error_category`。它把错误码和分类绑定，避免了"不同库错误码编号冲突"的问题。
+
+\code[cpp]{
+#include <system_error>
+#include <fstream>
+#include <iostream>
+#include <cerrno>
+
+void try_open(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) {
+        std::error_code ec(errno, std::system_category());
+        std::cout << "错误: " << ec.message()
+                  << " (code=" << ec.value() << ")\n";
+        if (ec == std::errc::no_such_file_or_directory)
+            std::cout << "确认: 文件不存在\n";
+    }
+}
+}
+
+`std::error_code` 本质是一个整数加一个分类指针，不涉及堆分配或异常抛出，适合性能敏感路径。
+
+// std::expected（C++23）
+
+C++23 引入的 `std::expected<T, E>`（定义在 `<expected>` 中）表示"一个 `T` 值，**或者**一个 `E` 类型的错误"。它是 `std::optional` 的增强——`optional` 只能说"有没有"，`expected` 还能说"为什么没有"。
+
+\code[cpp]{
+#include <expected>
+#include <string>
+#include <charconv>
+
+enum class ParseError { Empty, InvalidFormat, Overflow };
+
+std::expected<int, ParseError> parse_int(std::string_view s) {
+    if (s.empty()) return std::unexpected(ParseError::Empty);
+    int value = 0;
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), value);
+    if (ec == std::errc::result_out_of_range)
+        return std::unexpected(ParseError::Overflow);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::unexpected(ParseError::InvalidFormat);
+    return value;
+}
+
+// monadic 链式操作
+auto doubled = parse_int("21").transform([](int x) { return x * 2; });
+int result = doubled.value_or(-1);  // 42
+}
+
+`std::expected` 的 **monadic 接口**（`transform`、`and_then`、`or_else`）让你像链条一样组合可能失败的操作，避免层层 `if-else` 嵌套。
+
+// 游戏引擎中的错误处理策略
+
+几乎所有主流游戏引擎（Unreal、id Tech）都**禁用或限制 C++ 异常**，原因有三：**性能**——栈展开涉及 RTTI 查找，在 60fps 主循环中不可接受；**二进制体积**——异常表增加可执行文件大小；**确定性**——异常的非本地跳转与帧时间预算矛盾。
+
+替代方案通常是：`assert` 处理编程错误，错误码 / `expected` 处理可恢复错误，日志加**优雅降级（Graceful Degradation）**处理非致命问题（如纹理缺失用粉色方块替代），致命错误直接 `abort()`。Unreal 的 `check` / `verify` / `ensure` 宏体系就是这种策略的典型实现，编译器通过 `-fno-exceptions` 或 `/EHs-` 禁用异常支持。
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11/14 时代，错误处理主要靠异常加手工错误码。`std::optional` 不存在，表达"可能没有值"只能用指针或哨兵值（`-1`、`nullptr`）。动态异常规范 `throw(int, double)` 虽已弃用但仍合法。
+
+new: C++17 彻底移除动态异常规范，引入 `std::optional` 和 `std::filesystem`（每个函数同时提供异常版和 error_code 重载）。C++23 引入 `std::expected<T, E>` 并配备 monadic 接口，是错误处理领域最重大的演进。
+}
+
+/// 工程实践
+
+\tip{**策略选择经验法则：**
+1. 构造函数失败 → 抛异常（没有返回值）
+2. 可预期的业务失败 → `std::expected` 或错误码
+3. 库的公开 API → 同时提供异常版和 `error_code` 重载
+4. 性能关键路径 → 绝不用异常
+5. 析构函数和 `swap` → 必须 `noexcept`
+6. 移动构造/赋值 → 始终标记 `noexcept`
+7. 捕获异常 → 用 `const` 引用：`catch (const std::exception& e)`
+}
+
+/// 难点易错点分析
+
+\danger{**析构函数中抛异常 = 程序终止！** 析构函数默认是 `noexcept`。如果析构中抛出异常且正在栈展开，就会触发 `std::terminate()`。**规则：永远不要让异常逃出析构函数。**}
+
+\warning{**忘记 `noexcept` 导致性能退化：** 移动构造没标记 `noexcept` 时，`std::vector` 扩容退化为拷贝。对大对象可能造成数量级的性能差异。}
+
+\quiz[tf]{
+Q: 标记了 `noexcept` 的函数如果实际抛出异常，编译器会静默忽略该异常。
+ANS: F
+EXP: 违反 `noexcept` 承诺的结果是 `std::terminate()`——程序直接终止，不会吞掉异常也不会做正常栈展开。
+}
+
+\quiz[choice]{
+Q: 以下哪种方式最适合在游戏引擎帧循环（热路径）中处理"资源加载失败"这类可恢复错误？
+A: throw / try-catch 异常
+B: std::expected 或错误码
+C: assert + abort
+D: 忽略错误继续执行
+ANS: B
+EXP: 帧循环是性能关键路径，异常抛出开销不可接受。`std::expected` 和错误码是零额外开销的传递方式。`assert` 用于编程错误，忽略错误会导致未定义行为。
+}
+
+/// 实战作业
+
+// 🟢 基础题：异常安全的除法计算器
+
+实现 `safe_divide` 函数，在除数为零时抛出异常，并在 `main` 中正确捕获。
+
+\run[cpp]{
+#include <iostream>
+#include <stdexcept>
+
+// TODO: 实现 safe_divide
+// - 除数 b 等于 0 时，抛出 std::invalid_argument("除数不能为零")
+// - 否则返回 a / b
+double safe_divide(double a, double b) {
+    /* TODO: 你的代码 */
+    return 0.0;
+}
+
+int main() {
+    // 测试 1: 正常除法
+    try {
+        double r = safe_divide(10.0, 3.0);
+        std::cout << "10 / 3 = " << r << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "不应该到这里\n";
+    }
+
+    // 测试 2: 除以零
+    try {
+        double r = safe_divide(5.0, 0.0);
+        std::cout << "不应该到这里: " << r << "\n";
+    } catch (const std::invalid_argument& e) {
+        std::cout << "正确捕获: " << e.what() << "\n";
+    }
+
+    // 测试 3: 连续计算
+    try {
+        double a = safe_divide(100.0, 4.0);
+        double b = safe_divide(a, 5.0);
+        std::cout << "100 / 4 / 5 = " << b << "\n";
+    } catch (const std::exception& e) {
+        std::cout << "异常: " << e.what() << "\n";
+    }
+    return 0;
+}
+}
+
+// 🟡 进阶题：用 std::expected 实现配置解析器
+
+实现 `parse_config_line`，解析 `"key=value"` 格式的字符串，用 `std::expected` 返回结果或错误。
+
+\run[cpp23]{
+#include <iostream>
+#include <expected>
+#include <string>
+#include <string_view>
+#include <utility>
+
+enum class ConfigError { EmptyInput, MissingEquals, EmptyKey, EmptyValue };
+
+const char* to_cstr(ConfigError e) {
+    switch (e) {
+        case ConfigError::EmptyInput:    return "输入为空";
+        case ConfigError::MissingEquals: return "缺少 =";
+        case ConfigError::EmptyKey:      return "键为空";
+        case ConfigError::EmptyValue:    return "值为空";
+    }
+    return "?";
+}
+
+// TODO: 实现 parse_config_line
+// 成功: 返回 pair<string,string>{key, value}
+// 失败: 返回对应的 ConfigError
+std::expected<std::pair<std::string, std::string>, ConfigError>
+parse_config_line(std::string_view line) {
+    /* TODO: 你的代码 */
+    return std::unexpected(ConfigError::EmptyInput);
+}
+
+int main() {
+    for (auto input : {"name=Alice", "count=42", "",
+                       "noequals", "=value", "key="}) {
+        auto result = parse_config_line(input);
+        if (result) {
+            auto& [k, v] = *result;
+            std::cout << "OK: [" << k << "]=[" << v << "]\n";
+        } else {
+            std::cout << "ERR \"" << input << "\": "
+                      << to_cstr(result.error()) << "\n";
+        }
+    }
+    return 0;
+}
+}
+
+// 🔴 挑战题：健壮的 INI 文件解析器
+
+设计并实现一个简易 INI 格式解析器，综合运用本章的错误处理技术：
+
+\list{
+- 支持 `[section]` 分区和 `key=value` 键值对，跳过空行和 `;` 开头的注释
+- 返回类型为 `std::expected<Config, ParseError>`
+- `ParseError` 包含错误类型枚举、行号 `int line`、描述 `std::string message`
+- `Config` 为 `std::map<std::string, std::map<std::string, std::string>>`
+- 所有操作满足至少基本异常安全保证
+- 额外挑战：同时实现异常版和 expected 版，对比代码风格
+}
+
+\collapse[参考思路]{
+1. 定义 `enum class ErrorKind { InvalidSection, InvalidKeyValue, DuplicateKey }`
+2. 逐行处理：跳过空行和注释，判断 `[section]` 或 `key=value`
+3. 每个辅助函数返回 `expected<解析结果, ParseError>`
+4. 主循环中用 `if (!result)` 提前返回错误
+5. 异常版用 `throw ParseException`，正常路径更简洁
+6. expected 版错误路径更显式，调用者被迫处理每种错误
+}

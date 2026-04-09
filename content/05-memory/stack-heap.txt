@@ -1,0 +1,613 @@
+/// 简介
+
+上一节我们了解了 C++ 给予程序员直接管理内存的权力——但权力意味着责任。在你写下 `int x = 10;` 和 `new int(10)` 时，这两个 10 被放在了完全不同的地方，它们的生命周期、访问速度、失败模式也截然不同。如果你不清楚它们的区别，就像开车不看仪表盘——迟早会翻车。
+
+本节我们要搞清楚三件事：你的程序的内存长什么样（进程内存布局）、**栈（Stack）** 和**堆（Heap）** 分别怎么工作、以及在实际项目（尤其是游戏引擎）中如何做出正确的分配选择。
+
+/// 知识点列表
+
+\list{
+- 进程内存布局（Process Memory Layout）：代码段、数据段、BSS、堆、栈
+- 栈内存（Stack Memory）：自动变量、栈帧、LIFO、栈溢出
+- 堆内存（Heap Memory）：new/delete、malloc/free、堆碎片
+- 函数调用与栈帧（Call Stack）
+- 栈 vs 堆的性能差异（缓存友好性、分配速度）
+- 栈上数组 vs 堆上数组
+- 大对象分配策略
+- 递归与栈深度（Recursion & Stack Depth）
+}
+
+/// 知识点详解
+
+// 进程内存布局
+
+当操作系统加载一个 C++ 程序时，会为它划分出一块**虚拟地址空间（Virtual Address Space）**。这块空间不是杂乱无章的——它被分成几个区域，各司其职。
+
+\diagram[memory]{
+stack:
+  [高地址] 栈 (Stack) ↓ 向低地址增长
+  [      ] （空闲区域）
+  [      ] 堆 (Heap) ↑ 向高地址增长
+  [      ] BSS段 (未初始化全局变量)
+  [      ] 数据段 .data (已初始化全局变量)
+  [低地址] 代码段 .text (机器指令)
+}
+
+\list{
+- **代码段（.text）**：存放编译后的机器指令，通常只读
+- **数据段（.data）**：存放已初始化的全局变量和 `static` 变量
+- **BSS 段（Block Started by Symbol）**：存放未初始化的全局变量，程序启动时自动清零，不占用可执行文件体积
+- **堆（Heap）**：从低地址向高地址增长，通过 `new`/`malloc` 手动申请
+- **栈（Stack）**：从高地址向低地址增长，由编译器自动管理
+}
+
+中间那块空闲区域让堆和栈可以各自生长，直到"碰头"——此时内存耗尽。
+
+\run[cpp]{
+#include <iostream>
+
+int globalInit = 42;          // .data 段
+int globalUninit;             // BSS 段（自动初始化为 0）
+
+int main() {
+    int stackVar = 10;                  // 栈
+    int* heapVar = new int(20);         // 堆
+
+    std::cout << "数据段 (globalInit):    " << &globalInit         << "\n";
+    std::cout << "BSS段  (globalUninit):  " << &globalUninit       << "\n";
+    std::cout << "栈     (stackVar):      " << &stackVar           << "\n";
+    std::cout << "堆     (heapVar指向):   " << heapVar             << "\n";
+    // 观察：栈地址 >> 堆地址 >> 全局变量地址
+    delete heapVar;
+    return 0;
+}
+}
+
+\note{运行后观察各地址大小关系。栈地址最大（最高），全局变量地址较低。具体数值因系统而异，但**相对顺序**在主流平台上一致。}
+
+// 栈内存：自动变量与栈帧
+
+**栈（Stack）** 的核心特征是 **LIFO（Last In, First Out，后进先出）**。每当一个函数被调用，系统会在栈顶"压入"一个**栈帧（Stack Frame）**，其中包含：
+
+\list{
+- 函数的局部变量（**自动变量，Automatic Variable**）
+- 函数参数的副本
+- 返回地址（调用结束后回到哪里继续执行）
+- 保存的寄存器值
+}
+
+函数返回时，栈帧被"弹出"，所有局部变量瞬间失效——不需要逐个释放，栈指针（Stack Pointer）往回移动一步就行。
+
+\code[cpp]{
+void innerFunc() {
+    int a = 1;        // ← innerFunc 的栈帧中
+    double b = 2.0;   // ← 也在 innerFunc 的栈帧中
+}   // 函数结束 → 栈指针回退 → a、b 的内存被"回收"
+
+void outerFunc() {
+    int x = 10;       // ← outerFunc 的栈帧中
+    innerFunc();       // innerFunc 的栈帧压在 outerFunc 之上
+    // innerFunc 返回后，其栈帧已弹出，x 仍然有效
+}
+}
+
+为什么栈分配这么快？因为"分配"只是把栈指针减小一个偏移量——**一条 CPU 指令**。没有搜索空闲块，没有系统调用，没有线程锁。"释放"也一样——栈指针往回移。
+
+\warning{栈的大小是**固定的**。Windows 默认约 1 MB，Linux 默认约 8 MB。一旦栈帧累积超过这个限制，就会发生**栈溢出（Stack Overflow）**——程序直接崩溃，无法捕获、无法恢复。}
+
+// 堆内存：new/delete 与 malloc/free
+
+当你需要的内存大小在编译时无法确定，或者需要的对象必须在函数返回后继续存活，就需要用到**堆（Heap）**。
+
+\code[cpp]{
+// C++ 风格：new / delete
+int* p1 = new int(42);           // 堆上分配，初始化为 42
+int* arr = new int[1000];        // 堆上分配数组
+delete p1;                        // 释放单个对象
+delete[] arr;                     // 释放数组（必须用 delete[]！）
+
+// C 风格：malloc / free（C++ 中不推荐）
+int* p2 = (int*)malloc(sizeof(int));  // 不调用构造函数
+free(p2);                              // 不调用析构函数
+}
+
+堆分配的底层过程比栈复杂得多：
+
+\steps{
+\step[应用层请求]{
+代码执行 `new int(42)`，编译器将其翻译为对 `operator new(sizeof(int))` 的调用。
+}
+\step[分配器搜索空闲块]{
+**堆分配器（Heap Allocator）** 维护着一个**空闲链表（Free List）**。它需要在空闲块中找到一个大小合适的块——这是一个搜索过程，有开销。
+}
+\step[可能触发系统调用]{
+如果空闲链表里没有合适的块，分配器会向操作系统请求更多内存（Linux 上是 `sbrk`/`mmap`，Windows 上是 `VirtualAlloc`）。系统调用非常昂贵。
+}
+\step[返回地址]{
+找到或获得合适的块后，标记为已用，返回地址给调用者。然后在这块地址上构造对象。
+}
+}
+
+\danger{`new` 和 `delete` 必须配对，`new[]` 和 `delete[]` 必须配对。混用会导致**未定义行为（Undefined Behavior, UB）**——在实际项目中可能表现为内存泄漏、数据损坏甚至安全漏洞。}
+
+// 函数调用与栈帧
+
+当函数 A 调用函数 B，B 再调用函数 C 时，栈帧的排列顺序是这样的：
+
+\diagram[memory]{
+stack:
+  [栈顶] funcC 的栈帧: int c = 30
+  [    ] funcB 的栈帧: int b = 20, 返回地址→A
+  [    ] funcA 的栈帧: int a = 10, 返回地址→main
+  [栈底] main 的栈帧: argc, argv
+}
+
+这个嵌套结构就是**调用栈（Call Stack）**。当你在调试器中看到的"调用堆栈"窗口，展示的就是当前时刻所有未返回函数的栈帧。
+
+\run[cpp]{
+#include <iostream>
+
+void funcC() {
+    int c = 30;
+    std::cout << "funcC 中 c 的地址: " << &c << "\n";
+}
+
+void funcB() {
+    int b = 20;
+    std::cout << "funcB 中 b 的地址: " << &b << "\n";
+    funcC();
+}
+
+void funcA() {
+    int a = 10;
+    std::cout << "funcA 中 a 的地址: " << &a << "\n";
+    funcB();
+}
+
+int main() {
+    int m = 0;
+    std::cout << "main  中 m 的地址: " << &m << "\n";
+    funcA();  // 观察：地址依次递减（栈向低地址增长）
+    return 0;
+}
+}
+
+// 栈 vs 堆的性能差异
+
+性能差异不仅在分配速度上——**缓存友好性（Cache Friendliness）** 是另一个关键因素。
+
+\table{
+维度 | 栈（Stack） | 堆（Heap）
+---
+分配速度 | ~1 ns（移动指针） | ~100–1000 ns（搜索空闲块，可能系统调用）
+释放速度 | ~1 ns（移动指针） | ~50–200 ns（合并空闲块）
+缓存命中率 | 极高（数据连续、局部性好） | 较低（地址分散，容易 cache miss）
+线程安全 | 天然安全（每个线程有独立栈） | 需要加锁（全局堆被多线程共享）
+大小限制 | 1–8 MB（固定） | 可用物理内存 + 虚拟内存
+碎片化风险 | 无（LIFO 结构保证连续） | 有（频繁分配/释放产生碎片）
+}
+
+栈上的数据天然是紧凑排列的，CPU 一次**缓存行（Cache Line）** 加载 64 字节，往往能把接下来要用的数据也带进来。而堆上分配的对象可能散落在内存各处，每次访问都可能触发**缓存未命中（Cache Miss）**，需要从主存重新加载——慢上百倍。
+
+\collapse[🤔 为什么缓存未命中这么慢？]{
+现代 CPU 的 L1 缓存延迟约 1 ns，主存延迟约 50–100 ns。数据不在缓存中时，CPU 必须等待主存——慢几十倍。游戏引擎每帧处理上万对象，若每次访问都 cache miss，帧率会严重下降。这就是**数据导向设计（Data-Oriented Design, DOD）** 的动机——把同类数据紧凑存储在连续内存中。
+}
+
+// 栈上数组 vs 堆上数组
+
+在游戏开发中，你经常需要处理一组数据——比如一帧内所有需要更新的实体。选择把数组放在栈上还是堆上，影响很大。
+
+\code[cpp]{
+void stackArray() {
+    int scores[100];           // 栈上：100 * 4 = 400 字节，零分配开销
+}
+void heapArray(int n) {
+    std::vector<int> scores(n); // 堆上：大小运行时确定，灵活可扩容
+}
+}
+
+什么时候用栈上数组？什么时候用堆上数组？
+
+\table{
+场景 | 推荐方案 | 原因
+---
+大小编译时已知且较小（< 几 KB） | 栈上 C 数组 或 `std::array` | 零分配开销
+大小运行时确定 | `std::vector` | 安全且灵活
+需要在函数返回后继续使用 | `std::vector` 或 `std::unique_ptr<T[]>` | 栈帧弹出后栈数组失效
+临时缓冲区（每帧重置） | 栈上数组或预分配的 `vector` | 避免每帧 new/delete
+}
+
+\warning{**切勿在栈上声明超大数组。** `int huge[1000000];` 约占 4 MB，在 Windows 的 1 MB 默认栈上直接溢出。大数组一律用 `std::vector`。}
+
+// 大对象分配策略
+
+在游戏引擎中，频繁的堆分配/释放是性能杀手。以下是几种常见的应对策略：
+
+**1. 对象池（Object Pool）**：预分配一大块内存，内部自行管理。需要对象时从池中取，不需要时还回去——避免反复调用系统分配器。
+
+\code[cpp]{
+// 简化的对象池概念
+template<typename T, size_t PoolSize>
+class ObjectPool {
+    std::array<T, PoolSize> pool_;
+    std::array<bool, PoolSize> inUse_{};
+public:
+    T* acquire() {
+        for (size_t i = 0; i < PoolSize; ++i)
+            if (!inUse_[i]) { inUse_[i] = true; return &pool_[i]; }
+        return nullptr;
+    }
+    void release(T* obj) {
+        inUse_[obj - &pool_[0]] = false;
+    }
+};
+}
+
+**2. 帧分配器（Frame Allocator）**：每帧开始时重置指针到起点，这一帧的所有临时分配从上次重置位置开始线性增长，帧结束时直接重置——所有分配瞬间"释放"。
+
+**3. 栈分配器（Stack Allocator）**：和帧分配器类似，但支持按 LIFO 顺序释放。
+
+\tip{在实际游戏引擎（如 Unreal Engine、Unity 的 C++ 核心层）中，几乎所有性能敏感路径都使用自定义分配器，而非直接调用 `new`/`delete`。标准库的 `std::pmr`（Polymorphic Memory Resource，多态内存资源）从 C++17 开始就是为此设计的。}
+
+// 递归与栈深度
+
+每一次递归调用都会在栈上压入一个新的栈帧。如果递归深度过大，栈帧的累积会耗尽栈空间。
+
+\run[cpp]{
+#include <iostream>
+
+// 计算阶乘 —— 递归版本
+long long factorialRecursive(int n) {
+    if (n <= 1) return 1;
+    return n * factorialRecursive(n - 1);  // 每次调用 → 新栈帧
+}
+
+// 计算阶乘 —— 迭代版本（不消耗额外栈帧）
+long long factorialIterative(int n) {
+    long long result = 1;
+    for (int i = 2; i <= n; ++i) {
+        result *= i;  // 始终在同一个栈帧中
+    }
+    return result;
+}
+
+int main() {
+    std::cout << "递归: 10! = " << factorialRecursive(10) << "\n";
+    std::cout << "迭代: 10! = " << factorialIterative(10) << "\n";
+
+    // 试试 factorialRecursive(1000000) —— 栈溢出！
+    // 迭代版本则不会有这个问题（虽然会溢出 long long 的数值范围）
+    return 0;
+}
+}
+
+递归过深导致栈溢出是常见问题，例如游戏中的**路径搜索（Pathfinding）** 用朴素递归在大地图上很容易炸栈。
+
+\table{
+问题 | 解决方案
+---
+递归太深导致栈溢出 | 改用迭代 + 显式栈（`std::stack`）
+每个栈帧太大导致栈溢出 | 缩小局部变量（大数组放堆上）
+默认栈太小不够用 | 调整栈大小（MSVC: `/STACK:size`，GCC/Linux: `ulimit -s`）
+尾递归优化（Tail Recursion） | 编译器可能自动优化，但 C++ **不保证**
+}
+
+\collapse[🤔 什么是尾递归？]{
+**尾递归（Tail Recursion）** 是指递归调用是函数的最后一步操作。理论上编译器可将其优化为循环，但 C++ 标准**不保证**此优化。GCC/Clang 在 `-O2` 下通常会做，MSVC 较保守。对栈深度敏感的代码，主动改写为迭代才安全。
+}
+
+// 堆碎片化
+
+堆内存在反复分配和释放后，会出现**碎片化（Fragmentation）**——可用内存总量足够，但没有足够大的连续空闲块。
+
+\code[text]{
+碎片化：[已用][空闲4B][已用][空闲4B][已用][空闲4B]
+总空闲 = 12B，但需要 8B 连续块 → 分配失败！
+}
+
+碎片化分两种：
+- **外部碎片（External Fragmentation）**：空闲块太小太分散，无法满足大分配请求
+- **内部碎片（Internal Fragmentation）**：分配器出于对齐要求给了比请求更大的块（比如你要 7 字节，给了 8 字节），多出的部分被浪费
+
+在长时间运行的游戏服务器或持续运行的游戏客户端中，碎片化会逐渐恶化，导致分配变慢、内存利用率下降。
+
+/// 新版特性（C++17/20/23）
+
+// C++17: std::pmr 多态内存资源
+
+C++17 引入了 `std::pmr`（**Polymorphic Memory Resource，多态内存资源**）命名空间——"官方认证的自定义内存池接口"。
+
+\code[cpp]{
+#include <memory_resource>
+#include <vector>
+
+char buffer[4096];
+std::pmr::monotonic_buffer_resource pool{buffer, sizeof(buffer)};
+std::pmr::vector<int> vec{&pool};  // 从 pool 分配，不触发系统 new
+vec.push_back(1);
+vec.push_back(2);
+}
+
+// C++20: std::span 与 C++23 改进
+
+C++20 的 `std::span` 是一个轻量级**视图（View）**，引用连续内存但不拥有它——不分配、不拷贝。C++23 引入了 `std::stacktrace` 标准化调用栈追踪，对调试内存问题极其有用。
+
+\code[cpp]{
+#include <span>
+#include <vector>
+
+void process(std::span<int> data) {
+    for (int& val : data) { val *= 2; }
+}
+
+int stackArr[5] = {1, 2, 3, 4, 5};
+std::vector<int> heapVec = {6, 7, 8, 9, 10};
+process(stackArr);   // 传入栈上数组
+process(heapVec);    // 传入堆上 vector，零拷贝
+}
+
+\compare{
+old: C++11 之前，自定义分配器接口繁琐（需要满足 Allocator 概念的 20+ 个接口要求），实际很少有人用。堆分配追踪只能靠第三方工具。
+
+new: C++17 `std::pmr` 大幅简化了自定义分配器的使用门槛；C++20 `std::span` 避免了许多不必要的堆分配（不用为了传参而拷贝到 vector）；C++23 `std::stacktrace` 让内存问题的调试更加标准化。趋势：让"零成本抽象"延伸到内存管理层面。
+}
+
+/// 工程实践
+
+// 实际项目中的内存策略
+
+\list{
+- **默认使用栈和 RAII 容器**：局部变量用栈，动态大小用 `std::vector`，独占所有权用 `std::unique_ptr`，不直接写 `new`/`delete`
+- **大数组不放栈上**：超过几 KB 一律用 `vector`
+- **性能热点用自定义分配器**：帧分配器、对象池、`std::pmr` 等
+- **测量先于优化**：用 ASan / Valgrind / Tracy 分析分配热点
+}
+
+\table{
+工具/方法 | 用途 | 平台
+---
+`-fsanitize=address` | 检测越界、use-after-free、泄漏 | GCC / Clang
+Valgrind (memcheck) | 详细的内存错误检测 | Linux
+Visual Studio 诊断工具 | 内存快照、泄漏检测 | Windows / MSVC
+`std::pmr` | 标准化自定义分配器 | C++17+
+Tracy / heaptrack | 实时内存分配分析 | 跨平台
+}
+
+/// 难点易错点分析
+
+\danger{**错误 1：返回局部变量的地址或引用。** 函数返回后栈帧被回收，返回的指针变成**悬空指针（Dangling Pointer）**：}
+
+\code[cpp]{
+int* bad() {
+    int x = 42;
+    return &x;      // 错误！x 在函数返回后不存在
+}
+
+// 正确做法
+std::unique_ptr<int> good() {
+    return std::make_unique<int>(42);  // 堆上分配，所有权转移
+}
+// 或直接返回值（编译器会做 RVO 优化，不会真正拷贝）
+int best() {
+    return 42;
+}
+}
+
+\danger{**错误 2：栈上声明超大数组。** 在默认栈大小为 1 MB 的 Windows 上：}
+
+\code[cpp]{
+void crash() {
+    double matrix[500][500];  // 500 * 500 * 8 = 2,000,000 字节 ≈ 2 MB → 栈溢出！
+}
+void safe() {
+    std::vector<std::vector<double>> matrix(500, std::vector<double>(500));
+    // 堆上分配，不受栈大小限制
+}
+}
+
+\danger{**错误 3：new/delete 与 new[]/delete[] 混用。**}
+
+\code[cpp]{
+int* arr = new int[100];
+delete arr;    // 错误！应该用 delete[] arr;
+               // 结果是未定义行为——可能泄漏、可能崩溃
+}
+
+\danger{**错误 4：依赖 VLA（变长数组）。** `int arr[n]`（n 为运行时变量）不是标准 C++，虽然 GCC 作为扩展支持，但不可移植。用 `std::vector<int>(n)` 代替。}
+
+\quiz[choice]{
+Q: 以下哪个操作**不会**导致栈溢出？
+A: 在函数中声明 `int arr[10000000];`
+B: 递归调用自身 100 万次，每次创建 100 字节的局部变量
+C: 在 main 中创建 `std::vector<int>(10000000)`
+D: 调用 `alloca(10000000)` 在栈上分配 10 MB
+ANS: C
+EXP: `std::vector` 在**堆上**分配内存，不占用栈空间。只有 vector 对象本身（通常 24 字节：指针 + size + capacity）在栈上。其余三个选项都在栈上分配大量内存，很可能导致栈溢出。
+}
+
+\quiz[tf]{
+Q: 栈上分配内存需要调用操作系统的系统调用（如 `mmap` 或 `VirtualAlloc`）。
+ANS: F
+EXP: 栈分配只是移动栈指针（一条 CPU 指令），不涉及系统调用。堆分配在空闲链表耗尽时才可能需要系统调用。
+}
+
+\quiz[choice]{
+Q: 在一个游戏引擎中，每帧需要分配和释放上千个临时粒子对象。最佳策略是？
+A: 每个粒子用 `new` 分配，用完 `delete`
+B: 用 `std::vector<Particle>` 预分配好足够容量，每帧清空后复用
+C: 每帧用 `malloc` 分配一个大块，手动管理偏移
+D: 用全局数组 `Particle particles[MAX]` 放在栈上
+ANS: B
+EXP: 预分配的 `vector` 避免了每帧反复分配/释放的开销。`clear()` 不释放内存，只重置 `size`，下一帧直接复用已有容量。选项 A 开销太大，C 容易出错且不类型安全，D 放在栈上受限于栈大小且 MAX 必须编译时确定。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：观察栈与堆的地址分布
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+
+int globalVar = 100;
+
+void showAddresses() {
+    int stackVar = 200;
+    int* heapVar = new int(300);
+
+    std::cout << "全局变量地址: " << &globalVar << "\n";
+    std::cout << "栈变量地址:   " << &stackVar  << "\n";
+    std::cout << "堆变量地址:   " << heapVar     << "\n";
+    /* TODO: 声明 stackVar2 和 heapVar2，打印地址，观察栈/堆地址间距 */
+
+    delete heapVar;
+}
+
+int main() {
+    showAddresses();
+    return 0;
+}
+}
+
+// 🟢 基础题 2：改递归为迭代
+
+\run[cpp]{
+#include <iostream>
+#include <stack>
+
+// 递归版：计算斐波那契数列第 n 项
+int fibRecursive(int n) {
+    if (n <= 1) return n;
+    return fibRecursive(n - 1) + fibRecursive(n - 2);
+}
+
+// TODO: 写迭代版本（提示：两个变量记录前两项，循环推进）
+int fibIterative(int n) {
+    /* TODO: 你的代码 */
+    return 0;
+}
+
+int main() {
+    for (int i = 0; i < 10; ++i)
+        std::cout << "fib(" << i << ") = " << fibRecursive(i)
+                  << " / " << fibIterative(i) << "\n";
+    // fibIterative(50) 应该能正常运行
+    // fibRecursive(50) 虽然不会栈溢出，但会因为指数级时间复杂度而极慢
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：简易帧分配器
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+#include <cassert>
+
+// 帧分配器：预分配大块内存，每次分配移动偏移指针，帧结束一次性重置
+class FrameAllocator {
+    char* buffer_;
+    size_t capacity_;
+    size_t offset_;
+public:
+    FrameAllocator(size_t capacity)
+        : buffer_(new char[capacity]), capacity_(capacity), offset_(0) {}
+    
+    ~FrameAllocator() { delete[] buffer_; }
+
+    // TODO: 实现 allocate（检查容量→记录当前offset→offset+=size→返回地址）
+    void* allocate(size_t size) {
+        /* TODO: 你的代码 */
+        return nullptr;
+    }
+
+    // TODO: 实现 reset 方法（一行代码即可）
+    void reset() {
+        /* TODO: 你的代码 */
+    }
+
+    size_t used() const { return offset_; }
+};
+
+int main() {
+    FrameAllocator alloc(1024);  // 1 KB 的帧内存
+
+    // 模拟一帧中的分配
+    int* scores = static_cast<int*>(alloc.allocate(sizeof(int) * 10));
+    float* positions = static_cast<float*>(alloc.allocate(sizeof(float) * 3));
+    if (scores && positions) {
+        scores[0] = 100; positions[0] = 1.5f;
+        std::cout << "已使用: " << alloc.used() << " / 1024 字节\n";
+    }
+
+    // 帧结束，一次性重置
+    alloc.reset();
+    std::cout << "重置后已使用: " << alloc.used() << " 字节\n";
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：对比栈/堆分配性能
+
+\run[cpp]{
+#include <iostream>
+#include <chrono>
+#include <vector>
+#include <memory>
+
+// TODO: 完善 benchmarkStack 和 benchmarkHeap 函数
+// 目标：对比在循环中进行栈分配 vs 堆分配的性能差异
+
+void benchmarkStack(int iterations) {
+    auto start = std::chrono::high_resolution_clock::now();
+    volatile int sink = 0;
+    for (int i = 0; i < iterations; ++i) {
+        int arr[64]; arr[0] = i; sink += arr[0];
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    std::cout << "栈分配 " << iterations << " 次: " << us << " us\n";
+}
+
+void benchmarkHeap(int iterations) {
+    auto start = std::chrono::high_resolution_clock::now();
+    volatile int sink = 0;
+    for (int i = 0; i < iterations; ++i) {
+        /* TODO: 堆上分配 64 个 int 并释放（用 new[]/delete[] 或 make_unique） */
+    }
+    auto end = std::chrono::high_resolution_clock::now();
+    auto us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+    std::cout << "堆分配 " << iterations << " 次: " << us << " us\n";
+}
+
+int main() {
+    const int N = 1000000;
+    benchmarkStack(N);
+    benchmarkHeap(N);
+    // 预期：堆版本慢很多倍
+    return 0;
+}
+}
+
+// 🔴 挑战题：游戏实体内存池
+
+设计一个类型安全的**对象池（Object Pool）**，用于管理游戏中的子弹（Bullet）实体：
+
+\list{
+- 预分配固定数量（如 1000）的 `Bullet` 对象的内存空间
+- 提供 `spawn()` 方法：从池中获取一个空闲 Bullet，调用构造函数初始化，返回指针
+- 提供 `despawn(Bullet*)` 方法：调用析构函数，将内存槽标记为空闲
+- 不允许使用 `new`/`delete`（池初始化时的大块分配除外）
+- 池满时 `spawn()` 返回 `nullptr`
+- 验收：在循环中 spawn/despawn 10 万次，对比与 `new`/`delete` 的性能差异
+}
+
+\collapse[参考思路]{
+1. 用 `alignas(alignof(Bullet)) char buffer[sizeof(Bullet) * MAX]` 预分配原始内存
+2. 维护空闲索引栈（`std::stack<size_t>`），初始时所有索引入栈
+3. `spawn()` 弹出索引，用 **placement new** 构造：`new (&buffer[idx * sizeof(Bullet)]) Bullet(...);`
+4. `despawn()` 手动调用 `bullet->~Bullet()`，索引压回栈
+5. 用 `alignas` 保证内存对齐
+进阶：满时自动扩容，或用 `std::pmr::pool_resource` 简化。
+}

@@ -1,0 +1,470 @@
+/// 简介
+
+变量是程序的"记忆"。没有变量，程序就像一条金鱼——算完就忘。想象一下，你告诉计算机"把3和5加起来"，它算出8……然后呢？没了。变量让你**把数据存起来，之后可以读取、修改、传递**。
+
+上一节我们学了怎么输出 `Hello World`，但那只是让程序"说话"。这一节，我们教程序"记东西"。学完这节你能做到：声明变量、初始化变量、区分 `const` 和 `constexpr`、理解作用域。
+
+常量则是"不允许修改的变量"——一旦设定就不能再改了，像刻在石碑上的数字。
+
+/// 知识点列表
+
+\list{
+- 什么是变量？——带标签的盒子
+- 变量的声明和初始化——创建盒子并放东西
+- 变量命名规则——什么名字合法，什么好
+- auto——让编译器猜类型
+- const——运行时不可修改的常量
+- constexpr——编译期就确定的常量
+- 作用域（Scope）——变量的"生命范围"
+- 多变量声明——一行声明多个变量的坑
+}
+
+/// 知识点详解
+
+// 什么是变量？
+
+为什么需要变量？来，先看一个没有变量的"反面教材"：
+
+\code[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    cout << 3 + 5 << endl;   // 输出8，但……8存在哪了？
+    // 我想再用这个结果？没门。
+}
+}
+
+加了8，但没存！下次要用得重新算。这就是"金鱼记忆"。
+
+**类比：** 变量就是一个**带标签的盒子**。
+
+- 盒子有**名字**（标签），比如 `age`
+- 盒子有**类型**（大小和形状），比如 `int`（只能放整数）
+- 盒子里有**值**（内容），比如 `19`
+
+\code[cpp]{
+int age = 19;
+//  ^    ^    ^
+//  |    |    |
+// 类型  名字  值
+}
+
+你可以随时打开盒子看里面的值（读取），也可以换一个新值放进去（修改）。来，动手试一下——点击"运行"按钮看看效果：
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int age = 19;           // 创建盒子，放入19
+    cout << "age = " << age << endl;    // 打开盒子看
+
+    age = 20;               // 把19拿出来，放入20
+    cout << "age = " << age << endl;    // 再看
+
+    int score = age + 80;   // 用age的值算出新值，存到score
+    cout << "score = " << score << endl;
+
+    return 0;
+}
+}
+
+看到了吗？`age` 先是 `19`，被改成了 `20`，然后还可以拿来做运算。这就是变量的威力——**存值、改值、用值**。
+
+下面这张图展示了 `int age = 19;` 在内存里长什么样：
+
+\diagram[memory]{
+stack:
+  [0x7ff4] int age = 19
+  [0x7ff0] int score = 99
+}
+
+每个变量在内存中占一小块空间，有自己的地址（Address）。`int` 类型通常占 4 个字节。你不需要记地址，编译器帮你管，但知道"变量 = 内存中的一块空间"这个概念很重要。
+
+// 声明 vs 初始化
+
+这里有两个关键词必须分清楚：
+
+- **声明（Declaration）**：告诉编译器"我要一个叫 `x` 的 `int` 型变量"
+- **初始化（Initialization）**：在声明的同时给变量一个值
+
+\steps{
+\step[第一步：只声明不初始化（危险！）]{
+\code[cpp]{
+int x;          // 声明了x，但没放东西。里面是啥？随机的！
+}
+这就像拿了一个二手盒子，里面可能残留着上一个程序的"垃圾"。
+}
+\step[第二步：声明 + 初始化（正确做法）]{
+\code[cpp]{
+int y = 10;     // 声明并放入10（拷贝初始化）
+int z{20};      // 声明并放入20（列表初始化，C++11推荐）
+int w(30);      // 声明并放入30（直接初始化）
+}
+三种写法都合法，`{}` 写法最安全——它会在类型不匹配时报错，比如 `int n{3.14};` 会编译出错，提示你可能丢精度。
+}
+\step[第三步：先声明后赋值]{
+\code[cpp]{
+int x;          // 先声明
+x = 5;          // 后赋值（x现在是5了）
+}
+这样做合法，但存在一个时间窗口：从声明到赋值之间，`x` 的值是垃圾。能合并的话，**永远声明时就初始化**。
+}
+}
+
+\danger{**声明但不初始化的变量，里面的值是"垃圾值"（随机的）！** 这是C++和很多其他语言的重大区别。Python会给默认值、Java局部变量不初始化会编译报错，但C++不会拦你——它默默地给你一个脏盒子，你读到的可能是任何东西。这叫**未定义行为（Undefined Behavior，简称 UB）**。}
+
+先错后对——来看看未初始化变量有多危险：
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int x;              // 故意不初始化
+    cout << "x = " << x << endl;  // 输出什么？每次可能不同！
+
+    // 修正版：
+    int y = 0;          // 好习惯：声明时立刻初始化
+    cout << "y = " << y << endl;  // 这次确定是0
+
+    return 0;
+}
+}
+
+\tip{**黄金法则：声明变量时永远立刻初始化。** 写 `int x = 0;` 而不是 `int x;`。这一个习惯就能帮你避免一大类诡异的 bug。}
+
+// 变量命名规则
+
+变量名不是随便取的，C++ 有几条硬性规定（违反了编译不过），还有大家约定俗成的软性惯例（违反了不报错但会被同事嫌弃）。
+
+\code[cpp]{
+// ✅ 合法的变量名
+int playerHealth = 100;   // 字母开头，驼峰命名
+int player_health = 100;  // 字母开头，下划线分隔
+int _count = 0;           // 下划线开头（合法但通常留给系统用）
+int x1 = 5;               // 字母+数字
+
+// ❌ 非法的变量名（编译不过）
+int 1st_place = 1;    // 不能以数字开头
+int my-score = 0;     // 不能用连字符（编译器以为你在做减法）
+int int = 5;          // 不能用关键字做名字
+int my score = 0;     // 不能有空格
+}
+
+\note{**命名惯例（Naming Conventions）——不是语法要求，但大家都这么做：**
+- 变量用**小驼峰**（camelCase）：`playerHealth`、`isAlive`、`maxSpeed`
+- 或者用**蛇形命名**（snake_case）：`player_health`、`is_alive`、`max_speed`
+- 选一种风格，全项目保持一致
+- 名字要有**意义**：`ph` 不好，`playerHealth` 好；`t` 不好，`temperature` 好}
+
+// auto——让编译器猜类型
+
+有时候类型很长或者从右边的值就能一眼看出来，你可以用 `auto` 让编译器自己推断（Type Deduction）：
+
+\code[cpp]{
+auto x = 42;          // 编译器推断：x 是 int
+auto pi = 3.14;       // 编译器推断：pi 是 double
+auto name = "Pan";    // 编译器推断：name 是 const char*（C风格字符串指针）
+auto alive = true;    // 编译器推断：alive 是 bool
+}
+
+\warning{**`auto` 必须在声明时就初始化。** `auto x;` 是错误的——编译器没有值就没法猜类型。这不奇怪吧？你递给一个空盒子让人猜里面是什么，谁也猜不出来。}
+
+\collapse[auto 类型推导的更多细节]{
+`auto` 不只是"省打字"那么简单，它在类型推导时会**丢掉顶层 const 和引用**：
+
+\code[cpp]{
+const int a = 10;
+auto b = a;     // b 是 int，不是 const int！const 被丢了
+b = 20;         // 合法，b不是const
+
+// 要保留 const，得显式写：
+const auto c = a;  // c 是 const int
+}
+
+这在入门阶段不用太纠结，但如果你将来发现 `auto` 推出的类型和你想的不一样，记得回来看这里。更详细的内容在「auto 与类型推导」一章中。
+}
+
+// const——"常量"，不能修改的值
+
+有些值一旦设定就不应该被改变——比如圆周率 π、一天的秒数、游戏的最大等级。这时候就用 `const` 关键字（Constant 的缩写）。
+
+先看没有 `const` 时的痛点：万一你不小心写了一行 `PI = 3.0;`，圆变成了某种奇怪的形状……而编译器不会告诉你哪里错了。
+
+\code[cpp]{
+const double PI = 3.14159265358979;
+const int MAX_LEVEL = 100;
+const int SECONDS_PER_DAY = 86400;
+
+// PI = 3.0;  // ❌ 编译错误！const变量不能被修改
+// 这正是我们想要的——编译器帮你抓住"手滑"
+}
+
+\tip{**常量命名惯例：全大写 + 下划线分隔。** `MAX_HEALTH`、`SCREEN_WIDTH`、`GRAVITY`。这样一眼就能看出它是常量，不会有人试图去修改它。}
+
+// constexpr——编译期就确定的常量
+
+`const` 是"运行时不能改"，`constexpr`（Constant Expression 的缩写）是更强的——"**编译时就确定了值**"。
+
+\code[cpp]{
+constexpr int BOARD_SIZE = 8;                   // 编译时就知道是8
+constexpr double GRAVITY = 9.81;                // 编译时就知道是9.81
+constexpr int TOTAL = BOARD_SIZE * BOARD_SIZE;  // 编译时就算出64
+}
+
+\note{**什么时候用 `const`，什么时候用 `constexpr`？**
+- 如果值在**写代码时就确定了**（如 PI、棋盘大小）→ 用 `constexpr`
+- 如果值在**运行时才确定**（如用户输入的名字、文件里读取的配置）→ 用 `const`
+- 拿不准？用 `const` 总是安全的。`constexpr` 更强但要求也更高。}
+
+来跑一个完整例子，感受一下 `const` 与 `constexpr` 的区别：
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    const int MAX_HP = 100;           // const：运行时不可改
+    constexpr int BOARD_SIZE = 8;     // constexpr：编译时就确定
+    constexpr int CELLS = BOARD_SIZE * BOARD_SIZE;  // 编译时算出64
+
+    cout << "最大血量: " << MAX_HP << endl;
+    cout << "棋盘大小: " << BOARD_SIZE << "x" << BOARD_SIZE << endl;
+    cout << "总格数: " << CELLS << endl;
+
+    // MAX_HP = 200;    // 取消注释试试——编译报错！
+    // BOARD_SIZE = 10; // 取消注释试试——也报错！
+
+    return 0;
+}
+}
+
+// 作用域——变量的"生命范围"
+
+变量只在它被声明的那对**大括号 `{}`** 内有效。出了大括号，变量就"死了"（被销毁），不能再用。这叫**作用域（Scope）**。
+
+**类比：** 你在教室里写在白板上的笔记，出了教室门就被擦掉了。走廊里的人看不到你在教室里写了什么。
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int a = 10;  // a 在 main 的 {} 内有效
+
+    {   // 一对新的大括号 = 一个新的内部作用域
+        int b = 20;  // b 只在这对 {} 内有效
+        cout << "内部: a = " << a << endl;  // ✅ 可以访问外层的a
+        cout << "内部: b = " << b << endl;  // ✅ 可以访问b
+    }
+    // 这里 b 已经"死了"（出了它的 {}）
+
+    cout << "外部: a = " << a << endl;  // ✅ a还活着
+    // cout << b;  // ❌ 取消注释试试——编译错误！b在这里不存在了
+
+    return 0;
+}
+}
+
+\tip{**为什么要有作用域？** 防止变量"泄露"到不该出现的地方。你在一个代码块里创建的临时变量，不应该影响到外面的代码。这是代码组织和减少 bug 的基础。}
+
+// 多个变量的声明
+
+你可以在一行里声明多个同类型变量：
+
+\code[cpp]{
+int x = 1, y = 2, z = 3;   // 同时声明三个int
+}
+
+但要小心这个经典陷阱：
+
+\code[cpp]{
+int* a, b;  // ⚠ a 是 int*（指针），但 b 只是普通 int！不是两个指针！
+// 正确写法（如果想要两个指针）：
+int *a, *b; // 或者分两行写：int* a; int* b;
+}
+
+这个在后面「指针」一课会详细讲，目前知道**每行只声明一个变量**是最安全的做法。
+
+/// 新版特性（C++17/20/23）
+
+// 结构化绑定（C++17）
+
+C++17 引入了**结构化绑定（Structured Bindings）**，可以把多个值一次性拆到多个变量里，配合 `auto` 使用非常方便：
+
+\code[cpp]{
+// C++17：一次声明多个变量来接收一组值
+auto [x, y, z] = make_tuple(1, 2.0, "hello");
+// x 是 int, y 是 double, z 是 const char*
+}
+
+这个现在看个眼熟就行，后面学到 `tuple`、`pair`、结构体的时候会大量用到。
+
+/// 工程实践
+
+\note{**开发中的变量最佳实践：**
+1. **声明时立刻初始化**——永远不留未初始化的变量
+2. **尽量缩小作用域**——变量在哪儿用就在哪儿声明，别在函数开头全部声明（C语言遗风）
+3. **选择有意义的名字**——代码是给人读的，`remainingLives` 比 `rl` 好一万倍
+4. **能用 `const` 就用 `const`**——如果一个变量不需要修改，标为 `const`，编译器帮你防手滑
+5. **`auto` 适度使用**——类型显而易见时用 `auto`，类型看不出来时写明确类型}
+
+/// 难点易错点分析
+
+\danger{**3个最常见的变量陷阱：**
+
+**1. 未初始化的变量**
+`int x; cout << x;` → 垃圾值！可能是 0，可能是 -1234567，可能每次不同。这是**未定义行为（UB）**，程序可能做任何事。永远在声明时初始化。
+
+**2. const 变量试图赋值**
+`const int X = 5; X = 10;` → 编译错误。`const` 就是不让你改。如果你发现需要改，说明它不应该是 `const`。
+
+**3. 作用域外访问变量**
+内层 `{}` 里声明的变量，外层不能用。编译器会给你一个"未声明的标识符"（undeclared identifier）错误。}
+
+来几道题检验一下你是不是真的理解了：
+
+\quiz[tf]{
+Q: `int x;` 在C++中是合法的，`x` 的值确定为 `0`。
+ANS: F
+EXP: `int x;` 声明合法，但 `x` **不会**自动为0。在C++中，局部变量不初始化的话，值是不确定的（垃圾值）。Python和Java（实例变量）会给默认值，但C++不会。
+}
+
+\quiz[choice]{
+Q: 以下哪个是 `constexpr` 和 `const` 的关键区别？
+A: `constexpr` 变量可以被修改，`const` 不可以
+B: `constexpr` 的值在编译时就确定了，`const` 的值可以运行时确定
+C: `const` 只能用于整数，`constexpr` 可以用于任何类型
+D: 它们没有区别，只是两种拼写方式
+ANS: B
+EXP: `constexpr` 要求值必须在编译时就能算出来（比如字面量、编译时可算的表达式），而 `const` 只是运行时不可修改——值可以来自用户输入或文件读取。
+}
+
+\quiz[choice]{
+Q: 下面这段代码的输出是什么？
+`int a = 1; { int a = 2; cout << a; } cout << a;`
+A: 1 1
+B: 2 2
+C: 2 1
+D: 编译错误
+ANS: C
+EXP: 内层 `{}` 中声明了一个**新的** `a`（值为2），它"遮蔽（Shadow）"了外层的 `a`。在内层输出2，出了内层 `{}`，内层的 `a` 销毁，外层的 `a`（值仍为1）重新可见，所以输出1。
+}
+
+/// 实战作业
+
+// 🟢 基础题1：温度转换器
+
+**任务：** 写一个程序，将华氏温度（Fahrenheit）转换为摄氏温度（Celsius）。
+
+公式：`摄氏 = (华氏 - 32) × 5 / 9`
+
+要求：
+- 用 `const double` 存储华氏温度 `98.6`（人体正常体温）
+- 计算摄氏温度并存到一个 `double` 变量中
+- 输出格式：`Fahrenheit: 98.6 -> Celsius: 37`
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    // 1. 用 const double 声明华氏温度，值为 98.6
+    /* TODO: 你的代码 */
+
+    // 2. 用公式计算摄氏温度，存到 double celsius 中
+    /* TODO: 你的代码 */
+
+    // 3. 输出结果
+    /* TODO: 你的代码 */
+
+    return 0;
+}
+}
+
+\collapse[🤔 参考答案]{
+\code[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    const double fahrenheit = 98.6;
+    double celsius = (fahrenheit - 32) * 5 / 9;
+    cout << "Fahrenheit: " << fahrenheit << " -> Celsius: " << celsius << endl;
+    return 0;
+}
+}
+}
+
+// 🟢 基础题2：变量交换
+
+**任务：** 给你两个变量 `a` 和 `b`，不使用第三方库函数，把它们的值交换过来。
+
+提示：你需要一个临时变量来"暂存"其中一个值。
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int a = 10;
+    int b = 20;
+
+    cout << "交换前: a = " << a << ", b = " << b << endl;
+
+    // TODO: 用一个临时变量完成交换
+    /* 你的代码 */
+
+    cout << "交换后: a = " << a << ", b = " << b << endl;
+    // 期望输出: 交换后: a = 20, b = 10
+
+    return 0;
+}
+}
+
+// 🟡 进阶题：综合变量练习
+
+**任务：** 写一个游戏角色面板，用各种类型的变量和常量来描述一个角色。
+
+要求：
+- 用 `constexpr` 定义最大血量 `MAX_HP = 100` 和最大等级 `MAX_LEVEL = 50`
+- 用普通变量存储当前血量 `currentHP`、当前等级 `level`、角色名字（用 `string`，需要 `#include <string>`）
+- 把当前血量减少 25，输出受伤后的血量
+- 用 `const` 算出并存储血量百分比
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+using namespace std;
+
+int main() {
+    // 1. 用 constexpr 定义 MAX_HP 和 MAX_LEVEL
+    /* TODO: 你的代码 */
+
+    // 2. 声明角色变量：name(string), currentHP(int), level(int)
+    /* TODO: 你的代码 */
+
+    // 3. 输出角色信息
+    /* TODO: 格式: [角色名] Lv.等级  HP: 当前/最大 */
+
+    // 4. 受到25点伤害
+    /* TODO: 你的代码 */
+
+    // 5. 用 const double 计算并存储血量百分比
+    /* TODO: 你的代码 */
+
+    // 6. 输出受伤后信息
+    /* TODO: 格式: 受伤后 HP: 当前/最大 (百分比%) */
+
+    return 0;
+}
+}
+
+\collapse[🤔 参考思路]{
+- `constexpr int MAX_HP = 100;`
+- `string name = "Hero";`
+- `currentHP = currentHP - 25;` 或 `currentHP -= 25;`
+- 百分比计算注意整数除法陷阱：`static_cast<double>(currentHP) / MAX_HP * 100` 或直接用 `100.0 * currentHP / MAX_HP`
+}

@@ -1,0 +1,640 @@
+/// 简介
+
+在上一节我们学习了移动语义如何在运行时减少不必要的拷贝。这一节我们更进一步——让计算直接在**编译期**完成，运行时连一条指令都不需要执行。
+
+想象一下：游戏中需要一张正弦查找表（Lookup Table），传统做法是程序启动时初始化。但如果编译器能在编译期就算好整张表，直接嵌入二进制文件呢？这就是 `constexpr` 的核心价值——把能在编译期完成的计算交给编译器，换取**零运行时开销**。
+
+从 C++11 引入 `constexpr` 开始，每个标准版本都在放宽限制：C++14 允许循环，C++17 加入条件编译，C++20 引入 `consteval` 和 `constinit`，到 C++23 几乎所有代码都能在编译期运行。这一节我们系统梳理这条演进路线。
+
+/// 知识点列表
+
+\list{
+- const vs constexpr vs consteval vs constinit 四关键字辨析
+- constexpr 变量——编译期常量
+- constexpr 函数——从 C++11 到 C++20 的放宽历程
+- if constexpr（C++17）——编译期条件分支
+- consteval（C++20）——强制编译期求值
+- constinit（C++20）——编译期初始化保证
+- constexpr 容器（C++20 std::vector / std::string）
+- 编译期计算在游戏中的应用（LUT、哈希、配置）
+}
+
+/// 知识点详解
+
+// const vs constexpr vs consteval vs constinit
+
+学习 `constexpr` 之前，必须先厘清四个关键字的区别，否则极易混淆。
+
+**`const`**（常量）表示"一旦初始化就不能修改"，但它的值**不一定在编译期已知**。比如 `const int x = readInput();` 完全合法——`x` 在运行时才确定。
+
+**`constexpr`**（常量表达式，constant expression）比 `const` 更强：它要求值**必须能在编译期求出**。用在变量上时，编译器会在编译期计算出结果；用在函数上时，表示该函数**有可能**在编译期执行（但不强制）。
+
+**`consteval`**（立即函数，immediate function，C++20）比 `constexpr` 更强：它修饰的函数**必须**在编译期求值，否则编译报错。
+
+**`constinit`**（编译期初始化，C++20）只用于变量，保证变量在**编译期完成初始化**，但初始化之后允许修改——它解决的是**静态初始化顺序问题**（Static Initialization Order Fiasco）。
+
+\table{
+关键字 | 用途 | 编译期保证 | 运行时可修改
+--- 
+`const` | 变量不可修改 | 不保证 | 否
+`constexpr` | 变量/函数可在编译期求值 | 变量保证；函数视上下文 | 否（变量）
+`consteval` | 函数强制编译期求值 | 强制 | —
+`constinit` | 变量编译期初始化 | 初始化保证 | 是
+}
+
+\run[cpp]{
+#include <iostream>
+
+// const: 运行时也可以初始化
+int getRuntime() { return 42; }
+const int a = getRuntime();  // OK，运行时确定
+
+// constexpr: 编译期必须能确定值
+constexpr int b = 10 * 3;    // OK，编译期计算
+// constexpr int c = getRuntime(); // 错误！getRuntime() 不是 constexpr
+
+// constexpr 函数
+constexpr int square(int x) { return x * x; }
+constexpr int d = square(5); // 编译期求值
+
+int main() {
+    std::cout << "const a = " << a << "\n";
+    std::cout << "constexpr b = " << b << "\n";
+    std::cout << "constexpr d = " << d << "\n";
+
+    int n = 7;
+    int e = square(n); // OK! 但这里是运行时求值（n 不是常量）
+    std::cout << "runtime square(7) = " << e << "\n";
+}
+}
+
+// constexpr 变量
+
+**constexpr 变量**（constexpr variable）的值必须在编译期确定。编译器会把它当作**编译期常量**（compile-time constant）处理，可以用在需要常量表达式的场合，比如数组大小、模板参数、`switch` 的 `case` 标签。
+
+\code[cpp]{
+constexpr int MaxPlayers = 4;
+constexpr double Pi = 3.14159265358979;
+constexpr int BufferSize = MaxPlayers * 256; // 编译期计算
+
+int scores[MaxPlayers]; // OK：数组大小是编译期常量
+
+// 对比：const 不一定行
+const int n = someFunction(); 
+// int arr[n]; // 可能不合法（VLA 只有部分编译器支持）
+}
+
+`constexpr` 变量隐含 `const`，所以不需要写 `const constexpr`——写了也不会错，只是多余。
+
+// constexpr 函数的演进
+
+`constexpr` 函数是编译期计算的核心。它在不同标准版本中的限制逐步放宽，这个演进过程值得了解。
+
+\tabs{
+\tab[C++11]{
+C++11 对 `constexpr` 函数的限制非常严格：
+- 函数体只能有**一条 `return` 语句**
+- 不允许局部变量、循环、`if/else`
+- 必须通过递归实现任何稍复杂的逻辑
+
+\code[cpp]{
+// C++11 风格：只能用递归
+constexpr int factorial(int n) {
+    return n <= 1 ? 1 : n * factorial(n - 1);
+}
+static_assert(factorial(5) == 120, "");
+}
+}
+\tab[C++14]{
+C++14 大幅放宽限制：
+- 允许**局部变量**
+- 允许 **`if/else`**、**循环**（`for`、`while`）
+- 允许多条语句
+- 这让 `constexpr` 函数可以像普通函数一样写
+
+\code[cpp]{
+// C++14：终于可以用循环了
+constexpr int factorial(int n) {
+    int result = 1;
+    for (int i = 2; i <= n; ++i)
+        result *= i;
+    return result;
+}
+static_assert(factorial(5) == 120, "");
+}
+}
+\tab[C++17/20]{
+C++17 允许 `constexpr` lambda 表达式（lambda expression）。
+
+C++20 进一步放宽：
+- 允许 `try-catch`（但编译期不能 `throw`）
+- 允许**虚函数**（virtual function）
+- 允许**动态内存分配**（`new/delete`、`std::vector`）
+- 允许 `std::string` 操作
+
+\code[cpp]{
+// C++20：constexpr 中使用 vector
+constexpr int sumVector() {
+    std::vector<int> v = {1, 2, 3, 4, 5};
+    int total = 0;
+    for (int x : v) total += x;
+    return total; // vector 的内存在函数返回前释放
+}
+static_assert(sumVector() == 15);
+}
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+
+// C++14 风格的 constexpr 函数：使用循环和局部变量
+constexpr int factorial(int n) {
+    int result = 1;
+    for (int i = 2; i <= n; ++i)
+        result *= i;
+    return result;
+}
+
+// constexpr 函数可以互相调用
+constexpr int combination(int n, int r) {
+    return factorial(n) / (factorial(r) * factorial(n - r));
+}
+
+// 编译期验证
+static_assert(factorial(6) == 720, "factorial error");
+static_assert(combination(5, 2) == 10, "combination error");
+
+int main() {
+    // 编译期计算的结果直接嵌入二进制
+    constexpr auto f10 = factorial(10);
+    constexpr auto c52 = combination(5, 2);
+
+    std::cout << "10! = " << f10 << "\n";
+    std::cout << "C(5,2) = " << c52 << "\n";
+
+    // 也可以在运行时调用同一个函数
+    int n;
+    std::cout << "Enter n: ";
+    std::cin >> n;
+    std::cout << n << "! = " << factorial(n) << "\n";
+}
+}
+
+// if constexpr（C++17）— 编译期条件分支
+
+有时候我们需要根据类型或编译期条件选择不同的代码路径。在 C++17 之前，这只能靠模板特化（template specialization）或 SFINAE 实现，写起来繁琐。C++17 引入了 **`if constexpr`**（编译期条件分支），让分支选择在编译期完成，未选中的分支**不会被编译**。
+
+\compare{
+old: C++14 — 用模板特化处理不同类型
+\code[cpp]{
+template<typename T>
+typename std::enable_if<std::is_integral<T>::value, T>::type
+process(T value) { return value * 2; }
+
+template<typename T>
+typename std::enable_if<std::is_floating_point<T>::value, T>::type
+process(T value) { return value + 0.5; }
+}
+
+new: C++17 — 用 if constexpr 一目了然
+\code[cpp]{
+template<typename T>
+T process(T value) {
+    if constexpr (std::is_integral_v<T>)
+        return value * 2;
+    else if constexpr (std::is_floating_point_v<T>)
+        return value + 0.5;
+}
+}
+}
+
+关键区别：普通 `if` 的两个分支都必须对当前类型合法；`if constexpr` 中未选中的分支**直接被丢弃**，即使它对当前类型不合法也不会报错。
+
+\run[cpp]{
+#include <iostream>
+#include <type_traits>
+#include <string>
+
+template<typename T>
+std::string describe(T value) {
+    if constexpr (std::is_integral_v<T>) {
+        // 整数路径：这里可以用位运算，不怕浮点类型报错
+        return "integer: " + std::to_string(value) +
+               " (even=" + (value % 2 == 0 ? "yes" : "no") + ")";
+    } else if constexpr (std::is_floating_point_v<T>) {
+        // 浮点路径
+        return "float: " + std::to_string(value);
+    } else {
+        // 其他类型路径
+        return "other type";
+    }
+}
+
+int main() {
+    std::cout << describe(42) << "\n";
+    std::cout << describe(3.14) << "\n";
+    std::cout << describe('A') << "\n";  // char 是整数类型
+}
+}
+
+// consteval（C++20）— 强制编译期求值
+
+`constexpr` 函数的问题在于：它**不保证**在编译期执行。如果你传入一个运行时变量，它会悄悄退化为运行时执行。这在需要保证零运行时开销的场景中是个隐患。
+
+**`consteval`**（立即函数，immediate function）解决了这个问题：用 `consteval` 修饰的函数**必须**在编译期求值，如果传入运行时变量，**编译器直接报错**。
+
+\code[cpp]{
+consteval int mustCompileTime(int n) {
+    return n * n;
+}
+
+constexpr int a = mustCompileTime(5); // OK：编译期
+// int x = 5;
+// int b = mustCompileTime(x);        // 错误！x 不是常量表达式
+}
+
+`consteval` 的典型用途是**编译期字符串哈希**（compile-time string hashing）。在游戏引擎中经常用字符串标识资源和事件，但运行时做字符串比较很慢。用 `consteval` 哈希函数，可以在源码中写可读的字符串，编译后自动变成高效的整数比较。
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+#include <string_view>
+
+// consteval: 强制编译期求值的 FNV-1a 哈希
+consteval uint64_t compileHash(std::string_view s) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (char c : s) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+// 编译期计算所有哈希值
+constexpr auto H_ATTACK = compileHash("attack");
+constexpr auto H_DEFEND = compileHash("defend");
+constexpr auto H_HEAL   = compileHash("heal");
+
+int main() {
+    std::cout << "Hash of 'attack': " << H_ATTACK << "\n";
+    std::cout << "Hash of 'defend': " << H_DEFEND << "\n";
+    std::cout << "Hash of 'heal':   " << H_HEAL << "\n";
+
+    // consteval 保证这些哈希值都在编译期计算完毕
+    // 运行时只需要做整数比较，而不是字符串比较
+    static_assert(H_ATTACK != H_DEFEND, "hash collision!");
+}
+}
+
+// constinit（C++20）— 编译期初始化保证
+
+C++ 中有一个经典陷阱：**静态初始化顺序灾难**（Static Initialization Order Fiasco）。当一个翻译单元（translation unit）的全局变量依赖另一个翻译单元的全局变量时，初始化顺序是**未定义**的，可能导致使用未初始化的值。
+
+**`constinit`** 保证变量在**编译期完成初始化**，从而消除顺序问题。与 `constexpr` 不同的是，`constinit` 变量在初始化之后**可以修改**——它只约束初始化阶段。
+
+\code[cpp]{
+// constinit: 编译期初始化，运行时可修改
+constinit int playerCount = 0;         // 编译期初始化为 0
+constinit const char* version = "1.0"; // 编译期初始化
+
+void addPlayer() {
+    playerCount++; // OK：constinit 不意味着 const
+}
+
+// 对比
+// constexpr int x = 0;  // 编译期初始化 + 不可修改
+// constinit int y = 0;  // 编译期初始化 + 可修改
+// const int z = f();     // 可能运行时初始化 + 不可修改
+}
+
+\warning{`constinit` 只能用于**静态存储期**（static storage duration）的变量——全局变量、`static` 局部变量、`thread_local` 变量。不能用在普通局部变量上。}
+
+// constexpr 容器（C++20）
+
+C++20 让 `std::vector` 和 `std::string` 可以在 `constexpr` 上下文中使用。这意味着你可以在编译期用这些容器做计算——但有一个关键限制。
+
+\danger{**constexpr 中动态分配的内存必须在编译期释放！** 你可以在 `constexpr` 函数内使用 `vector`、`string`、`new`，但它们的内存**必须在同一个常量表达式结束前释放**——堆内存不能"逃逸"到运行时。通常的做法是：在函数内用 `vector` 计算，最终把结果拷贝到 `std::array` 返回。}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <array>
+#include <algorithm>
+#include <numeric>
+
+// 编译期使用 vector 计算，返回 array
+constexpr auto makeSortedSquares() {
+    std::vector<int> v;
+    for (int i = 10; i >= 1; --i)
+        v.push_back(i * i);       // vector 在编译期可用
+
+    std::sort(v.begin(), v.end()); // 排序也可以编译期执行
+
+    std::array<int, 10> result{};
+    for (int i = 0; i < 10; ++i)
+        result[i] = v[i];
+    return result; // vector 内存在这里释放，array 拷贝逃逸
+}
+
+// 编译期计算完毕，直接嵌入二进制
+constexpr auto squares = makeSortedSquares();
+
+int main() {
+    static_assert(squares[0] == 1, "");
+    static_assert(squares[9] == 100, "");
+
+    for (int x : squares)
+        std::cout << x << " ";
+    std::cout << "\n";
+    // 输出: 1 4 9 16 25 36 49 64 81 100
+}
+}
+
+// 编译期计算在游戏中的应用
+
+编译期计算在游戏开发中有三大经典应用场景：
+
+**1. 查找表（Lookup Table, LUT）生成**
+
+三角函数、颜色转换、曲线插值等计算量大但结果固定的数据，可以在编译期计算好。运行时直接查表，省去每帧大量浮点运算。
+
+**2. 编译期哈希（Compile-time Hashing）**
+
+前面已经展示过：游戏中大量使用字符串做标识符（资源路径、事件名、状态名）。`consteval` 哈希让源码保持可读性，编译后变成整数比较。
+
+**3. 编译期配置/验证**
+
+游戏的配置参数（最大玩家数、世界尺寸、缓冲区大小）用 `constexpr` 定义，配合 `static_assert` 在编译期就能验证参数的一致性和合理性。
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+#include <cmath>
+
+// 编译期生成正弦查找表（泰勒展开近似）
+constexpr double constexprSin(double x) {
+    // 将角度归约到 [-pi, pi] 范围
+    double term = x;
+    double sum = x;
+    for (int n = 1; n < 12; ++n) {
+        term *= -x * x / ((2.0 * n) * (2.0 * n + 1.0));
+        sum += term;
+    }
+    return sum;
+}
+
+constexpr auto generateSinLUT() {
+    std::array<float, 360> table{};
+    for (int deg = 0; deg < 360; ++deg) {
+        double rad = deg * 3.14159265358979 / 180.0;
+        table[deg] = static_cast<float>(constexprSin(rad));
+    }
+    return table;
+}
+
+// 编译期计算完毕的查找表
+constexpr auto SinLUT = generateSinLUT();
+
+// 编译期配置 + 验证
+constexpr int MaxPlayers = 4;
+constexpr int MaxEntities = 1024;
+constexpr int EntityPoolSize = MaxPlayers * MaxEntities;
+static_assert(EntityPoolSize <= 65536, "Entity pool too large!");
+
+int main() {
+    std::cout << "sin(30°) = " << SinLUT[30] << "\n";
+    std::cout << "sin(90°) = " << SinLUT[90] << "\n";
+    std::cout << "sin(180°) = " << SinLUT[180] << "\n";
+    std::cout << "EntityPoolSize = " << EntityPoolSize << "\n";
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17 带来的 constexpr 增强
+
+- **`if constexpr`**：编译期条件分支，简化模板编程
+- **constexpr lambda**：lambda 表达式默认可以是 `constexpr`
+- 标准库中更多函数标记为 `constexpr`（如 `std::array` 的大部分操作）
+
+// C++20 带来的 constexpr 增强
+
+- **`consteval`**：强制编译期求值的立即函数
+- **`constinit`**：保证编译期初始化
+- **constexpr 虚函数**：编译期多态
+- **constexpr `std::vector` / `std::string`**：编译期动态容器
+- **constexpr `new/delete`**：编译期动态内存分配
+- **constexpr `std::algorithm`**：`sort`、`find` 等可编译期使用
+
+// C++23 带来的 constexpr 增强
+
+- **`if consteval`**：在 `constexpr` 函数内检测"当前是否在编译期执行"，根据结果选择不同路径
+- 更多标准库函数可在编译期使用（`<cmath>` 部分函数等）
+- `constexpr` 限制进一步放宽
+
+\collapse[C++23 if consteval 示例]{
+`if consteval` 让同一个函数在编译期和运行时走不同的代码路径：
+
+\code[cpp]{
+#include <cmath>
+
+constexpr double power(double base, int exp) {
+    if consteval {
+        // 编译期路径：用简单循环（编译期没有 std::pow）
+        double result = 1.0;
+        for (int i = 0; i < exp; ++i) result *= base;
+        return result;
+    } else {
+        // 运行时路径：用数学库的优化实现
+        return std::pow(base, exp);
+    }
+}
+}
+
+这解决了一个长期痛点：以前 `constexpr` 函数必须用编译期兼容的方式写，即使运行时有更高效的实现也没法用。
+}
+
+/// 工程实践
+
+// 何时使用 constexpr / consteval / constinit
+
+\table{
+场景 | 推荐关键字 | 原因
+---
+编译期常量（π、最大值等） | `constexpr` 变量 | 保证编译期求值，可用作模板参数
+可编译期也可运行时的通用函数 | `constexpr` 函数 | 灵活，两种场景复用同一实现
+必须编译期的计算（哈希、LUT） | `consteval` 函数 | 防止意外退化为运行时
+全局/静态变量初始化 | `constinit` | 消除静态初始化顺序问题
+需要编译期验证的断言 | `static_assert` | 编译期检查不变量
+}
+
+// 最佳实践
+
+\tip{**优先用 `constexpr`，需要强制时升级为 `consteval`。** 大多数情况下 `constexpr` 足够——它允许函数在编译期和运行时复用。只有当你**必须保证编译期执行**（如安全相关的哈希、性能关键的 LUT）时，才用 `consteval`。}
+
+\note{**用 `static_assert` 验证编译期计算的正确性。** 编译期计算的 bug 不会在运行时暴露，所以要用 `static_assert` 做"编译期单元测试"。养成每个 `constexpr`/`consteval` 函数都写 `static_assert` 的习惯。}
+
+/// 难点易错点分析
+
+\danger{**`constexpr` 函数不保证编译期执行！** 只有当所有参数都是常量表达式，且结果用于**常量上下文**（`constexpr` 变量、`static_assert`、模板参数、数组大小）时，才保证编译期求值。否则编译器可能在运行时执行。如果想强制编译期，用 `consteval`。}
+
+\quiz[choice]{
+Q: 下面哪行代码的 `square` 调用**一定**在编译期执行？
+\code[cpp]{
+constexpr int square(int x) { return x * x; }
+int a = square(5);           // (A)
+constexpr int b = square(5); // (B)
+int n = 5;
+int c = square(n);           // (C)
+}
+A: `int a = square(5);`
+B: `constexpr int b = square(5);`
+C: `int c = square(n);`
+D: A 和 B 都是
+ANS: B
+EXP: 只有 (B) 的结果赋给了 `constexpr` 变量——这个常量上下文迫使编译器在编译期求值。(A) 虽然参数是字面量，但 `a` 是普通 `int`，编译器**可以但不必须**在编译期计算。(C) 的 `n` 不是常量表达式，只能运行时执行。
+}
+
+\danger{**`constexpr` 变量和 `const` 变量是不同的！** `constexpr` 隐含 `const`，但 `const` 不隐含 `constexpr`。`const int x = runtimeFunc();` 完全合法——`x` 在运行时初始化，不能用在需要常量表达式的地方。}
+
+\quiz[tf]{
+Q: `constinit int count = 0;` 声明后，`count` 的值不能在运行时修改。
+ANS: F
+EXP: `constinit` 只保证**初始化在编译期完成**，但变量本身不是 `const`。初始化之后可以正常修改。如果写 `constinit const int count = 0;` 才不能修改。
+}
+
+\warning{**constexpr 容器的内存不能逃逸！** 在 `constexpr` 函数内可以用 `std::vector`，但 vector 内部的堆内存必须在函数返回前释放。你不能让一个 `constexpr` 变量直接保存 `vector`——需要把结果转存到 `std::array` 中。}
+
+\quiz[choice]{
+Q: 以下代码能否通过编译？
+\code[cpp]{
+constexpr std::vector<int> getVec() {
+    return {1, 2, 3};
+}
+constexpr auto v = getVec();
+}
+A: 能通过编译，v 是编译期 vector
+B: 不能，constexpr 函数不允许使用 vector
+C: 不能，vector 的堆内存无法逃逸到编译期变量
+D: 不能，需要用 consteval 替换 constexpr
+ANS: C
+EXP: C++20 允许在 `constexpr` 函数**内部**使用 `vector`，但 `vector` 分配的堆内存不能逃逸到常量表达式之外。`getVec()` 返回的 `vector` 持有堆内存，赋给 `constexpr` 变量时编译器报错。正确做法是在函数内把结果拷贝到 `std::array` 再返回。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：constexpr 幂函数
+
+实现一个 `constexpr` 幂函数 `power(base, exp)`，用 `static_assert` 验证正确性。
+
+\run[cpp]{
+#include <iostream>
+
+// TODO: 实现 constexpr 幂函数
+// constexpr int power(int base, int exp)
+// 要求：支持 exp >= 0，用循环实现
+
+/* 你的代码 */
+
+// 验证（取消注释后应能通过编译）
+// static_assert(power(2, 0) == 1, "2^0 should be 1");
+// static_assert(power(2, 10) == 1024, "2^10 should be 1024");
+// static_assert(power(3, 4) == 81, "3^4 should be 81");
+
+int main() {
+    // constexpr auto result = power(2, 10);
+    // std::cout << "2^10 = " << result << "\n";
+    std::cout << "Implement power() and uncomment the tests!\n";
+}
+}
+
+// 🟢 基础题 2：if constexpr 类型分发
+
+用 `if constexpr` 实现一个 `toStr` 函数模板，根据类型返回不同的字符串表示。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <type_traits>
+
+template<typename T>
+std::string toStr(T value) {
+    // TODO: 用 if constexpr 分三种情况：
+    // 1. 整数类型 → "int: " + std::to_string(value)
+    // 2. 浮点类型 → "float: " + std::to_string(value)
+    // 3. 其他类型 → "unknown"
+    // 提示: std::is_integral_v<T>, std::is_floating_point_v<T>
+
+    return "TODO"; /* 替换这行 */
+}
+
+int main() {
+    std::cout << toStr(42) << "\n";      // 应输出: int: 42
+    std::cout << toStr(3.14) << "\n";    // 应输出: float: 3.140000
+    std::cout << toStr('A') << "\n";     // 应输出: int: 65 (char 是整数类型)
+}
+}
+
+// 🟡 进阶题 1：编译期排序
+
+实现一个 `constexpr` 函数，在编译期对 `std::array` 进行冒泡排序，并用 `static_assert` 验证。
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+
+template<std::size_t N>
+constexpr std::array<int, N> compileSort(std::array<int, N> arr) {
+    // TODO: 实现冒泡排序（编译期兼容，不能用 std::sort 以练习手写）
+    // 提示：双重循环 + std::swap（C++20 constexpr）
+
+    /* 你的代码 */
+
+    return arr;
+}
+
+int main() {
+    constexpr std::array<int, 5> unsorted = {5, 3, 1, 4, 2};
+    constexpr auto sorted = compileSort(unsorted);
+
+    // 验证编译期排序结果
+    static_assert(sorted[0] == 1, "");
+    static_assert(sorted[4] == 5, "");
+
+    for (int x : sorted)
+        std::cout << x << " ";
+    std::cout << "\n";
+    // 期望输出: 1 2 3 4 5
+}
+}
+
+// 🟡 进阶题 2：consteval 编译期哈希 + switch 分发
+
+实现 `consteval` 的 FNV-1a 哈希函数，并用它构建一个基于字符串的命令分发系统。
+
+\collapse[参考思路]{
+1. 实现 `consteval uint64_t fnvHash(std::string_view s)`，使用 FNV-1a 算法
+2. FNV-1a 初始值：`14695981039346656037ULL`，乘数：`1099511628211ULL`
+3. 在 `switch` 的 `case` 中用 `fnvHash("command")` 作为标签
+4. 用 `static_assert` 验证不同命令的哈希值不冲突
+}
+
+// 🔴 挑战题：编译期数学工具库
+
+设计一个 `constexpr` / `consteval` 数学工具库，包含以下功能：
+1. 编译期正弦/余弦查找表（360 度整数角，精度 4 位小数）
+2. 编译期 `sqrt` 函数（牛顿迭代法，Newton's method）
+3. 编译期最大公约数 `gcd` 和最小公倍数 `lcm`
+4. 所有函数用 `static_assert` 验证，至少 5 条断言
+5. 用 `constinit` 声明全局查找表
+
+验收标准：所有 `static_assert` 通过编译；查找表的值与 `<cmath>` 标准库结果误差不超过 0.001。
+
+\collapse[参考思路]{
+- 正弦用泰勒展开：`sin(x) = x - x³/3! + x⁵/5! - ...`，取 10-12 项精度足够
+- 牛顿迭代 `sqrt`：`guess = (guess + n/guess) / 2`，迭代 15-20 次即可收敛
+- `gcd` 用辗转相除法（Euclidean algorithm）
+- 注意：`constexpr double` 精度足以满足 4 位小数的要求
+}

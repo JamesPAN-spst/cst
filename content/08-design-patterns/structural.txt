@@ -1,0 +1,465 @@
+/// 简介
+
+创建型模式解决了"如何创建对象"，本节转向**结构型模式（Structural Patterns）**——解决"如何组装更大的结构"。在游戏引擎中，第三方库接口不匹配需要**适配器**，渲染管线的抽象与实现需要独立变化要用**桥接**，场景图天然是**组合模式**，武器附魔系统是**装饰器**的典型应用。本节以游戏开发场景为主线，逐一拆解七种结构型模式的动机、实现与权衡。
+
+/// 知识点列表
+
+\list{
+- 适配器（Adapter）— 接口转换，兼容第三方库
+- 桥接（Bridge）— 抽象与实现独立变化
+- 组合（Composite）— 树形结构的统一操作
+- 装饰器（Decorator）— 动态叠加功能
+- 外观（Facade）— 简化子系统接口
+- 享元（Flyweight）— 共享不变数据，节省内存
+- 代理（Proxy）— 控制对象访问
+}
+
+/// 知识点详解
+
+// 适配器
+
+第三方物理引擎的向量类型是 `Vec2f`，你的引擎用 `Vector2d`——类型不匹配。**适配器（Adapter）** 在不修改两端代码的前提下，包装一方使其符合另一方接口。游戏引擎集成第三方中间件（物理、音频、AI）时几乎必用。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <memory>
+
+// 第三方库接口——不可修改
+namespace ThirdParty {
+    struct Vec2f { float x, y; };
+    class PhysicsBody {
+    public:
+        void applyForce(Vec2f f) {
+            std::cout << "ThirdParty force: (" << f.x << ", " << f.y << ")\n";
+        }
+    };
+}
+
+// 你的引擎接口
+struct Vector2 { double x, y; };
+class IPhysicsBody {
+public:
+    virtual void addForce(Vector2 f) = 0;
+    virtual ~IPhysicsBody() = default;
+};
+
+// 适配器：将第三方 API 包装为引擎接口
+class PhysicsBodyAdapter : public IPhysicsBody {
+    ThirdParty::PhysicsBody body_;
+public:
+    void addForce(Vector2 f) override {
+        // 类型转换在适配器内部完成
+        body_.applyForce({static_cast<float>(f.x), static_cast<float>(f.y)});
+    }
+};
+
+int main() {
+    std::unique_ptr<IPhysicsBody> body = std::make_unique<PhysicsBodyAdapter>();
+    body->addForce({10.5, -3.2});  // 引擎代码只知道 IPhysicsBody
+}
+}
+
+\note{**对象适配器 vs 类适配器：** 上例是**对象适配器（Object Adapter）**——通过组合持有被适配对象。C++ 也支持**类适配器（Class Adapter）**——通过多重继承同时继承目标接口和被适配类。前者更灵活（运行时可替换），后者可以重写被适配类的方法但受限于继承耦合。}
+
+// 桥接
+
+当一个抽象有多个维度的变化时（如"形状"×"渲染器"），用继承会导致类爆炸。**桥接（Bridge）** 将抽象层与实现层分离，各自独立演化。游戏中典型场景：`Renderer`（OpenGL/Vulkan/Software）× `Shape`（Mesh/Sprite/Particle）。
+
+\code[cpp]{
+// 实现层接口
+class IRenderImpl {
+public:
+    virtual void drawCircle(float x, float y, float r) = 0;
+    virtual void drawRect(float x, float y, float w, float h) = 0;
+    virtual ~IRenderImpl() = default;
+};
+
+// 抽象层——持有实现层的指针
+class Shape {
+protected:
+    IRenderImpl& renderer_;  // 桥接到实现
+public:
+    explicit Shape(IRenderImpl& r) : renderer_(r) {}
+    virtual void draw() = 0;
+    virtual ~Shape() = default;
+};
+
+class Circle : public Shape {
+    float x_, y_, r_;
+public:
+    Circle(IRenderImpl& r, float x, float y, float radius)
+        : Shape(r), x_(x), y_(y), r_(radius) {}
+    void draw() override { renderer_.drawCircle(x_, y_, r_); }
+};
+
+// 新增渲染后端不影响 Shape 层，新增形状不影响 Renderer 层
+}
+
+\tip{**Bridge vs Strategy：** 两者结构相似（都是抽象持有接口指针），但意图不同。Bridge 分离**抽象与实现**两个独立变化维度；Strategy 让**算法**可热替换。Bridge 的分离通常在构造时确定，Strategy 随时可切换。}
+
+// 组合
+
+游戏场景是一棵树：世界节点包含关卡节点，关卡包含角色和道具，角色又包含武器和装备。**组合模式（Composite）** 让叶子节点和容器节点实现相同接口，客户端可以递归地统一处理整棵树。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+class SceneNode {
+    std::string name_;
+    std::vector<std::unique_ptr<SceneNode>> children_;
+    SceneNode* parent_ = nullptr;
+public:
+    explicit SceneNode(std::string name) : name_(std::move(name)) {}
+
+    void addChild(std::unique_ptr<SceneNode> child) {
+        child->parent_ = this;
+        children_.push_back(std::move(child));
+    }
+
+    void print(int depth = 0) const {
+        for (int i = 0; i < depth; ++i) std::cout << "  ";
+        std::cout << name_ << "\n";
+        for (auto& c : children_) c->print(depth + 1);
+    }
+
+    const std::string& name() const { return name_; }
+    size_t childCount() const { return children_.size(); }
+};
+
+int main() {
+    auto root = std::make_unique<SceneNode>("World");
+    auto level = std::make_unique<SceneNode>("Level1");
+    auto player = std::make_unique<SceneNode>("Player");
+    auto weapon = std::make_unique<SceneNode>("Sword");
+    auto enemy = std::make_unique<SceneNode>("Goblin");
+
+    player->addChild(std::move(weapon));  // 武器是玩家的子节点
+    level->addChild(std::move(player));
+    level->addChild(std::move(enemy));
+    root->addChild(std::move(level));
+
+    root->print();
+    // World
+    //   Level1
+    //     Player
+    //       Sword
+    //     Goblin
+}
+}
+
+\diagram[tree]{
+root: World (SceneNode)
+  L: Level1
+    L: Player
+      L: Sword
+    R: Goblin
+  R: Level2
+    L: Boss
+}
+
+// 装饰器
+
+**装饰器（Decorator）** 在不修改原有类的前提下动态添加功能——通过包装而非继承实现。游戏中武器附魔、buff 叠加、技能增强都是经典场景：一把剑可以同时附火焰、毒素和吸血效果。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+
+class IWeapon {
+public:
+    virtual int damage() const = 0;
+    virtual std::string desc() const = 0;
+    virtual ~IWeapon() = default;
+};
+
+class Sword : public IWeapon {
+public:
+    int damage() const override { return 10; }
+    std::string desc() const override { return "Sword"; }
+};
+
+class WeaponDecorator : public IWeapon {
+protected:
+    std::unique_ptr<IWeapon> inner_;
+public:
+    explicit WeaponDecorator(std::unique_ptr<IWeapon> w) : inner_(std::move(w)) {}
+    int damage() const override { return inner_->damage(); }
+    std::string desc() const override { return inner_->desc(); }
+};
+
+class FireEnchant : public WeaponDecorator {
+public:
+    using WeaponDecorator::WeaponDecorator;
+    int damage() const override { return inner_->damage() + 5; }
+    std::string desc() const override { return inner_->desc() + " +Fire"; }
+};
+
+class LifestealEnchant : public WeaponDecorator {
+public:
+    using WeaponDecorator::WeaponDecorator;
+    int damage() const override { return inner_->damage() + 2; }
+    std::string desc() const override { return inner_->desc() + " +Lifesteal"; }
+};
+
+int main() {
+    std::unique_ptr<IWeapon> w = std::make_unique<Sword>();
+    w = std::make_unique<FireEnchant>(std::move(w));
+    w = std::make_unique<LifestealEnchant>(std::move(w));
+
+    std::cout << w->desc() << " -> damage: " << w->damage() << "\n";
+    // Sword +Fire +Lifesteal -> damage: 17
+}
+}
+
+\warning{**装饰器链过长的性能开销：** 每层装饰器增加一次虚函数间接调用。在每帧调用数百万次的热路径中（如粒子系统的属性计算），考虑用**数据驱动（Data-Driven）** 方式——将增益存为数组直接累加，而非装饰器链。}
+
+// 外观
+
+引擎的子系统（渲染、物理、音频、输入）各有复杂的初始化流程。**外观（Facade）** 提供一个简化接口，隐藏子系统交互细节。客户端调用一个方法即可完成原本需要协调多个子系统的操作。
+
+\code[cpp]{
+class GameFacade {
+    Renderer renderer_;
+    Physics physics_;
+    Audio audio_;
+    Input input_;
+public:
+    void init() {
+        renderer_.init(1920, 1080);   // 参数细节被隐藏
+        physics_.init(9.8f);
+        audio_.init(44100);
+        input_.init();
+    }
+
+    void runFrame(float dt) {
+        input_.poll();           // 子系统调用顺序被封装
+        physics_.step(dt);
+        renderer_.beginFrame();
+        renderer_.endFrame();
+        audio_.update();
+    }
+};
+
+// 客户端只需：
+GameFacade game;
+game.init();
+game.runFrame(0.016f);  // 不需要知道内部有哪些子系统
+}
+
+// 享元
+
+一片森林有 10000 棵树，但只有 5 种树模型。**享元（Flyweight）** 将**共享的不变数据（内在状态，Intrinsic State）** 与**每实例独有数据（外在状态，Extrinsic State）** 分离，大幅节省内存。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+#include <unordered_map>
+
+struct TreeModel {               // 内在状态——共享
+    std::string mesh;
+    std::string texture;
+    TreeModel(std::string m, std::string t)
+        : mesh(std::move(m)), texture(std::move(t)) {
+        std::cout << "  [Loaded model: " << mesh << "]\n";
+    }
+};
+
+struct TreeInstance {             // 外在状态——每实例独有
+    std::shared_ptr<const TreeModel> model;
+    float x, y, scale;
+};
+
+class TreeModelCache {           // 享元工厂
+    std::unordered_map<std::string, std::shared_ptr<const TreeModel>> cache_;
+public:
+    std::shared_ptr<const TreeModel> get(const std::string& name,
+                                          const std::string& mesh,
+                                          const std::string& tex) {
+        auto it = cache_.find(name);
+        if (it != cache_.end()) return it->second;
+        auto model = std::make_shared<const TreeModel>(mesh, tex);
+        cache_[name] = model;
+        return model;
+    }
+};
+
+int main() {
+    TreeModelCache cache;
+    std::vector<TreeInstance> forest;
+
+    std::cout << "Creating 100 trees with 2 model types:\n";
+    for (int i = 0; i < 50; ++i) {
+        forest.push_back({cache.get("oak", "oak.obj", "oak.png"),
+                          i * 1.0f, 0.0f, 1.0f});
+    }
+    for (int i = 0; i < 50; ++i) {
+        forest.push_back({cache.get("pine", "pine.obj", "pine.png"),
+                          i * 1.0f, 10.0f, 0.8f});
+    }
+
+    std::cout << "Total trees: " << forest.size()
+              << ", Models loaded: 2\n";
+    // 100 个实例只加载了 2 份模型数据
+}
+}
+
+// 代理
+
+**代理（Proxy）** 在客户端和真实对象之间插入一个中间层，控制访问方式。游戏中常见几种代理变体：
+
+\table{
+代理类型 | 用途 | 游戏场景
+---
+虚代理（Virtual Proxy） | 延迟加载重量级对象 | 大地图纹理按需加载
+保护代理（Protection Proxy） | 权限控制 | 管理员 vs 普通玩家的操作权限
+远程代理（Remote Proxy） | 网络透明访问 | 网络同步中的远端玩家对象
+缓存代理（Caching Proxy） | 缓存昂贵计算 | 寻路结果缓存
+}
+
+\code[cpp]{
+// 虚代理：延迟加载纹理
+class ITexture {
+public:
+    virtual void render(int x, int y) = 0;
+    virtual ~ITexture() = default;
+};
+
+class HeavyTexture : public ITexture {
+    std::vector<uint8_t> data_;  // 可能几百 MB
+public:
+    HeavyTexture(const std::string& path) {
+        // 从磁盘加载——耗时操作
+        data_.resize(1024 * 1024);
+    }
+    void render(int x, int y) override { /* 使用 data_ 渲染 */ }
+};
+
+class TextureProxy : public ITexture {
+    std::string path_;
+    std::unique_ptr<HeavyTexture> real_;  // 延迟创建
+public:
+    explicit TextureProxy(std::string path) : path_(std::move(path)) {}
+    void render(int x, int y) override {
+        if (!real_) real_ = std::make_unique<HeavyTexture>(path_);  // 首次使用才加载
+        real_->render(x, y);
+    }
+};
+}
+
+\collapse[🤔 七种模式如何在引擎中协作？]{
+一个完整的游戏引擎中，这七种结构型模式经常组合使用：
+- **Facade** 作为引擎的顶层入口，内部协调各子系统
+- **Adapter** 包装第三方库（物理/音频）使其符合引擎接口
+- **Bridge** 分离抽象渲染命令与具体后端实现
+- **Composite** 构建场景图（场景树/UI 树）
+- **Decorator** 实现 buff/附魔的动态叠加
+- **Flyweight** 共享模型/纹理/材质等重量级资源
+- **Proxy** 延迟加载不可见区域的资源
+}
+
+/// 新版特性（C++17/20/23）
+
+\list{
+- C++17 `std::any` — 可用于实现通用属性系统，Decorator 可以装饰任意类型
+- C++17 `std::variant` — 替代部分 Composite 的继承层次（已知类型集合时）
+- C++20 Concepts — 约束 Adapter/Decorator 的模板参数，编译期验证接口匹配
+- C++20 `std::span` — Flyweight 模式中共享连续内存区域的轻量级视图
+- C++23 `std::generator` — 惰性遍历 Composite 树结构
+}
+
+/// 工程实践
+
+\list{
+- Adapter 优先选对象适配器（组合），类适配器（继承）仅在需要重写被适配类方法时考虑
+- Composite 中 parent 指针用裸指针（非拥有），children 用 `unique_ptr`——避免循环引用
+- Decorator 应与被装饰对象实现**相同接口**，否则客户端无法透明使用
+- Flyweight 的共享数据必须是**不可变的（immutable）**——否则一处修改影响所有引用者
+- Proxy 的线程安全：如果多线程访问虚代理，延迟初始化需要 `std::call_once` 保护
+}
+
+/// 难点易错点分析
+
+\danger{**Composite 中的循环引用：** 子节点持有 parent 的 owning 指针（如 `shared_ptr`）会导致引用循环→内存泄漏。parent 指针必须用**裸指针（non-owning）** 或 `weak_ptr`。}
+
+\danger{**Decorator 顺序敏感：** `FireEnchant(LifestealEnchant(Sword))` 和 `LifestealEnchant(FireEnchant(Sword))` 的行为可能不同——如果吸血基于最终伤害计算。确认装饰器是否对顺序敏感，并在文档中明确约定。}
+
+\quiz[choice]{
+Q: 以下哪种模式最适合实现"大地图纹理按需加载（首次使用才从磁盘读取）"？
+A: Adapter
+B: Decorator
+C: Proxy（虚代理）
+D: Flyweight
+ANS: C
+EXP: 虚代理延迟创建重量级对象直到首次真正使用。Adapter 解决接口不匹配，Decorator 添加功能，Flyweight 共享数据。
+}
+
+\quiz[tf]{
+Q: Flyweight 模式中共享的内在状态（Intrinsic State）可以被单个实例修改。
+ANS: F
+EXP: 内在状态必须是**不可变的**。如果一个实例修改了共享数据，所有引用该数据的对象都会受影响。外在状态（位置、缩放等）才是每实例独有的可变数据。
+}
+
+/// 实战作业
+
+// 🟢 基础：场景图
+
+实现简单的 `SceneNode` 组合模式：支持 `addChild`、递归 `update(float dt)`、递归 `print(depth)` 输出树形结构。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+class SceneNode {
+    std::string name_;
+    std::vector<std::unique_ptr<SceneNode>> children_;
+public:
+    explicit SceneNode(std::string n) : name_(std::move(n)) {}
+
+    /* TODO: addChild —— 接受 unique_ptr<SceneNode> 并添加到 children_ */
+
+    /* TODO: print(int depth) —— 输出 depth 个缩进空格后打印名称，然后递归打印子节点 */
+
+    void update(float dt) {
+        std::cout << "Update: " << name_ << " dt=" << dt << "\n";
+        for (auto& c : children_) c->update(dt);
+    }
+};
+
+int main() {
+    auto root = std::make_unique<SceneNode>("World");
+    auto player = std::make_unique<SceneNode>("Player");
+    auto sword = std::make_unique<SceneNode>("Sword");
+    player->addChild(std::move(sword));
+    root->addChild(std::move(player));
+    root->addChild(std::make_unique<SceneNode>("Enemy"));
+
+    root->print(0);
+    std::cout << "---\n";
+    root->update(0.016f);
+}
+}
+
+// 🟡 进阶：装饰器技能系统
+
+实现 `ISkill` 接口（`damage()`、`cooldown()`、`desc()`），3 种基础技能和 4 种装饰器（增伤、减 CD、AOE、吸血）。支持任意组合叠加，输出最终伤害和描述。
+
+// 🟡 进阶：享元 + 对象池
+
+实现粒子系统的享元模式：`ParticleTemplate`（共享纹理、颜色曲线）和 `Particle`（独有位置、速度、生命周期）。结合对象池复用已消亡的粒子实例。
+
+// 🔴 挑战：完整的资源管理系统
+
+综合运用 Flyweight（共享模型数据）+ Proxy（延迟加载）+ Facade（统一对外接口），实现一个 `ResourceManager` 类：支持 `getTexture(path)` / `getModel(path)` 接口，首次访问从"磁盘"加载（Proxy），相同路径返回缓存（Flyweight），对外只暴露简单接口（Facade）。
+
+\collapse[🔴 参考思路]{
+`ResourceManager` 内部维护 `unordered_map<string, shared_ptr<const Resource>>`。`getTexture(path)` 先查缓存，未命中则创建 `TextureProxy`；当 Proxy 的 `data()` 被首次调用时才真正加载。对外只暴露 `ResourceManager::getTexture/getModel`，隐藏内部缓存和代理逻辑。
+}

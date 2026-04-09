@@ -1,0 +1,384 @@
+/// 简介
+
+上节用向量表示了位置和方向，但游戏对象需要**移动、旋转、缩放**——这些操作统称为**变换（Transform）**。**矩阵（Matrix）**是将所有变换统一为"一次乘法"的数学工具：一个 4×4 矩阵可以同时编码平移、旋转、缩放，并且多个变换可以通过矩阵乘法合并成一个矩阵。
+
+从 GPU 渲染管线到物理碰撞响应，矩阵运算无处不在。本节从矩阵乘法的机制讲到齐次坐标、变换矩阵的构造，最终抵达渲染管线核心——**模型-视图-投影（MVP）**。
+
+/// 知识点列表
+
+\list{
+- 矩阵基础（行/列存储、乘法规则）
+- 齐次坐标（Homogeneous Coordinates）
+- 变换矩阵：平移、旋转、缩放
+- 变换组合与矩阵乘法顺序
+- 逆矩阵（Inverse Matrix）
+- 视图矩阵（View Matrix）— LookAt
+- 投影矩阵（Projection Matrix）— 透视 & 正交
+}
+
+/// 知识点详解
+
+// 矩阵基础与 Mat4 实现
+
+游戏中最常用的是 **4×4 矩阵（Mat4）**，配合齐次坐标表示所有仿射变换。先建立基本结构：
+
+\code[cpp]{
+struct Mat4 {
+    float m[4][4] = {};  // 行主序（Row-major）
+
+    static Mat4 identity() {
+        Mat4 r;
+        r.m[0][0] = r.m[1][1] = r.m[2][2] = r.m[3][3] = 1.0f;
+        return r;
+    }
+
+    // 矩阵乘法：C[r][c] = Σ A[r][k] * B[k][c]
+    Mat4 operator*(const Mat4& b) const {
+        Mat4 r;
+        for (int row = 0; row < 4; ++row)
+            for (int col = 0; col < 4; ++col)
+                for (int k = 0; k < 4; ++k)
+                    r.m[row][col] += m[row][k] * b.m[k][col];
+        return r;
+    }
+
+    // 矩阵 × 四维向量
+    Vec4 operator*(const Vec4& v) const {
+        return {
+            m[0][0]*v.x + m[0][1]*v.y + m[0][2]*v.z + m[0][3]*v.w,
+            m[1][0]*v.x + m[1][1]*v.y + m[1][2]*v.z + m[1][3]*v.w,
+            m[2][0]*v.x + m[2][1]*v.y + m[2][2]*v.z + m[2][3]*v.w,
+            m[3][0]*v.x + m[3][1]*v.y + m[3][2]*v.z + m[3][3]*v.w
+        };
+    }
+};
+}
+
+\warning{**行主序（Row-major）vs 列主序（Column-major）**是矩阵代码中最常见的困惑源。C/C++ 数组天然行主序；OpenGL 传统列主序，DirectX 行主序；GLM 默认列主序。存储顺序影响：1）`m[row][col]` 的含义 2）传给 GPU 时是否需要转置。项目初期确定约定并贯彻始终。}
+
+// 齐次坐标
+
+**齐次坐标（Homogeneous Coordinates）** 用 4D 向量表示 3D 数据，使平移也能用矩阵乘法实现：
+
+\table{
+类型 | 齐次坐标 | w 分量作用
+---
+3D 点（位置）| (x, y, z, 1) | 受平移影响
+3D 方向（向量）| (x, y, z, 0) | 不受平移影响
+}
+
+\code[cpp]{
+// 从齐次坐标恢复 3D：透视除法
+Vec3 fromHomogeneous(Vec4 v) {
+    if (std::abs(v.w) < 1e-8f) return {v.x, v.y, v.z}; // 方向向量
+    return {v.x / v.w, v.y / v.w, v.z / v.w};           // 透视除法
+}
+}
+
+\note{**为什么 w=0 的方向不受平移影响？** 平移矩阵在第四列存储偏移量，乘以 w=0 时偏移量被消除。这正是齐次坐标的精妙之处——一个矩阵同时正确处理点和方向。}
+
+// 变换矩阵
+
+三种基本变换的矩阵构造：
+
+\tabs{
+\tab[平移]{
+\code[cpp]{
+Mat4 translate(float tx, float ty, float tz) {
+    Mat4 m = Mat4::identity();
+    m.m[0][3] = tx;  // 行主序：平移量在第四列
+    m.m[1][3] = ty;
+    m.m[2][3] = tz;
+    return m;
+}
+// 点 (x,y,z,1) × T → (x+tx, y+ty, z+tz, 1) ✓
+// 方向 (x,y,z,0) × T → (x, y, z, 0)         ✓ 不变
+}
+}
+\tab[缩放]{
+\code[cpp]{
+Mat4 scale(float sx, float sy, float sz) {
+    Mat4 m = {};
+    m.m[0][0] = sx;
+    m.m[1][1] = sy;
+    m.m[2][2] = sz;
+    m.m[3][3] = 1.0f;
+    return m;
+}
+// 非均匀缩放 (sx≠sy≠sz) 会扭曲法线 — 后面会讲处理方法
+}
+}
+\tab[旋转]{
+\code[cpp]{
+// 绕 Y 轴旋转（最常用：角色左右转）
+Mat4 rotateY(float angle) {
+    float c = std::cos(angle), s = std::sin(angle);
+    Mat4 m = Mat4::identity();
+    m.m[0][0] = c;  m.m[0][2] = s;
+    m.m[2][0] = -s; m.m[2][2] = c;
+    return m;
+}
+
+// 绕任意轴旋转（Rodrigues 公式）
+Mat4 rotateAxis(Vec3 axis, float angle) {
+    axis = normalize(axis);
+    float c = std::cos(angle), s = std::sin(angle), t = 1 - c;
+    float x = axis.x, y = axis.y, z = axis.z;
+    Mat4 m = {};
+    m.m[0][0] = t*x*x+c;   m.m[0][1] = t*x*y-s*z; m.m[0][2] = t*x*z+s*y;
+    m.m[1][0] = t*x*y+s*z; m.m[1][1] = t*y*y+c;   m.m[1][2] = t*y*z-s*x;
+    m.m[2][0] = t*x*z-s*y; m.m[2][1] = t*y*z+s*x; m.m[2][2] = t*z*z+c;
+    m.m[3][3] = 1.0f;
+    return m;
+}
+}
+}
+}
+
+// 变换组合与顺序
+
+矩阵乘法**不满足交换律**。变换顺序从右往左读：
+
+\code[cpp]{
+// "先缩放 → 再旋转 → 最后平移" （最常见的 TRS 顺序）
+Mat4 model = translate(10, 0, 5) * rotateY(0.5f) * scale(2, 2, 2);
+
+// 对一个顶点应用变换：
+Vec4 worldPos = model * Vec4{localX, localY, localZ, 1.0f};
+
+// 注意：rotate * translate ≠ translate * rotate
+// 前者：绕原点旋转后移动（物体飘出去）
+// 后者：先移动再绕新位置旋转（绕自身旋转）
+}
+
+\diagram[flow]{
+局部顶点 -> [Scale] -> [Rotate] -> [Translate] -> 世界坐标
+读代码方向: ← 从右往左
+}
+
+// 逆矩阵
+
+**逆矩阵（Inverse Matrix）** 撤销一个变换。如果 `M` 将点从局部空间变换到世界空间，`M⁻¹` 将其变换回来。
+
+\code[cpp]{
+// 对正交矩阵（仅旋转）：逆 = 转置（非常快）
+Mat4 transpose(const Mat4& m) {
+    Mat4 r;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            r.m[i][j] = m.m[j][i];
+    return r;
+}
+
+// 通用 4x4 逆矩阵：用伴随矩阵法或高斯消元
+// 游戏中通常避免通用求逆 — 分解为 T/R/S 后分别求逆更高效：
+// inv(T * R * S) = inv(S) * inv(R) * inv(T)
+// inv(T) = translate(-tx, -ty, -tz)
+// inv(R) = transpose(R)    （正交矩阵性质）
+// inv(S) = scale(1/sx, 1/sy, 1/sz)
+}
+
+\tip{**法线变换：** 如果 Model 矩阵包含非均匀缩放，法线不能直接用 Model 矩阵变换。正确做法是用 **Model 矩阵的逆转置矩阵（Inverse Transpose）** 变换法线。均匀缩放时 Model 矩阵本身即可。}
+
+// 视图矩阵
+
+**视图矩阵（View Matrix）** 将世界坐标变换到摄像机坐标系。经典的 **LookAt** 函数：
+
+\code[cpp]{
+Mat4 lookAt(Vec3 eye, Vec3 target, Vec3 worldUp) {
+    Vec3 f = normalize(target - eye);    // 摄像机前方
+    Vec3 r = normalize(cross(f, worldUp)); // 摄像机右方
+    Vec3 u = cross(r, f);                 // 摄像机上方
+
+    Mat4 m = Mat4::identity();
+    m.m[0][0] = r.x;  m.m[0][1] = r.y;  m.m[0][2] = r.z;
+    m.m[1][0] = u.x;  m.m[1][1] = u.y;  m.m[1][2] = u.z;
+    m.m[2][0] = -f.x; m.m[2][1] = -f.y; m.m[2][2] = -f.z;
+    m.m[0][3] = -dot(r, eye);
+    m.m[1][3] = -dot(u, eye);
+    m.m[2][3] = dot(f, eye);
+    return m;
+}
+}
+
+// 投影矩阵
+
+\tabs{
+\tab[透视投影]{
+\code[cpp]{
+// 近大远小效果，用于 3D 游戏
+Mat4 perspective(float fovY, float aspect, float near, float far) {
+    float tanHalf = std::tan(fovY / 2.0f);
+    Mat4 m = {};
+    m.m[0][0] = 1.0f / (aspect * tanHalf);
+    m.m[1][1] = 1.0f / tanHalf;
+    m.m[2][2] = -(far + near) / (far - near);
+    m.m[2][3] = -2.0f * far * near / (far - near);
+    m.m[3][2] = -1.0f;  // w = -z → 透视除法
+    return m;
+}
+}
+}
+\tab[正交投影]{
+\code[cpp]{
+// 无透视缩放，用于 2D 游戏 / UI / 阴影贴图
+Mat4 ortho(float left, float right, float bottom, float top,
+           float near, float far) {
+    Mat4 m = {};
+    m.m[0][0] = 2.0f / (right - left);
+    m.m[1][1] = 2.0f / (top - bottom);
+    m.m[2][2] = -2.0f / (far - near);
+    m.m[0][3] = -(right + left) / (right - left);
+    m.m[1][3] = -(top + bottom) / (top - bottom);
+    m.m[2][3] = -(far + near) / (far - near);
+    m.m[3][3] = 1.0f;
+    return m;
+}
+}
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+#include <iomanip>
+
+struct Vec4 { float x, y, z, w; };
+
+struct Mat4 {
+    float m[4][4] = {};
+    static Mat4 identity() {
+        Mat4 r; r.m[0][0]=r.m[1][1]=r.m[2][2]=r.m[3][3]=1; return r;
+    }
+    Mat4 operator*(const Mat4& b) const {
+        Mat4 r;
+        for (int i=0;i<4;++i) for (int j=0;j<4;++j)
+            for (int k=0;k<4;++k) r.m[i][j]+=m[i][k]*b.m[k][j];
+        return r;
+    }
+    Vec4 operator*(const Vec4& v) const {
+        return {m[0][0]*v.x+m[0][1]*v.y+m[0][2]*v.z+m[0][3]*v.w,
+                m[1][0]*v.x+m[1][1]*v.y+m[1][2]*v.z+m[1][3]*v.w,
+                m[2][0]*v.x+m[2][1]*v.y+m[2][2]*v.z+m[2][3]*v.w,
+                m[3][0]*v.x+m[3][1]*v.y+m[3][2]*v.z+m[3][3]*v.w};
+    }
+};
+
+Mat4 translate(float tx, float ty, float tz) {
+    Mat4 m = Mat4::identity();
+    m.m[0][3]=tx; m.m[1][3]=ty; m.m[2][3]=tz;
+    return m;
+}
+Mat4 scale(float sx, float sy, float sz) {
+    Mat4 m={}; m.m[0][0]=sx; m.m[1][1]=sy; m.m[2][2]=sz; m.m[3][3]=1;
+    return m;
+}
+Mat4 rotateY(float a) {
+    float c=std::cos(a), s=std::sin(a);
+    Mat4 m=Mat4::identity(); m.m[0][0]=c; m.m[0][2]=s; m.m[2][0]=-s; m.m[2][2]=c;
+    return m;
+}
+
+int main() {
+    // TRS: 先缩放2倍 → 绕Y轴旋转45° → 平移(10,0,5)
+    float angle = 3.14159f / 4.0f; // 45°
+    Mat4 model = translate(10,0,5) * rotateY(angle) * scale(2,2,2);
+
+    Vec4 local{1, 0, 0, 1}; // 局部坐标 (1,0,0)
+    Vec4 world = model * local;
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "世界坐标: (" << world.x << ", " << world.y
+              << ", " << world.z << ")\n";
+    // 缩放后(2,0,0)→旋转45°→平移→约(11.414, 0, 6.414)
+}
+}
+
+/// 工程实践
+
+\collapse[🔧 矩阵库设计决策]{
+\list{
+- **存储约定**：行主序适配 C++ 数组和 DirectX；列主序适配 OpenGL/Vulkan。选定后在 README 中明确标注
+- **乘法顺序约定**：行主序用 `v * M`（行向量左乘），列主序用 `M * v`（列向量右乘）。混用是灾难
+- **避免通用求逆**：4×4 通用求逆约 100+ 次浮点运算，对 TRS 矩阵分解后分别求逆效率高一个数量级
+- **SIMD 优化**：Mat4 乘法是 SIMD（SSE/AVX）的理想目标，4 次 4D 点积映射到 4 条 SIMD 指令
+}
+}
+
+/// 难点易错点分析
+
+\danger{**变换顺序错误是最常见的 3D 渲染 bug。** `translate * rotate` 和 `rotate * translate` 结果完全不同。TRS 规则：Scale → Rotate → Translate，代码里从右往左写 `T * R * S`。}
+
+\danger{**near 平面设为 0 或极小值：** 透视矩阵中，near 接近 0 会导致 Z-buffer 精度崩溃（Z-fighting），远处物体深度值几乎相同。实践中 near ≥ 0.1f。}
+
+\warning{**忘记透视除法：** 透视投影后坐标是齐次的 `(x, y, z, w)`，必须除以 `w` 才得到 NDC。GPU 自动做这一步，但手动计算时容易遗漏。}
+
+\quiz[choice]{
+Q: 矩阵 `T * R * S` 对一个顶点的变换顺序是？
+A: 先平移，再旋转，最后缩放
+B: 先缩放，再旋转，最后平移
+C: 先旋转，再缩放，最后平移
+D: 顺序无关，矩阵乘法满足交换律
+ANS: B
+EXP: 矩阵乘法从右往左应用：先 S（缩放）→ 再 R（旋转）→ 最后 T（平移）。矩阵乘法不满足交换律，顺序不可更改。
+}
+
+\quiz[tf]{
+Q: 正交矩阵（仅含旋转）的逆矩阵等于其转置矩阵。
+ANS: T
+EXP: 正交矩阵的列（或行）是互相正交的单位向量，满足 $R^T R = I$。转置比通用求逆快几个数量级，这是引擎中的常用优化。
+}
+
+/// 实战作业
+
+// 🟢 基础题：构建 TRS 变换
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec4 { float x,y,z,w; };
+struct Mat4 {
+    float m[4][4]={};
+    static Mat4 identity(){Mat4 r; r.m[0][0]=r.m[1][1]=r.m[2][2]=r.m[3][3]=1; return r;}
+    Mat4 operator*(const Mat4& b)const{
+        Mat4 r; for(int i=0;i<4;++i)for(int j=0;j<4;++j)
+            for(int k=0;k<4;++k) r.m[i][j]+=m[i][k]*b.m[k][j]; return r;
+    }
+    Vec4 operator*(const Vec4& v)const{
+        return {m[0][0]*v.x+m[0][1]*v.y+m[0][2]*v.z+m[0][3]*v.w,
+                m[1][0]*v.x+m[1][1]*v.y+m[1][2]*v.z+m[1][3]*v.w,
+                m[2][0]*v.x+m[2][1]*v.y+m[2][2]*v.z+m[2][3]*v.w,
+                m[3][0]*v.x+m[3][1]*v.y+m[3][2]*v.z+m[3][3]*v.w};
+    }
+};
+
+/* TODO: 实现以下三个函数 */
+Mat4 translate(float tx, float ty, float tz) { return Mat4::identity(); }
+Mat4 scale(float sx, float sy, float sz) { return Mat4::identity(); }
+Mat4 rotateY(float angle) { return Mat4::identity(); }
+
+int main() {
+    // 测试：缩放3倍 → 绕Y轴旋转90° → 平移(5,0,0)
+    float pi2 = 3.14159265f / 2.0f;
+    Mat4 model = translate(5,0,0) * rotateY(pi2) * scale(3,3,3);
+    Vec4 local{1, 0, 0, 1};
+    Vec4 world = model * local;
+    // 缩放→(3,0,0), 旋转90°→(0,0,-3), 平移→(5,0,-3)
+    std::cout << "结果: (" << world.x << ", " << world.y << ", " << world.z << ")\n";
+    std::cout << "期望: (5, 0, -3)\n";
+}
+}
+
+// 🟡 进阶题：实现 LookAt 视图矩阵
+
+实现 `lookAt(eye, target, up)` 函数并验证：摄像机在 `(0,0,5)` 看向原点时，原点处的点应变换为 `(0,0,-5)` 在摄像机空间中。提供完整测试用例。
+
+// 🔴 挑战题：ASCII 3D 渲染器
+
+用 MVP 矩阵将一个 3D 立方体的顶点变换到 2D 屏幕坐标，在终端用字符画显示线框。要求：实现透视投影，立方体可以绕 Y 轴旋转。
+
+\collapse[🤔 参考思路]{
+8 个立方体顶点 → MVP 变换 → 透视除法得到 NDC → 映射到终端字符网格（如 80×24）。用 Bresenham 画线连接 12 条边。每帧清屏重绘，旋转角度递增。
+}
+
+矩阵将向量运算的威力放大到变换层面——下一节我们用四元数解决矩阵旋转的核心缺陷。

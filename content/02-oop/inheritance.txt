@@ -1,0 +1,498 @@
+/// 简介
+
+上一节学了构造函数和析构函数，知道了对象的"生"与"死"。但如果你在做一个游戏，`Enemy`、`Boss`、`NPC` 都有位置、血量、`update()` 方法——难道每个类都复制粘贴？
+
+**继承（Inheritance）** 就是解法：定义通用 `GameObject` 基类，让子类继承共性再添加特色。就像生物分类——哺乳动物都能调节体温，但猫抓老鼠、狗叼飞盘，共性在上层，个性在下层。
+
+继承配合**虚函数（Virtual Function）**，能用一个 `GameObject*` 指针操作所有对象，运行时自动调用正确版本——这就是**动态多态（Dynamic Polymorphism）**，C++ 面向对象的核心武器。
+
+/// 知识点列表
+
+\list{
+- public / protected / private 继承的区别
+- 虚函数（virtual）与动态多态
+- override 与 final（C++11）
+- 纯虚函数与抽象类
+- 虚析构函数（为什么必须用）
+- 继承层次中的构造与析构顺序
+- 多重继承与菱形继承问题
+- 虚继承（virtual inheritance）
+- dynamic_cast 与 RTTI
+- 切片问题（object slicing）
+}
+
+/// 知识点详解
+
+// public / protected / private 继承
+
+回顾**访问控制（Access Control）**：`public` 对外可见，`protected` 仅本类和子类可见，`private` 仅本类可见。继承时 `:` 后的关键词决定基类成员在派生类中的可见性上限——权限只会**压低**不会提升。
+
+\table{
+继承方式 | 基类 public 变为 | 基类 protected 变为 | 基类 private
+---
+`public` 继承 | `public` | `protected` | 不可访问
+`protected` 继承 | `protected` | `protected` | 不可访问
+`private` 继承 | `private` | `private` | 不可访问
+}
+
+\code[cpp]{
+class GameObject {
+public:
+    void setPosition(float x, float y);
+protected:
+    float hp = 100;                        // 子类可访问
+private:
+    int internalId;                        // 仅本类可访问
+};
+class Enemy : public GameObject {          // "is-a" 关系
+    void takeDamage(float d) {
+        hp -= d;          // ✅ protected 子类可访问
+        // internalId;    // ❌ private 子类不行
+    }
+};
+}
+
+\tip{**99% 的情况用 `public` 继承**——表达"是一个（is-a）"。`private` 继承偶尔表示"用……实现"，但组合通常更清晰。}
+
+// 虚函数与动态多态
+
+`Enemy` 和 `Boss` 都继承 `GameObject`，各有不同 `update()` 逻辑。拿 `GameObject*` 指向 `Boss` 调 `update()` 执行谁的？没有 `virtual` 时编译器在编译期决定——永远调基类的（**静态绑定，Static Binding**）。加 `virtual` 后运行时查表决定（**动态绑定，Dynamic Binding**）。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <memory>
+class GameObject {
+public:
+    virtual void update() { std::cout << "GameObject update\n"; }
+    virtual ~GameObject() = default;
+};
+class Enemy : public GameObject {
+public:
+    void update() override { std::cout << "Enemy: 向玩家移动\n"; }
+};
+class Boss : public GameObject {
+public:
+    void update() override { std::cout << "Boss: 释放技能\n"; }
+};
+int main() {
+    std::vector<std::unique_ptr<GameObject>> objects;
+    objects.push_back(std::make_unique<Enemy>());
+    objects.push_back(std::make_unique<Boss>());
+    for (auto& obj : objects)
+        obj->update();   // 运行时自动调用正确版本！
+}
+}
+
+\note{虚函数依赖**虚函数表（vtable）**：每个含虚函数的类有一张函数指针表，每个对象头部有**虚表指针（vptr）**。调用时通过 vptr 查表找实际函数地址——一次额外间接寻址，现代 CPU 上几乎可忽略。}
+
+// override 与 final
+
+`override` 告诉编译器"我在重写基类虚函数，签名不匹配就报错"。没有它，拼写错误会**悄无声息**变成新函数。`final` 放在虚函数后表示"不许再重写"，放在类名后表示"不许被继承"。
+
+\code[cpp]{
+class Widget {
+public:
+    virtual void draw() const {}
+    virtual void resize(int w, int h) {}
+};
+class Button : public Widget {
+public:
+    void draw() const override {}         // ✅ 正确重写
+    // void drow() const override {}      // ❌ 编译错误！基类没有 drow
+    void resize(int w, int h) final {}    // 子类不能再重写
+};
+class FancyButton final : public Button { // 此类不能被继承
+    void draw() const override {}
+};
+}
+
+\danger{**永远给重写的虚函数加 `override`！** 签名写错编译器不报错，你以为在重写其实定义了新函数——C++ 最经典的隐蔽 bug。}
+
+// 纯虚函数与抽象类
+
+基类有时根本没有"默认行为"——`Shape::area()` 该返回什么？让函数 `= 0` 变成**纯虚函数（Pure Virtual Function）**，含纯虚函数的类叫**抽象类（Abstract Class）**，不能实例化。
+
+\code[cpp]{
+class IRenderable {     // I 前缀 = 接口惯例(Interface)
+public:
+    virtual void draw() const = 0;       // 纯虚→子类必须实现
+    virtual void update(float dt) = 0;
+    virtual ~IRenderable() = default;
+};
+// IRenderable obj;  // ❌ 抽象类不能实例化
+class Sprite : public IRenderable {
+public:
+    void draw() const override { /* 绘制精灵 */ }
+    void update(float dt) override { /* 更新动画帧 */ }
+};
+}
+
+\tip{C++ 没有 `interface` 关键字，但"只有纯虚函数+虚析构"的类就是接口。命名常用 `I` 前缀或 `able` 后缀。}
+
+// 虚析构函数
+
+继承中**最致命的错误**——通过基类指针 `delete` 派生类对象时，非虚析构只调基类的，派生类析构被跳过 → 内存泄漏 + **未定义行为（UB）**。
+
+\steps{
+\step[灾难：非虚析构]{
+\code[cpp]{
+class Base { public: ~Base() {} };
+class Derived : public Base {
+    int* data = new int[1000];
+public:
+    ~Derived() { delete[] data; }
+};
+Base* p = new Derived;
+delete p;  // 💥 只调 ~Base，data 永远泄漏！
+}
+}
+\step[修复：加 virtual]{
+\code[cpp]{
+class Base { public: virtual ~Base() = default; };
+// 现在 delete basePtr 正确调用完整析构链 ✅
+}
+}
+}
+
+\danger{**只要类有虚函数，就必须有虚析构。** 违反 = 内存泄漏 + UB。}
+
+// 构造与析构顺序
+
+构造**从上到下**（先基类后派生类），析构**从下到上**（先派生类后基类）。像盖楼拆楼——先打地基后盖楼层，拆时反过来。
+
+\run[cpp]{
+#include <iostream>
+class Base {
+public:
+    Base()  { std::cout << "Base 构造\n"; }
+    virtual ~Base() { std::cout << "Base 析构\n"; }
+};
+class Middle : public Base {
+public:
+    Middle()  { std::cout << "Middle 构造\n"; }
+    ~Middle() override { std::cout << "Middle 析构\n"; }
+};
+class Child : public Middle {
+public:
+    Child()  { std::cout << "Child 构造\n"; }
+    ~Child() override { std::cout << "Child 析构\n"; }
+};
+int main() {
+    std::cout << "--- 创建 ---\n";
+    Child c;
+    std::cout << "--- 销毁 ---\n";
+}
+}
+
+\quiz[choice]{
+Q: 上面程序的析构输出顺序是？
+A: Base → Middle → Child
+B: Child → Middle → Base
+C: Child → Base → Middle
+D: 顺序不确定
+ANS: B
+EXP: 析构与构造严格相反。Child 最后构造，最先析构。
+}
+
+// 多重继承与菱形继承
+
+C++ 允许同时继承多个基类（**多重继承，Multiple Inheritance**）。但如果 `Enemy` 和 `NPC` 都继承 `GameObject`，`BossNPC` 同时继承两者就形成**菱形继承（Diamond Inheritance）**——`BossNPC` 有**两份** `GameObject` 数据！
+
+\diagram[tree]{
+root: GameObject
+  L: Enemy
+  R: NPC
+child: BossNPC
+}
+
+\code[cpp]{
+class GameObject { public: int hp = 100; };
+class Enemy : public GameObject {};
+class NPC   : public GameObject {};
+class BossNPC : public Enemy, public NPC {};
+BossNPC b;
+// b.hp;          // ❌ 二义性！
+b.Enemy::hp = 50; // 必须指定路径，两份 hp！
+}
+
+// 虚继承
+
+**虚继承（Virtual Inheritance）** 解决菱形问题：中间层加 `virtual`，顶层基类只存一份。
+
+\code[cpp]{
+class GameObject { public: int hp = 100; };
+class Enemy : virtual public GameObject {};
+class NPC   : virtual public GameObject {};
+class BossNPC : public Enemy, public NPC {};
+BossNPC b;
+b.hp = 200;   // ✅ 只有一份 hp
+}
+
+\warning{虚继承有运行时开销。**现代 C++ 更推荐组合或纯虚接口替代多重继承**。需要菱形时先反思设计。}
+
+// dynamic_cast 与 RTTI
+
+拿到基类指针需要知道实际类型时用 `dynamic_cast`，它在运行时检查类型转换是否合法。
+
+\code[cpp]{
+void onCollision(GameObject* obj) {
+    if (auto* enemy = dynamic_cast<Enemy*>(obj))
+        enemy->takeDamage(10);     // 转换成功
+    // 指针版失败返 nullptr，引用版抛 std::bad_cast
+}
+}
+
+`dynamic_cast` 依赖**运行时类型信息（RTTI）**，有性能开销，某些引擎禁用（`-fno-rtti`）。频繁使用通常是设计信号，考虑**虚函数派发**或 **ECS** 替代。
+
+// 切片问题（Object Slicing）
+
+把派生类对象**按值**赋给基类变量，派生类独有部分被"切掉"：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+class Animal {
+public:
+    virtual void speak() const { std::cout << "...\n"; }
+    virtual ~Animal() = default;
+};
+class Dog : public Animal {
+    std::string name = "旺财";
+public:
+    void speak() const override { std::cout << name << ": 汪汪!\n"; }
+};
+int main() {
+    Dog dog;
+    Animal a = dog;    // 💥 切片！
+    a.speak();         // "..." 而非 "旺财: 汪汪!"
+    Animal& ref = dog; // ✅ 引用不切片
+    ref.speak();       // "旺财: 汪汪!"
+}
+}
+
+\danger{**多态必须通过指针或引用。** 按值传递导致切片。容器中存多态对象用 `std::unique_ptr<Base>`。}
+
+/// 新版特性（C++17/20/23）
+
+// C++17: 聚合体与继承
+
+C++17 放宽**聚合初始化（Aggregate Initialization）**，允许有基类的简单类用花括号初始化：
+
+\compare{
+old:
+// C++14——有基类不能聚合初始化
+struct Base { int x; };
+struct Derived : Base { int y; };
+Derived d; d.x = 1; d.y = 2;
+new:
+// C++17
+struct Base { int x; };
+struct Derived : Base { int y; };
+Derived d{{1}, 2};   // ✅
+}
+
+/// 工程实践
+
+// 继承 vs 组合
+
+**优先组合，只在"is-a"关系明确时用继承。**
+
+\table{
+判断维度 | 用继承 | 用组合
+---
+关系类型 | Dog is an Animal | Car has an Engine
+多态需求 | 需基类指针统一处理 | 不需多态
+变化频率 | 类型层次稳定 | 行为需运行时灵活组合
+}
+
+\tip{**ECS（Entity-Component-System）** 就是"组合优于继承"的极致——实体只是 ID，行为由组件决定。把大接口拆成小纯虚接口（`IUpdatable`、`IDrawable`），类只实现需要的——**接口隔离原则（ISP）**。}
+
+/// 难点易错点分析
+
+\danger{**陷阱 1：忘记虚析构。** 有虚函数就加 `virtual ~Class() = default;`。}
+
+\danger{**陷阱 2：不写 override。** 签名拼错编译器不报错，加 override 立刻抓住。}
+
+\danger{**陷阱 3：对象切片。** `Base b = derived;` 切掉派生部分。多态必须用指针/引用。}
+
+\danger{**陷阱 4：构造/析构中调虚函数。** 构造 Derived 时先进 Base 构造函数，此时虚函数不派发到 Derived——输出 `Base::init` 而非 `Derived::init`！}
+\danger{**陷阱 5：菱形继承忘记 virtual。** 基类数据重复→二义性。最佳方案是避免菱形。}
+
+\quiz[tf]{
+Q: 在基类构造函数中调用虚函数，会调用派生类的重写版本。
+ANS: F
+EXP: 构造时派生部分未初始化，vptr 指向当前类的 vtable，标准规定的行为。
+}
+
+\quiz[choice]{
+Q: 以下哪种做法会导致对象切片？
+A: `Base* p = new Derived;`
+B: `Base& ref = derivedObj;`
+C: `Base b = derivedObj;`
+D: `std::unique_ptr<Base> p = std::make_unique<Derived>();`
+ANS: C
+EXP: 只有按值赋值才切片。指针和引用保留完整信息。
+}
+
+\quiz[choice]{
+Q: 含纯虚函数的类，以下正确的是？
+A: 可以实例化但纯虚函数不能调用
+B: 不能实例化，派生类必须实现所有纯虚函数才能实例化
+C: 所有成员函数自动变纯虚
+D: 纯虚函数不能有函数体
+ANS: B
+EXP: 抽象类不能实例化。D 不对——纯虚函数可有函数体（默认实现），但派生类仍须覆盖。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：游戏角色继承体系
+
+完成代码，让 `Warrior` 和 `Mage` 继承 `Character` 并实现 `attack()`。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory>
+class Character {
+protected:
+    std::string name;
+    int hp;
+public:
+    Character(const std::string& n, int h) : name(n), hp(h) {}
+    virtual void attack() const = 0;
+    virtual ~Character() = default;
+    void showStatus() const { std::cout << name << " [HP:" << hp << "]\n"; }
+};
+/* TODO: Warrior 继承 Character，attack() 输出 "<name> 挥剑攻击！" */
+/* TODO: Mage 继承 Character，attack() 输出 "<name> 释放火球！" */
+int main() {
+    std::vector<std::unique_ptr<Character>> team;
+    team.push_back(std::make_unique<Warrior>("亚瑟", 120));
+    team.push_back(std::make_unique<Mage>("梅林", 80));
+    for (auto& c : team) { c->showStatus(); c->attack(); }
+}
+}
+
+// 🟢 基础题 2：虚析构函数修正
+
+下面有内存泄漏，找出并修复。
+
+\run[cpp]{
+#include <iostream>
+class Texture {
+public:
+    Texture()  { std::cout << "Texture 已加载\n"; }
+    ~Texture() { std::cout << "Texture 已释放\n"; }
+};
+class GameObject {
+public:
+    ~GameObject() { std::cout << "~GameObject\n"; }  // BUG在这里
+};
+class Sprite : public GameObject {
+    Texture* tex;
+public:
+    Sprite() : tex(new Texture()) {}
+    ~Sprite() { delete tex; std::cout << "~Sprite\n"; }
+};
+int main() {
+    GameObject* obj = new Sprite();
+    delete obj;   // Texture 释放了吗？
+}
+}
+
+// 🟡 进阶题 1：形状多态计算
+
+实现 `Shape`（纯虚 `area()` + `describe()`），派生 `Circle` 和 `Rectangle`，用智能指针容器计算总面积。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <memory>
+#include <cmath>
+#include <string>
+class Shape {
+public:
+    virtual double area() const = 0;
+    virtual std::string describe() const = 0;
+    virtual ~Shape() = default;
+};
+/* TODO: Circle(double r) — area = M_PI*r*r */
+/* TODO: Rectangle(double w, double h) — area = w*h */
+int main() {
+    std::vector<std::unique_ptr<Shape>> shapes;
+    shapes.push_back(std::make_unique<Circle>(5.0));
+    shapes.push_back(std::make_unique<Rectangle>(3.0, 4.0));
+    shapes.push_back(std::make_unique<Circle>(2.0));
+    double total = 0;
+    for (auto& s : shapes) {
+        std::cout << s->describe() << " -> " << s->area() << "\n";
+        total += s->area();
+    }
+    std::cout << "总面积: " << total << "\n";
+}
+}
+
+// 🟡 进阶题 2：技能系统（多重继承+接口）
+
+定义 `IDamageable`(可受伤) 和 `IHealable`(可治疗) 接口。`Player` 实现两者，`Boss` 只实现 `IDamageable`。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+class IDamageable {
+public:
+    virtual void takeDamage(int amount) = 0;
+    virtual int getHP() const = 0;
+    virtual ~IDamageable() = default;
+};
+class IHealable {
+public:
+    virtual void heal(int amount) = 0;
+    virtual ~IHealable() = default;
+};
+/* TODO: Player(name, hp, maxHP) 继承两个接口 */
+/* TODO: Boss(name, hp) 只继承 IDamageable */
+int main() {
+    Player player("英雄", 100, 100);
+    Boss boss("恶龙", 500);
+    boss.takeDamage(80); player.takeDamage(30); player.heal(20);
+    std::cout << "Player HP: " << player.getHP() << "\n";  // 90
+    std::cout << "Boss HP: "   << boss.getHP()   << "\n";  // 420
+}
+}
+
+// 🔴 挑战题：简化版 ECS
+
+设计简化版 ECS：`Component` 基类（纯虚 `update(float dt)`），实现 `TransformComponent`（位置+速度）和 `HealthComponent`（血量+回血）。`Entity` 持有 `vector<unique_ptr<Component>>`，支持动态添加组件和统一 update。用 `dynamic_cast` 查找特定组件，并思考如何优化。
+
+\collapse[参考思路]{
+\code[cpp]{
+class Component {
+public:
+    virtual void update(float dt) = 0;
+    virtual ~Component() = default;
+};
+class Entity {
+    std::string name;
+    std::vector<std::unique_ptr<Component>> components;
+public:
+    Entity(const std::string& n) : name(n) {}
+    void addComponent(std::unique_ptr<Component> c) {
+        components.push_back(std::move(c));
+    }
+    template<typename T>
+    T* getComponent() {
+        for (auto& c : components)
+            if (auto* p = dynamic_cast<T*>(c.get())) return p;
+        return nullptr;
+    }
+    void update(float dt) {
+        for (auto& c : components) c->update(dt);
+    }
+};
+// 进阶：用 typeid 或模板 tag 替代 dynamic_cast
+}
+}

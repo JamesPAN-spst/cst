@@ -1,0 +1,564 @@
+﻿/// 简介
+
+上一节学了迭代器——容器与算法之间的"桥梁"。这一节终于要过桥了：STL 提供了上百种**通用算法（Generic Algorithms）**，涵盖查找、排序、变换、数值计算等日常操作。
+
+为什么不自己手写循环？两个原因：第一，手写循环容易犯"差一"错误，而 STL 算法经过千锤百炼、边界处理可靠；第二，同一个 `std::sort` 可以排 `vector<int>`、排 `deque<Player>`、排原生数组——**一份代码适配所有容器**。更妙的是，C++17 加入了**并行执行策略（Execution Policy）**让算法自动多线程，C++20 的 **Ranges** 又把冗长的 `begin()/end()` 简化成直接传容器。
+
+/// 知识点列表
+
+\list{
+- 算法概述与分类 — 非修改 / 修改 / 排序 / 数值四大族
+- 查找类算法 — find, find_if, count, count_if, any_of / all_of / none_of
+- 排序类算法 — sort, stable_sort, partial_sort, nth_element
+- 修改类算法 — transform, for_each, copy, copy_if, remove/remove_if + erase
+- 数值类算法 — accumulate, inner_product, iota
+- lambda 表达式与算法配合 — 捕获列表、泛型 lambda
+- C++17 并行执行策略 — std::execution::seq / par / par_unseq
+- C++20 Ranges 算法与管道 — ranges::sort, views::filter, 管道 |
+}
+
+/// 知识点详解
+
+// 算法概述与分类
+
+**动机：** 你在开发一个游戏排行榜系统，需要排序玩家分数、查找指定玩家、过滤低分记录、计算总分……这些操作手写循环能做，但每次都要处理边界、迭代器递增、空容器判断。STL 算法把这些"苦力活"封装好了，你只需告诉它"做什么"。
+
+所有 STL 算法都定义在 `<algorithm>` 和 `<numeric>` 中，按功能分为四大族：
+
+\table{
+分类 | 代表算法 | 特点
+---
+非修改（Non-modifying） | `find`, `count`, `all_of` | 只读遍历，不改变元素
+修改（Modifying） | `transform`, `copy`, `remove` | 改变元素值或位置
+排序（Sorting） | `sort`, `stable_sort`, `nth_element` | 重排元素顺序
+数值（Numeric） | `accumulate`, `inner_product`, `iota` | 数学运算，在 `<numeric>` 中
+}
+
+\note{几乎所有算法都接受**迭代器对** `[first, last)` 表示操作范围，与上一节学的半开区间模型一致。C++20 起 `std::ranges::` 版本允许直接传容器。}
+
+// 查找类算法
+
+**动机：** 游戏中最频繁的操作之一就是"**找**"——找某个敌人、找血量低于 30% 的单位、判断是否所有玩家都准备就绪。
+
+`find` 按值查找，返回第一个匹配的迭代器；`find_if` 按条件查找，接受一个**谓词（Predicate）**——返回 `bool` 的可调用对象。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <string>
+
+struct Enemy {
+    std::string name;
+    int hp;
+};
+
+int main() {
+    std::vector<int> ids = {101, 205, 303, 418, 502};
+    auto it = std::find(ids.begin(), ids.end(), 303);
+    if (it != ids.end())
+        std::cout << "找到 id=303，位置: " << (it - ids.begin()) << "\n";
+
+    std::vector<Enemy> enemies = {{"Goblin", 30}, {"Dragon", 500}, {"Slime", 10}};
+    auto weak = std::find_if(enemies.begin(), enemies.end(),
+        [](const Enemy& e) { return e.hp < 20; });
+    if (weak != enemies.end())
+        std::cout << "弱敌: " << weak->name << " (HP=" << weak->hp << ")\n";
+    return 0;
+}
+}
+
+**`std::count` / `std::count_if`** 返回匹配元素的个数。**`std::all_of` / `std::any_of` / `std::none_of`** 回答"是否全部/至少一个/没有一个满足条件"：
+
+\code[cpp]{
+int num_low = std::count_if(enemies.begin(), enemies.end(),
+    [](const Enemy& e) { return e.hp < 100; });  // 2
+
+bool all_alive = std::all_of(enemies.begin(), enemies.end(),
+    [](const Enemy& e) { return e.hp > 0; });
+bool has_boss = std::any_of(enemies.begin(), enemies.end(),
+    [](const Enemy& e) { return e.hp >= 500; });
+}
+
+\tip{`all_of`/`any_of`/`none_of` 比手写循环 + `bool` 标志清晰得多，适合写前置条件检查。}
+
+// 排序类算法
+
+**动机：** 排行榜要排序、碰撞检测前要按坐标排序加速邻近查找、`binary_search` 要求有序……STL 提供四种不同"力度"的排序。
+
+\table{
+算法 | 功能 | 复杂度 | 稳定
+---
+`sort` | 完全排序 | O(n log n) | ❌
+`stable_sort` | 完全排序，保持等值元素原始顺序 | O(n log n)，可能多用内存 | ✅
+`partial_sort` | 只排前 k 个 | O(n log k) | ❌
+`nth_element` | 第 n 小放到正确位置，左边都更小 | O(n) 平均 | ❌
+}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+int main() {
+    // sort：默认升序，传 greater 降序
+    std::vector<int> scores = {88, 45, 92, 73, 65, 97, 81};
+    std::sort(scores.begin(), scores.end(), std::greater<int>{});
+    // scores = {97, 92, 88, 81, 73, 65, 45}
+
+    // partial_sort：只需要前 3 名
+    std::vector<int> data = {88, 45, 92, 73, 65, 97, 81};
+    std::partial_sort(data.begin(), data.begin() + 3, data.end(), std::greater<int>{});
+    std::cout << "Top 3: ";
+    for (int i = 0; i < 3; ++i) std::cout << data[i] << " ";
+    std::cout << "\n";  // 97 92 88
+
+    // nth_element：快速找中位数
+    std::vector<int> vals = {88, 45, 92, 73, 65, 97, 81};
+    int mid = vals.size() / 2;
+    std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+    std::cout << "中位数: " << vals[mid] << "\n";  // 81
+    return 0;
+}
+}
+
+\collapse[🤔 什么时候选 partial_sort 而不是 sort？]{
+当你只需要"前 k 大/小"时，`partial_sort` 的 O(n log k) 比 `sort` 的 O(n log n) 快。典型场景：排行榜只显示 Top 10，但有十万名玩家——速度差异巨大。如果只需第 k 个元素本身（如中位数），`nth_element` 更快——O(n)。
+}
+
+// 修改类算法
+
+**动机：** "对每个元素做某件事"、"把满足条件的复制出来"、"删掉不需要的"——修改类算法把这些操作标准化。
+
+**`std::for_each`** 遍历执行操作；**`std::transform`** 映射生成新序列；**`std::copy_if`** 条件复制：
+
+\code[cpp]{
+// for_each：所有敌人受 10 点 AOE 伤害
+std::for_each(enemies.begin(), enemies.end(), [](Enemy& e) { e.hp -= 10; });
+
+// transform：计算 HP 百分比
+std::vector<int> hp_list = {100, 80, 50};
+std::vector<float> hp_pct;
+std::transform(hp_list.begin(), hp_list.end(), std::back_inserter(hp_pct),
+    [](int hp) { return hp / 100.0f; });  // {1.0, 0.8, 0.5}
+
+// copy_if：筛选及格分数
+std::vector<int> all = {92, 45, 78, 33, 88}, passed;
+std::copy_if(all.begin(), all.end(), std::back_inserter(passed),
+    [](int s) { return s >= 60; });  // {92, 78, 88}
+}
+
+**`std::remove` / `std::remove_if` + `erase`** — STL 最经典的"坑"：
+
+\tabs{
+\tab[C++17前：erase-remove 惯用法]{
+`std::remove_if` **不真正删除**！它把保留的元素移到前面，返回"新逻辑末尾"迭代器，但容器大小不变。必须配合 `erase()`：
+
+\code[cpp]{
+std::vector<int> v = {1, 2, 3, 4, 5, 6};
+auto new_end = std::remove_if(v.begin(), v.end(), [](int x) { return x % 2 == 0; });
+v.erase(new_end, v.end());  // 现在 v = {1, 3, 5}
+}
+}
+\tab[C++20：std::erase_if]{
+\code[cpp]{
+std::vector<int> v = {1, 2, 3, 4, 5, 6};
+std::erase_if(v, [](int x) { return x % 2 == 0; });  // v = {1, 3, 5}
+}
+}
+}
+
+\danger{**经典错误：只调用 `remove` 不调用 `erase`**，以为元素已删除，结果遍历到"幽灵元素"。}
+
+// 数值类算法
+
+**动机：** 求总分、求点积、生成连续编号——`<numeric>` 头文件提供了一组小巧但实用的数值算法。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <numeric>
+
+int main() {
+    std::vector<int> scores = {90, 85, 78, 92, 88};
+    int total = std::accumulate(scores.begin(), scores.end(), 0);
+    std::cout << "总分: " << total << "\n";  // 433
+
+    // accumulate + 自定义操作：求乘积（注意初始值是 1 不是 0）
+    int product = std::accumulate(scores.begin(), scores.end(), 1,
+        [](int a, int b) { return a * b; });
+
+    // inner_product：向量点积
+    std::vector<float> a = {1.0f, 2.0f, 3.0f}, b = {4.0f, 5.0f, 6.0f};
+    float dot = std::inner_product(a.begin(), a.end(), b.begin(), 0.0f);
+    std::cout << "点积: " << dot << "\n";  // 32
+
+    // iota：填充连续值
+    std::vector<int> ids(10);
+    std::iota(ids.begin(), ids.end(), 1);  // {1, 2, ..., 10}
+    for (int id : ids) std::cout << id << " ";
+    std::cout << "\n";
+    return 0;
+}
+}
+
+\warning{**`accumulate` 的初始值类型决定返回类型！** 对 `vector<double>` 求和传 `0`（int），结果被截断。正确做法：传 `0.0`。}
+
+// lambda 表达式与算法配合
+
+**动机：** 前面每个示例里的 `[](auto x){ ... }` 就是 **lambda 表达式（Lambda Expression）**。C++11 之前给算法传自定义操作得单独定义**函数对象类（Functor）**，极其啰嗦。lambda 把函数定义内联到调用点。
+
+**捕获列表（Capture List）** 是 lambda 的关键——指定能"看见"外部哪些变量：
+
+\table{
+写法 | 含义
+---
+`[]` | 不捕获
+`[x]` | 按值捕获 x（副本）
+`[&x]` | 按引用捕获 x
+`[=]` | 按值捕获所有用到的变量
+`[&]` | 按引用捕获所有
+`[=, &x]` | 默认按值，x 按引用
+`[this]` | 捕获当前对象指针
+}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+
+int main() {
+    std::vector<int> damage = {25, 80, 15, 60, 45};
+    int threshold = 30;
+
+    // 按值捕获 threshold
+    int count = std::count_if(damage.begin(), damage.end(),
+        [threshold](int d) { return d >= threshold; });
+    std::cout << "高伤害次数: " << count << "\n";  // 3
+
+    // 按引用捕获 sum_above，在 lambda 中累加
+    int sum_above = 0;
+    std::for_each(damage.begin(), damage.end(),
+        [threshold, &sum_above](int d) {
+            if (d >= threshold) sum_above += d;
+        });
+    std::cout << "高伤害总值: " << sum_above << "\n";  // 185
+
+    // C++14 泛型 lambda
+    auto print = [](const auto& v) {
+        for (const auto& x : v) std::cout << x << " ";
+        std::cout << "\n";
+    };
+    print(damage);
+    return 0;
+}
+}
+
+\tip{简单谓词（一两行）用 lambda；复杂逻辑（>10 行）提取成命名函数。lambda 太长会让算法调用难以阅读。}
+
+/// 新版特性（C++17/20/23）
+
+// C++17 并行执行策略
+
+**动机：** 现代 CPU 多核，但传统 STL 算法单线程。C++17 的**执行策略（Execution Policy）** 只需加一个参数就能并行化。
+
+\table{
+策略 | 含义
+---
+`std::execution::seq` | 顺序执行（与传统行为相同）
+`std::execution::par` | 并行执行（多线程）
+`std::execution::par_unseq` | 并行 + 向量化（SIMD）
+}
+
+\code[cpp]{
+#include <algorithm>
+#include <execution>
+#include <vector>
+
+std::vector<int> huge(10'000'000);
+std::sort(std::execution::par, huge.begin(), huge.end());        // 并行排序
+std::transform(std::execution::par, huge.begin(), huge.end(),
+    huge.begin(), [](int x) { return x * 2; });                  // 并行变换
+}
+
+\warning{**并行 lambda 必须线程安全！** 不能修改共享非原子变量，否则是**未定义行为（Undefined Behavior）**。}
+
+\note{小数据集（<万）的并行开销可能大于收益。MSVC 和 GCC（需 TBB）支持较好，Clang 尚不完整。}
+
+// C++20 Ranges 算法与管道
+
+**动机：** `v.begin(), v.end()` 写着啰嗦，嵌套操作像套娃。C++20 **Ranges** 带来两大改进：**直接传容器** 和 **管道 `|`**。
+
+\tabs{
+\tab[传统写法]{
+\code[cpp]{
+std::sort(v.begin(), v.end());
+auto it = std::find_if(v.begin(), v.end(), [](int x){ return x > 5; });
+}
+}
+\tab[Ranges 写法]{
+\code[cpp]{
+std::ranges::sort(v);
+auto it = std::ranges::find_if(v, [](int x){ return x > 5; });
+}
+}
+}
+
+**投影（Projection）** 是 Ranges 的杀手特性——对结构体排序不用写完整 lambda：
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <ranges>
+#include <string>
+
+struct Player {
+    std::string name;
+    int score;
+};
+
+int main() {
+    std::vector<Player> players = {
+        {"Alice", 920}, {"Bob", 750}, {"Charlie", 880}, {"Diana", 950}
+    };
+    // 按 score 降序——投影 + 比较器
+    std::ranges::sort(players, std::greater{}, &Player::score);
+    for (const auto& p : players)
+        std::cout << p.name << ": " << p.score << "\n";
+    auto& best = *std::ranges::max_element(players, {}, &Player::score);
+    std::cout << "MVP: " << best.name << "\n";
+    return 0;
+}
+}
+
+**管道（Views + Pipe）** 把多个变换串成链式调用。**视图（View）** 是**惰性求值（Lazy Evaluation）**的——不创建中间容器，遍历时按需计算：
+
+\code[cpp]{
+#include <ranges>
+namespace rv = std::views;
+
+std::vector<int> data = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+auto result = data
+    | rv::filter([](int x) { return x % 2 == 0; })   // {2,4,6,8,10}
+    | rv::transform([](int x) { return x * x; })      // {4,16,36,64,100}
+    | rv::take(3);                                     // {4,16,36}
+for (int x : result) std::cout << x << " ";  // 遍历时才计算
+}
+
+\collapse[🤔 views 和 algorithms 有什么关系？]{
+`std::ranges::` 算法是"**急性（Eager）**"的——调用时立即执行。`std::views::` 适配器是"**惰性（Lazy）**"的——只定义变换规则，遍历时才计算。两者配合：视图过滤/变换数据流，算法执行最终操作。
+}
+
+/// 工程实践
+
+\table{
+需求 | 推荐 | 避免
+---
+遍历操作 | `for_each` 或 range-for | 手写下标循环
+条件筛选 | `copy_if` / `views::filter` | 循环 + push_back
+批量变换 | `transform` | 循环 + push_back
+删除元素 | `std::erase_if`（C++20）/ erase-remove | 循环中单个 `erase`（O(n²)）
+前 k 大 | `partial_sort` / `nth_element` | 全排序再取前 k
+存在性 | `any_of` | `find != end`
+}
+
+\tip{**"No raw loops"原则：** 现代 C++ 提倡优先用 STL 算法。算法名本身就表达意图——`copy_if` 一眼看出是条件复制，手写循环需读完循环体才能理解。}
+
+\tip{**游戏开发算法热点：** 1）`nth_element` 快速中位数（LOD 切换距离）。2）`partition` 分离存活/死亡实体。3）`sort` + 自定义比较器做渲染排序（先材质、再深度）。}
+
+/// 难点易错点分析
+
+\danger{**`std::remove` 不删除元素！** `remove`/`remove_if` 只把保留元素移到前面，`size()` 不变。必须配合 `erase()` 才能真正移除。C++20 `std::erase_if` 终于解决此问题。}
+
+\danger{**二分查找必须在有序范围上调用！** `binary_search`、`lower_bound`、`upper_bound` 对未排序范围是**未定义行为**——编译器不报错，结果不可预测。}
+
+\danger{**`accumulate` 初始值类型陷阱。** 对 `vector<double>` 求和传 `0`（int），浮点被截断！应传 `0.0`。}
+
+\warning{**`sort` 要求随机访问迭代器。** 不能对 `std::list` 用 `std::sort`——用 `list.sort()` 成员函数。}
+
+\warning{**循环中逐个 `erase` 是 O(n²)！** 每删一个元素后面全部前移。正确做法：erase-remove 或 `erase_if`。}
+
+\quiz[choice]{
+Q: 以下代码执行后 `v.size()` 是多少？
+```
+std::vector<int> v = {1, 2, 3, 4, 5};
+std::remove_if(v.begin(), v.end(), [](int x){ return x % 2 == 0; });
+```
+A: 3
+B: 5
+C: 2
+D: 0
+ANS: B
+EXP: `remove_if` 不改变容器大小！它把保留元素移到前面，返回新逻辑末尾迭代器。`v.size()` 仍为 5。必须调用 `v.erase(返回值, v.end())` 才能缩小容器。
+}
+
+\quiz[tf]{
+Q: `std::partial_sort(v.begin(), v.begin()+5, v.end())` 执行后，前 5 个元素是最小的 5 个且有序，后面的元素顺序不确定。
+ANS: T
+EXP: `partial_sort` 保证 `[begin, middle)` 是最小 k 个且有序，`[middle, end)` 无顺序保证。
+}
+
+\quiz[choice]{
+Q: 对 `vector<float>` 求和，哪个调用正确？
+A: `std::accumulate(v.begin(), v.end(), 0)`
+B: `std::accumulate(v.begin(), v.end(), 0.0f)`
+C: `std::accumulate(v.begin(), v.end(), 0.0)`
+D: B 和 C 都正确
+ANS: D
+EXP: A 的初始值 `0` 是 int，每次加法结果被截断。B 用 float 精确匹配，C 用 double 也可以。A 是典型类型陷阱。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：敌人筛选器
+
+用 STL 算法完成：统计存活敌人、找血量最低的存活敌人、对所有存活敌人施加 AOE 伤害。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <string>
+
+struct Enemy {
+    std::string name;
+    int hp;
+    bool alive() const { return hp > 0; }
+};
+
+int main() {
+    std::vector<Enemy> enemies = {
+        {"Goblin", 45}, {"Orc", 120}, {"Skeleton", 0},
+        {"Dragon", 500}, {"Slime", 15}, {"Bat", 30}
+    };
+
+    // TODO 1: 用 count_if 统计存活（hp > 0）的敌人数量
+
+    // TODO 2: 用 min_element 找血量最低的存活敌人
+    // 提示：先 copy_if 筛选到新 vector，再 min_element
+
+    // TODO 3: 用 for_each 给所有存活敌人扣 20 HP，然后打印状态
+
+    return 0;
+}
+}
+
+// 🟢 基础题 2：分数排行榜
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <string>
+
+struct Player {
+    std::string name;
+    int score;
+};
+
+int main() {
+    std::vector<Player> players = {
+        {"Alice", 850}, {"Bob", 920}, {"Charlie", 780},
+        {"Diana", 990}, {"Eve", 670}, {"Frank", 880}
+    };
+
+    // TODO 1: sort 按 score 降序
+    // TODO 2: 打印前 3 名
+    // TODO 3: accumulate 计算平均分（注意初始值类型！）
+    // TODO 4: count_if 统计高于平均的玩家数
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：游戏实体清理管线
+
+用 partition 分离存活/死亡实体 → sort 按优先级排序 → count_if 分类统计 → accumulate 求 HP 总和。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <numeric>
+#include <string>
+
+struct Entity {
+    int id;
+    std::string type;  // "enemy", "npc", "pickup"
+    int hp;
+    int priority;
+};
+
+int main() {
+    std::vector<Entity> entities = {
+        {1, "enemy", 100, 3}, {2, "npc",    50, 1},
+        {3, "enemy",   0, 3}, {4, "pickup", -1, 2},
+        {5, "enemy", 200, 5}, {6, "npc",    80, 1},
+        {7, "enemy",  30, 4}, {8, "pickup", -1, 2},
+    };
+
+    // TODO 1: partition 把 hp > 0 的移到前面，返回分界迭代器
+    // TODO 2: 对存活部分按 priority 降序 sort
+    // TODO 3: count_if 统计存活 enemy/npc/pickup 数量
+    // TODO 4: accumulate 计算存活实体 HP 总和
+    // 打印结果
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：Ranges 管道实战
+
+\run[cpp20]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <ranges>
+#include <string>
+
+struct Item {
+    std::string name;
+    int value;
+    std::string rarity;  // "common", "rare", "legendary"
+};
+
+int main() {
+    std::vector<Item> loot = {
+        {"Iron Sword", 50, "common"}, {"Gold Ring", 200, "rare"},
+        {"Health Potion", 25, "common"}, {"Dragon Scale", 1000, "legendary"},
+        {"Leather Boots", 80, "common"}, {"Magic Wand", 500, "rare"},
+        {"Old Scroll", 10, "common"}, {"Phoenix Feather", 2000, "legendary"},
+    };
+
+    // TODO 1: ranges::sort 按 value 降序
+    // TODO 2: 管道筛选 rarity != "common"，取前 3，打印
+    // TODO 3: ranges::find_if 找第一个 legendary
+    // TODO 4: 计算所有 rare 物品总价值
+
+    return 0;
+}
+}
+
+// 🔴 挑战题：战斗模拟排行系统
+
+设计战斗模拟：多角色多轮战斗，每轮随机伤害。要求：
+- `generate`/`iota` 初始化角色
+- `transform` 模拟伤害计算
+- `partial_sort` 维护 Top 3
+- `accumulate` 统计场均数据
+- `erase_if` 清除死亡角色
+- Ranges 管道生成最终排行
+
+验收：输出每轮 Top 3、最终排行榜、场均统计。
+
+\collapse[参考思路]{
+1. `struct Fighter { string name; int hp; int total_damage; int kills; }`
+2. 每轮 `transform` 生成随机伤害值，`for_each` 应用到目标
+3. `erase_if` 清除 hp <= 0 的角色
+4. `partial_sort` 按 total_damage 排前 3 输出
+5. 循环到只剩 1 人或达最大轮数
+6. `ranges::sort` + `views::transform` 输出排行报告
+关键：用 `<random>` 的 `mt19937` + `uniform_int_distribution`，不要用 `rand()`。
+}

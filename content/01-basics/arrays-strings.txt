@@ -1,0 +1,624 @@
+/// 简介
+
+上节课你学了变量——一个"带标签的盒子"，里面放一个数据。但如果你要存全班30个同学的成绩呢？难道写30个变量 `score1, score2, score3, ..., score30`？那也太蠢了吧！
+
+这就是**数组（Array）**要解决的问题：它是一排连续的盒子，用一个名字就能管理所有数据。而**字符串（String）**本质上就是一种特殊的数组——一排连续的字符。
+
+C++ 里有好几种数组和字符串类型：从最原始的 C 数组和 `char*`，到现代的 `std::array`、`std::string`、`std::string_view`、`std::span`。你可能会问：搞这么多种干嘛？答案是——C 数组到处是坑，现代 C++ 一步步在填坑。
+
+这节课我们从"坑"讲起，然后看现代 C++ 怎么帮你避开这些坑。读完之后，你就知道什么时候该用哪种类型了。
+
+/// 知识点列表
+
+\list{
+- C 风格数组及其致命缺陷
+- std::array——编译期大小已知的安全数组（C++11）
+- std::span——数组的"只读窗口"（C++20）
+- C 风格字符串（char*）为什么危险
+- std::string——自动管理的字符串
+- std::string_view——零拷贝的字符串视图（C++17）
+- 原始字符串字面量（Raw String Literal）
+- 字符串格式化——std::format 和 std::println
+}
+
+/// 知识点详解
+
+// C 风格数组——"一排盒子"
+
+**类比：** 想象你有一排 5 个格子的储物柜，每个格子里放一个整数。这就是 C 风格数组。
+
+\code[cpp]{
+int arr[5] = {1, 2, 3, 4, 5};  // 声明一个有5个格子的数组
+int partial[5] = {1, 2};        // 只填了前2个，后面自动补0 → {1, 2, 0, 0, 0}
+int zeros[5] = {};               // 全部是0
+int deduced[] = {1, 2, 3};       // 编译器自动数出来：3个格子
+}
+
+访问数组的方式是用方括号 `[]` 加**下标（Index）**，注意下标从 0 开始，不是 1！
+
+\code[cpp]{
+arr[0] = 10;  // 第一个格子（不是 arr[1]！）
+arr[4] = 50;  // 最后一个格子
+// arr[5] = ?  // ❌ 越界！只有 arr[0]~arr[4]，没有 arr[5]
+}
+
+来看看数组在内存里长什么样：
+
+\diagram[memory]{
+stack:
+  [0x7ff0] arr[0] = 1
+  [0x7ff4] arr[1] = 2
+  [0x7ff8] arr[2] = 3
+  [0x7ffc] arr[3] = 4
+  [0x8000] arr[4] = 5
+}
+
+看到了吧？5 个 `int` 紧挨着排成一排，每个占 4 字节，地址连续递增。这就是"连续存储"。
+
+好，现在你会用 C 数组了。但我要泼你一盆冷水——**C 数组有一堆致命缺陷，在现代 C++ 中你几乎不应该用它。**
+
+// C 数组的致命缺陷——先看坑，再学填坑
+
+\danger{**C 数组有五大致命缺陷：**}
+
+\list{
+- **不知道自己有多大**——传给函数时退化（Decay）为指针，大小信息丢失
+- **没有边界检查**——越界访问是未定义行为（UB），可能炸程序，也可能默默出错
+- **不能拷贝赋值**——不能 `arr2 = arr1`
+- **不能作为函数返回值**
+- **不能直接比较**——`arr1 == arr2` 比较的是指针地址，永远不是你想的"逐元素比较"
+}
+
+来，我们用代码亲眼看看这些坑：
+
+\run[cpp]{
+#include <iostream>
+
+void printSize(int arr[]) {
+    // 以为能拿到数组大小？天真！
+    // arr 在这里已经退化成 int* 了
+    std::cout << "函数内 sizeof(arr) = " << sizeof(arr) << " 字节" << std::endl;
+    std::cout << "（这是指针的大小，不是数组的大小！）" << std::endl;
+}
+
+int main() {
+    int a[] = {10, 20, 30, 40, 50};
+    std::cout << "main 里 sizeof(a) = " << sizeof(a) << " 字节" << std::endl;
+    std::cout << "（5 个 int × 4 字节 = 20 字节 ✓）" << std::endl;
+    std::cout << std::endl;
+
+    printSize(a);  // 传给函数后大小信息就丢了！
+
+    std::cout << std::endl;
+    
+    // 另一个坑：数组"比较"
+    int b[] = {10, 20, 30, 40, 50};
+    if (a == b) {
+        std::cout << "a 和 b 相等" << std::endl;
+    } else {
+        std::cout << "a == b 是 false！（比较的是地址，不是内容）" << std::endl;
+    }
+
+    return 0;
+}
+}
+
+点击"▶ 运行"，你会看到：函数内 `sizeof` 变成了 8（指针大小），而且明明内容一样的两个数组比较结果却是 `false`。这就是 C 数组的"坑"。
+
+那怎么办？C++11 给出了答案——
+
+// std::array——安全的固定大小数组
+
+**`std::array`** 就是 C 数组的现代替代品。它修复了上面所有的缺陷：知道自己的大小、能拷贝、能比较、能作为返回值。
+
+\code[cpp]{
+#include <array>
+
+std::array<int, 5> arr = {1, 2, 3, 4, 5};
+
+arr.size();       // 5（编译期常量，永远准确！）
+arr.at(2);        // 带边界检查：越界抛出 std::out_of_range 异常
+arr[2];           // 不带边界检查：越界是 UB（和 C 数组一样快，但一样危险）
+arr.front();      // 第一个元素
+arr.back();       // 最后一个元素
+arr.data();       // 拿到底层 C 数组的指针（兼容旧 API 用）
+arr.fill(0);      // 把所有元素填成 0
+}
+
+看看 `std::array` 是怎么修复那些坑的：
+
+\tabs{
+\tab[C 数组（满是坑）]{
+\code[cpp]{
+// ❌ 传参后大小丢失
+void process(int arr[]) {
+    // sizeof(arr) 是指针大小，没用！
+}
+
+// ❌ 不能拷贝
+int a[] = {1, 2, 3};
+int b[3];
+// b = a;  // 编译错误！
+
+// ❌ 不能比较内容
+int c[] = {1, 2, 3};
+// a == c;  // 比较指针地址，不是内容
+}
+}
+\tab[std::array（全部修复）]{
+\code[cpp]{
+#include <array>
+
+// ✅ 传参后大小保留
+void process(const std::array<int, 3>& arr) {
+    arr.size(); // 3，永远准确
+}
+
+// ✅ 能拷贝
+std::array<int, 3> a = {1, 2, 3};
+auto b = a; // 完整拷贝！
+
+// ✅ 逐元素比较
+std::array<int, 3> c = {1, 2, 3};
+a == c; // true！逐元素比较内容
+}
+}
+}
+
+\code[cpp]{
+// C++17 CTAD（类模板参数推导）——编译器帮你推导类型和大小
+std::array a2 = {1, 2, 3, 4}; // 推导为 std::array<int, 4>
+
+// constexpr 使用——编译期数组
+constexpr std::array<int, 3> ca = {10, 20, 30};
+static_assert(ca[1] == 20); // 编译期就验证了
+
+// C++20: std::to_array——从 C 数组快速创建 std::array
+auto a3 = std::to_array({1, 2, 3});   // std::array<int, 3>
+auto a4 = std::to_array("hello");     // std::array<char, 6>（含 '\0'）
+}
+
+\tip{**黄金规则：大小编译期已知用 `std::array`，大小运行时确定用 `std::vector`（后面章节会讲），永远不用 C 数组。**}
+
+// std::span——数组的"只读窗口"（C++20）
+
+**类比：** 你有一柜子书（`std::array` 或 `std::vector`），你不想把整柜子搬给朋友看，而是给他一个"窗口"让他看其中几本。`std::span` 就是这个窗口——它不拥有数据，只是指向别人的数据。
+
+\code[cpp]{
+#include <span>
+
+// span 作为函数参数：任何连续容器都能传进来！
+void process(std::span<const int> data) {
+    for (int x : data) { /* ... */ }
+    data.size();           // 知道有多少元素
+    data[0];               // 可以访问
+    data.subspan(1, 3);    // 取子视图（从下标1开始取3个）
+}
+
+// 以下全部都能传给上面的函数：
+std::vector<int> vec = {1, 2, 3, 4, 5};
+std::array<int, 5> arr = {1, 2, 3, 4, 5};
+int cArr[] = {1, 2, 3, 4, 5};
+
+process(vec);
+process(arr);
+process(cArr);
+process({vec.data() + 1, 3}); // 只看 vec 中间3个元素
+}
+
+\note{`std::span` 不拥有数据，只是一个"指针 + 长度"。你必须确保 span 使用期间底层数据还活着。它是替代"指针 + 大小"参数对的现代方案。}
+
+\collapse[🤔 什么时候该用 span？]{
+`std::span` 最大的好处是**统一接口**。以前你写个函数想同时接受 `vector`、`array`、C 数组，得写三个重载或用模板。现在只要参数写成 `std::span<const int>`，三种都能传。
+
+用 `std::span` 的场景：
+- 函数只需要**读取**一段连续数据，不关心数据具体存在哪种容器里
+- 替代老代码中的 `void func(const int* data, int size)` 这种"指针+大小"参数对
+
+不该用 `std::span` 的场景：
+- 需要存储数据（span 不拥有数据，底层数据销毁后 span 就悬空了）
+- 数据不是连续存储的（比如 `std::list`）
+}
+
+// C 风格字符串——更大的坑
+
+C 风格字符串就是一个 `char` 数组，以 `'\0'`（空字符，Null Terminator）结尾。
+
+\code[cpp]{
+char greeting[] = "hello";  // 实际存了 6 个字符：h, e, l, l, o, \0
+}
+
+\diagram[memory]{
+stack:
+  [0x7ff0] greeting[0] = 'h'
+  [0x7ff1] greeting[1] = 'e'
+  [0x7ff2] greeting[2] = 'l'
+  [0x7ff3] greeting[3] = 'l'
+  [0x7ff4] greeting[4] = 'o'
+  [0x7ff5] greeting[5] = '\0'
+}
+
+看到最后那个 `'\0'` 了吗？这就是 C 字符串的"结束标记"。所有 C 字符串函数（`strlen`、`strcmp`……）都靠这个 `'\0'` 来判断字符串在哪里结束。如果你不小心丢了这个 `'\0'`，函数就会一直往后读内存，直到碰到一个碰巧是 0 的字节——这就是**缓冲区溢出（Buffer Overflow）**，安全漏洞的头号元凶。
+
+\danger{**C 字符串有 C 数组的全部缺陷，外加更多坑：手动管理内存、容易忘记 `'\0'`、容易缓冲区溢出。在现代 C++ 中请用 `std::string`。**}
+
+// std::string——自动管理的字符串
+
+`std::string` 帮你管理了一切：自动分配内存、自动扩容、自动释放、知道自己的长度、能拷贝、能比较、能拼接。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+using namespace std::string_literals; // 启用 "..."s 后缀
+
+int main() {
+    std::string s1 = "hello";
+    auto s2 = "world"s;        // "..."s 直接创建 std::string
+    std::string s3(5, '*');     // "*****"（5个星号）
+
+    // 拼接
+    s1 += " ";
+    s1 += s2;
+    std::cout << s1 << std::endl;  // "hello world"
+
+    // 常用操作
+    std::cout << "长度: " << s1.size() << std::endl;
+    std::cout << "是否为空: " << s1.empty() << std::endl;
+    std::cout << "子串: " << s1.substr(0, 5) << std::endl;
+
+    // 查找
+    auto pos = s1.find("world");
+    if (pos != std::string::npos) {
+        std::cout << "找到 'world' 在位置: " << pos << std::endl;
+    }
+
+    // 数值转换
+    int n = std::stoi("42");
+    double d = std::stod("3.14");
+    std::string ns = std::to_string(42);
+    std::cout << "stoi: " << n << ", stod: " << d 
+              << ", to_string: " << ns << std::endl;
+
+    return 0;
+}
+}
+
+试着运行上面的代码，然后改改 `s1` 的内容，看看 `find` 和 `substr` 的结果怎么变化。
+
+\code[cpp]{
+// C++20 新增：更方便的前缀/后缀检查
+s1.starts_with("hello");  // true
+s1.ends_with("world");    // true
+
+// C++23 新增
+s1.contains("lo wo");     // true
+}
+
+\warning{**`std::string` 的 `operator[]` 不做边界检查！** 越界访问是 UB。调试阶段请用 `.at()`，它越界会抛出异常提醒你。}
+
+\collapse[🔍 SSO：小字符串优化]{
+你可能想问：`std::string` 每次都要在堆上分配内存吗？那短字符串岂不是很浪费？
+
+好消息是——大多数编译器实现了**SSO（Small String Optimization，小字符串优化）**：
+
+- 短字符串（通常 ≤ 15 或 22 字节，取决于编译器）直接存在 `std::string` 对象内部，不需要堆分配
+- 长字符串才会在堆上分配内存
+
+这意味着像 `"hello"`、`"OK"`、`"error"` 这样的短字符串拷贝起来非常快。但也意味着 `std::string` 对象本身通常占 32 字节（即使存的是空字符串），不要以为它很小。
+}
+
+// std::string_view——零拷贝的"观察窗"（C++17）
+
+**类比：** `std::string` 是你自己的书（你拥有它，能修改它），`std::string_view` 是图书馆的阅览窗口——你能看，但不能改，而且书不是你的，图书馆关门了窗口就没用了。
+
+\code[cpp]{
+#include <string_view>
+
+void greet(std::string_view name) {
+    // string_view 只读、不拥有数据、零拷贝
+    std::cout << "Hello, " << name << "!" << std::endl;
+}
+
+// 以下全部零拷贝传入，没有字符串复制！
+greet("world");                    // const char* → string_view ✓
+greet(std::string("world"));       // std::string → string_view ✓
+
+// string_view 操作（都是零拷贝）
+std::string_view sv = "hello world";
+sv.size();               // 11
+sv.substr(6, 5);         // "world"（返回新的 string_view，不复制字符！）
+sv.starts_with("hello"); // true（C++20）
+sv.remove_prefix(6);     // sv 现在指向 "world"（只移动了指针，零拷贝）
+}
+
+\danger{**string_view 的生命周期陷阱——最常见的 Bug！**}
+
+\code[cpp]{
+// ❌ 错误：返回局部 string 的 view
+std::string_view bad() {
+    std::string s = "temporary";
+    return s;  // s 被销毁后 string_view 指向无效内存！
+}
+
+// ❌ 错误：view 比原始数据活得久
+std::string_view sv;
+{
+    std::string s = "scoped";
+    sv = s;  // sv 指向 s 的内存
+}
+// s 已经销毁了，sv 悬空！使用 sv 是 UB！
+}
+
+\tip{**选择指南：**
+- 函数参数只读字符串 → `std::string_view`（零拷贝最快）
+- 需要拥有/修改字符串 → `std::string`
+- 函数返回值 → `std::string`（不要返回 `string_view`，除非返回的是成员变量或全局数据）
+}
+
+// 原始字符串字面量——告别转义地狱
+
+写过 Windows 路径或正则表达式吗？反斜杠 `\` 需要转义成 `\\`，搞得代码像乱码。原始字符串字面量（Raw String Literal）帮你解决这个问题：
+
+\code[cpp]{
+// R"delimiter(内容)delimiter" 语法——内部所有字符原样保留，不需要转义
+auto path = R"(C:\Users\pan\Documents)";  // 不用写 C:\\Users\\pan\\Documents
+auto json = R"({
+    "name": "C++ Mastery",
+    "version": 23
+})";
+auto regex = R"(\d{3}-\d{4})";  // 不用写 \\d{3}-\\d{4}
+
+// 内容包含 )" 时用自定义分隔符
+auto tricky = R"xxx(包含 )" 的字符串)xxx";
+}
+
+\note{`R"(...)"` 中的 `R` 是 Raw 的意思。圆括号内的所有字符（包括换行、反斜杠、引号）都原样保留，零转义。这在写正则表达式、JSON、文件路径时特别有用。}
+
+// 字符串格式化——现代 C++ 的 printf
+
+以前格式化字符串要用 `sprintf`（不安全）或 `std::stringstream`（太啰嗦）。C++20 引入了 `std::format`，C++23 又引入了 `std::println`——终于有了类型安全又简洁的格式化方案。
+
+\run[cpp]{
+#include <iostream>
+#include <format>
+
+int main() {
+    // std::format 返回格式化后的 std::string
+    auto greeting = std::format("Name: {}, Age: {}", "Pan", 20);
+    std::cout << greeting << std::endl;
+
+    // 格式说明符（和 Python 的 f-string 很像！）
+    auto pi = std::format("{:.4f}", 3.14159);     // "3.1416"（4位小数）
+    auto hex = std::format("{:#x}", 255);          // "0xff"（十六进制）
+    auto padded = std::format("{:>10}", "hi");     // "        hi"（右对齐宽度10）
+
+    std::cout << "pi = " << pi << std::endl;
+    std::cout << "hex = " << hex << std::endl;
+    std::cout << "padded = [" << padded << "]" << std::endl;
+
+    // 常用格式说明符：
+    // {:d} 十进制  {:x} 十六进制  {:o} 八进制  {:b} 二进制
+    // {:f} 定点    {:e} 科学计数  {:g} 通用
+    // {:.Nf} N位小数  {:>W} 右对齐宽度W  {:<W} 左对齐  {:^W} 居中
+
+    return 0;
+}
+}
+
+\collapse[📝 C++23 的 std::println]{
+C++23 更进一步，引入了 `std::println` 和 `std::print`，让输出更简洁：
+
+\code[cpp]{
+#include <print>  // C++23
+
+std::println("x = {}, y = {:.2f}", 42, 3.14);
+// 输出: x = 42, y = 3.14（自动换行）
+
+std::print("不换行: {}", "hello");
+// 输出: 不换行: hello（不换行）
+}
+
+`std::println` = `std::format` + `std::cout` + 自动换行，三合一！如果你的编译器支持 C++23，优先用它。
+}
+
+/// 难点易错点分析
+
+\danger{**坑1：字符串字面量 `"hello"` 的类型不是 `std::string`！**
+
+它的类型是 `const char[6]`（包含末尾的 `'\0'`），会隐式转换为 `const char*` 或 `std::string`，但这种转换有开销。用 `"hello"s` 后缀直接创建 `std::string`，用 `"hello"sv` 创建 `std::string_view`。}
+
+\danger{**坑2：`c_str()` 返回的指针在 string 被修改后可能失效！**}
+
+\code[cpp]{
+const char* p = someString.c_str();
+someString += " more"; // 可能触发重新分配内存
+use(p); // p 可能已经指向被释放的内存！→ UB
+}
+
+\danger{**坑3：`std::vector<bool>` 不是真正的容器！** 它是一个特化版本，每个 `bool` 只占 1 位。`operator[]` 返回代理对象而非 `bool&`，导致 `auto x = vec[0];` 的类型不是 `bool`。避免使用 `vector<bool>`，改用 `vector<char>` 或 `std::bitset`。}
+
+\danger{**坑4：数组越界不报错 ≠ 代码正确。** C 数组和 `std::array` 的 `operator[]` 都不做边界检查。你的程序可能"偶尔能跑"但实际在读写不该碰的内存。调试时用 `.at()` 替代 `[]`。}
+
+现在来测测你学到了多少——
+
+\quiz[choice]{
+Q: 以下代码的输出是什么？\n`int arr[] = {10, 20, 30};`\n`void foo(int a[]) { std::cout << sizeof(a); }`\n在 64 位系统上调用 `foo(arr)` 会输出：
+A: 12（3个int × 4字节）
+B: 8（指针的大小）
+C: 3（数组元素个数）
+D: 编译错误
+ANS: B
+EXP: C 数组传给函数时发生**退化（Decay）**：数组名变成指向首元素的指针。`sizeof(a)` 算的是指针大小（64 位系统上是 8 字节），而非数组大小。这就是 C 数组"不知道自己有多大"的经典表现。用 `std::array` 或 `std::span` 可以避免这个问题。
+}
+
+\quiz[tf]{
+Q: `std::string_view` 可以安全地作为函数返回值，返回一个局部 `std::string` 变量的视图。
+ANS: F
+EXP: 绝对不行！局部 `std::string` 在函数返回时被销毁，`string_view` 就变成**悬空引用（Dangling Reference）**，指向已释放的内存。使用它是未定义行为（UB）。函数返回字符串应该返回 `std::string`，不要返回 `string_view`。
+}
+
+\quiz[choice]{
+Q: 以下哪种写法可以在函数参数中同时接受 `std::vector<int>`、`std::array<int, 5>` 和 C 数组 `int[]`？
+A: 参数类型写 `int*`
+B: 参数类型写 `const std::vector<int>&`
+C: 参数类型写 `std::span<const int>`
+D: 参数类型写 `const std::array<int, 5>&`
+ANS: C
+EXP: `std::span<const int>` 是非拥有的连续数据视图，能隐式接受任何连续容器（vector、array、C 数组）。选项 A 虽然也能接受三种，但丢失了大小信息。B 和 D 各自只能接受特定类型。`std::span` 是现代 C++ 替代"指针+大小"参数的最佳方案。
+}
+
+/// 常用方法速查
+
+\table{
+类型/函数 | 用途 | 引入版本
+---
+`std::array<T,N>` | 固定大小数组（编译期大小已知） | C++11
+`std::span<T>` | 非拥有的连续数据视图 | C++20
+`std::string` | 拥有的、自动管理的字符串 | C++98
+`std::string_view` | 非拥有的只读字符串视图 | C++17
+`std::to_array` | C 数组转 std::array | C++20
+`std::format` | 类型安全的字符串格式化 | C++20
+`std::println` | 格式化输出（自动换行） | C++23
+`starts_with / ends_with` | 前缀/后缀检查 | C++20
+`contains` | 子串包含检查 | C++23
+}
+
+/// 新旧标准差异
+
+\compare{
+old: C++98/03 时代只有 C 数组和 `char*` / `std::string`。数组没有安全替代品，字符串格式化要用 `sprintf`（不安全，容易缓冲区溢出）或 `std::stringstream`（笨重）。没有原始字符串字面量，写路径和正则表达式要疯狂转义。
+
+new: C++11 引入 `std::array`，终于有了安全的固定大小数组。C++17 引入 `std::string_view`，大幅减少不必要的字符串拷贝。C++20 引入 `std::span`、`starts_with`/`ends_with`、`std::format`。C++23 引入 `contains`、`std::println`。趋势：用非拥有视图（view/span）传参，用拥有类型（string/vector/array）存储。
+}
+
+/// 实战作业
+
+🟢 **基础题：数组统计**
+
+用 `std::array` 存储一组成绩，然后计算最高分、最低分和平均分。代码框架已给出，你需要填写 `TODO` 部分：
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+#include <algorithm>
+#include <numeric>
+
+int main() {
+    std::array<int, 8> scores = {78, 92, 65, 88, 95, 73, 81, 90};
+
+    // TODO: 用 std::max_element 找最高分
+    // auto maxIt = ???
+    // std::cout << "最高分: " << *maxIt << std::endl;
+
+    // TODO: 用 std::min_element 找最低分
+    // auto minIt = ???
+    // std::cout << "最低分: " << *minIt << std::endl;
+
+    // TODO: 用 std::accumulate 算总分，然后除以 scores.size() 得到平均分
+    // int total = ???
+    // double avg = ???
+    // std::cout << "平均分: " << avg << std::endl;
+
+    return 0;
+}
+}
+
+\collapse[🔑 基础题参考答案]{
+\code[cpp]{
+auto maxIt = std::max_element(scores.begin(), scores.end());
+std::cout << "最高分: " << *maxIt << std::endl;
+
+auto minIt = std::min_element(scores.begin(), scores.end());
+std::cout << "最低分: " << *minIt << std::endl;
+
+int total = std::accumulate(scores.begin(), scores.end(), 0);
+double avg = static_cast<double>(total) / scores.size();
+std::cout << "平均分: " << avg << std::endl;
+}
+}
+
+🟢 **基础题2：字符串操作练习**
+
+练习 `std::string` 的基本操作。填写 `TODO` 部分：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+int main() {
+    std::string sentence = "I love C++ programming";
+
+    // TODO: 输出字符串长度
+    // std::cout << "长度: " << ??? << std::endl;
+
+    // TODO: 用 find() 找到 "C++" 的位置，输出位置
+    // auto pos = ???
+    // std::cout << "C++ 在位置: " << pos << std::endl;
+
+    // TODO: 用 substr() 提取 "C++ programming"（从 pos 开始到末尾）
+    // std::string sub = ???
+    // std::cout << "子串: " << sub << std::endl;
+
+    // TODO: 用 replace() 把 "C++" 替换成 "Rust"（replace 参数：起始位置, 长度, 新字符串）
+    // sentence.replace(???, ???, ???);
+    // std::cout << "替换后: " << sentence << std::endl;
+
+    return 0;
+}
+}
+
+🟡 **进阶题：实现 split 函数**
+
+实现一个 `split` 函数，把字符串按分隔符拆分成多个子串。要求使用 `std::string_view` 实现零拷贝：
+
+\code[cpp]{
+#include <iostream>
+#include <string_view>
+#include <vector>
+
+// TODO: 实现这个函数
+// 提示：用 find() 找分隔符位置，用 substr() 截取子串，循环直到找不到分隔符
+std::vector<std::string_view> split(std::string_view str, char delimiter) {
+    std::vector<std::string_view> result;
+    // 你的代码……
+    return result;
+}
+
+int main() {
+    std::string_view csv = "apple,banana,cherry,date";
+    auto parts = split(csv, ',');
+    for (auto part : parts) {
+        std::cout << "[" << part << "]" << std::endl;
+    }
+    // 期望输出：
+    // [apple]
+    // [banana]
+    // [cherry]
+    // [date]
+    return 0;
+}
+}
+
+\collapse[🔑 进阶题参考思路]{
+核心思路：循环用 `find()` 找分隔符，用 `substr()` 截取分隔符之前的部分，然后用 `remove_prefix()` 跳过已处理的部分：
+
+\code[cpp]{
+std::vector<std::string_view> split(std::string_view str, char delimiter) {
+    std::vector<std::string_view> result;
+    while (true) {
+        auto pos = str.find(delimiter);
+        if (pos == std::string_view::npos) {
+            if (!str.empty()) result.push_back(str);
+            break;
+        }
+        result.push_back(str.substr(0, pos));
+        str.remove_prefix(pos + 1);
+    }
+    return result;
+}
+}
+
+注意：`string_view::substr()` 返回的是新的 `string_view`，不会复制字符数据，所以整个函数实现了零拷贝！但前提是调用者必须保证原始字符串在使用 `result` 期间不能被销毁。
+}
+
+这节课内容挺多的，核心就一句话：**现代 C++ 开发中，用 `std::array` 替代 C 数组，用 `std::string` 替代 `char*`，用 `string_view` 和 `span` 传参减少拷贝。** 下节课我们讲控制流——让程序学会"做决定"和"重复劳动"。

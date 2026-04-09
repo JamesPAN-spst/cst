@@ -1,0 +1,512 @@
+﻿/// 简介
+
+上一课我们学了变量和运算符——你已经会用 C++ 做计算了。但目前你的程序就像一条直路，从头走到尾，不会拐弯。现实中呢？你过马路要看红绿灯，绿灯走、红灯停；你在游戏里打怪要判定伤害、循环刷副本……这些"根据条件做决定"和"重复做某件事"的能力，就是**流程控制（Control Flow）**。
+
+流程控制是编程的灵魂——没有它，程序就只是一台只会直线跑的玩具车。学完这节，你的代码就能"看路况、做决定、反复练"了！
+
+/// 知识点列表
+
+\list{
+- if / else if / else —— 条件分支
+- switch / case —— 多路分支
+- for 循环 —— 知道次数时重复
+- while / do-while 循环 —— 不知道次数时重复
+- range-based for —— 现代遍历方式（C++11）
+- break、continue —— 循环控制
+- if 带初始化语句（C++17）
+- switch 带初始化语句（C++17）
+- if constexpr 编译期分支（C++17）
+- [[fallthrough]]、[[likely]]、[[unlikely]] 属性
+}
+
+/// 知识点详解
+
+// if / else if / else —— 红绿灯
+
+想象你站在十字路口：绿灯亮？走！红灯亮？停！黄灯？那就等一等。这就是 `if-else` 在干的事——**根据条件选择不同的动作**。
+
+先来看最基本的写法：
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int score = 75;  // ← 试试改成不同的分数！
+
+    if (score >= 90) {
+        cout << "优秀！奖励一朵小红花" << endl;
+    } else if (score >= 60) {
+        cout << "及格了，继续加油！" << endl;
+    } else {
+        cout << "不及格……回去复习吧" << endl;
+    }
+
+    return 0;
+}
+}
+
+我们逐行拆解一下：
+
+- `if (score >= 90)` —— 先问第一个问题："分数够 90 吗？" 够的话执行大括号里的代码
+- `else if (score >= 60)` —— 第一个不满足才问第二个："那够 60 吗？"
+- `else` —— 上面都不满足？那就走这里
+
+**关键点：** `else if` 和 `else` 不是必须的！你可以只写一个 `if`，也可以写一大串 `else if`。但 `else` 最多只能有一个，而且必须放最后。
+
+\diagram[flow]{
+开始 -> 判断 score >= 90?
+判断 score >= 90? --是--> 输出"优秀"
+判断 score >= 90? --否--> 判断 score >= 60?
+判断 score >= 60? --是--> 输出"及格"
+判断 score >= 60? --否--> 输出"不及格"
+输出"优秀" -> 结束
+输出"及格" -> 结束
+输出"不及格" -> 结束
+}
+
+\tip{**永远加大括号！** 哪怕 `if` 里面只有一行代码，也写上 `{}`。不加大括号是 C++ 半数 bug 的温床——后面"难点易错点"会细讲。}
+
+// switch / case —— 电梯按钮
+
+`if-else` 适合判断范围（大于、小于），但如果你要对一个值做**精确匹配**——比如用户输入了 1 就做 A，输入 2 就做 B，输入 3 就做 C——用 `switch` 更清爽，就像电梯里的按钮面板，按哪层去哪层。
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int day = 3;  // ← 试试改成 1~7
+
+    switch (day) {
+        case 1:
+            cout << "星期一：新的一周开始！" << endl;
+            break;  // ← 别忘了 break！
+        case 2:
+            cout << "星期二：继续搬砖" << endl;
+            break;
+        case 3:
+            cout << "星期三：已经周中了" << endl;
+            break;
+        case 6:
+        case 7:
+            cout << "周末：终于可以休息！" << endl;
+            break;
+        default:
+            cout << "普通工作日" << endl;
+            break;
+    }
+
+    return 0;
+}
+}
+
+**逐行看重点：**
+
+- `switch (day)` —— 把 `day` 的值拿来，和每个 `case` 比对
+- `case 1:` —— 如果 `day == 1`，从这里开始执行
+- `break;` —— **跳出 switch！** 这个千万不能忘（下面会讲为什么）
+- `case 6: case 7:` —— 多个值共享同一段代码，直接写在一起
+- `default:` —— 所有 case 都不匹配时走这里，就像 `else`
+
+\danger{**switch 最经典的 bug：忘写 `break`！** 如果你不写 `break`，程序会"失足坠落"到下一个 `case` 继续执行——这叫**贯穿（fall-through）**。99% 的情况这不是你要的效果！}
+
+\warning{**switch 只能比较整数和枚举！** 你不能 `switch` 一个 `string` 或 `float`。想对字符串做选择？乖乖用 `if-else if` 链。}
+
+// for 循环 —— 跑操场
+
+循环就是"反复做同一件事"。`for` 循环最适合你**明确知道要重复多少次**的场景——就像体育课老师说"绕操场跑 5 圈"。
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    // "绕操场跑5圈"
+    for (int lap = 1; lap <= 5; lap++) {
+        cout << "正在跑第 " << lap << " 圈..." << endl;
+    }
+    cout << "跑完了！累死了" << endl;
+
+    // 求 1+2+3+...+100
+    int sum = 0;
+    for (int i = 1; i <= 100; i++) {
+        sum += i;  // ← 每次把 i 加到 sum 上
+    }
+    cout << "1到100的和 = " << sum << endl;
+
+    return 0;
+}
+}
+
+`for` 循环的三件套——括号里用分号隔开的三部分：
+
+1. **初始化** `int lap = 1` —— 起跑前：从第 1 圈开始
+2. **条件** `lap <= 5` —— 每圈开始前检查：还没跑到 5 圈吗？
+3. **更新** `lap++` —— 每圈跑完后：圈数 +1
+
+\diagram[flow]{
+初始化 (int i = 0) -> 判断条件 (i < n)?
+判断条件 (i < n)? --是--> 执行循环体
+执行循环体 -> 更新 (i++)
+更新 (i++) -> 判断条件 (i < n)?
+判断条件 (i < n)? --否--> 循环结束
+}
+
+// while 和 do-while —— 不知道要几圈
+
+有时候你不知道要循环多少次——比如"一直让用户输入密码，直到输对为止"。这种场景用 `while` 循环。
+
+**`while`：先判断，再执行**——如果一上来条件就不满足，循环体一次都不会执行。
+
+**`do-while`：先执行，再判断**——循环体至少执行一次。就像你去餐厅，服务员先上菜（执行一次），然后问"还要吗？"（判断条件）。
+
+\code[cpp]{
+// while：先问再做
+int tries = 0;
+while (tries < 3) {       // ← 还没试3次？
+    cout << "请输入密码：";
+    // ...读取密码...
+    tries++;               // ← 试一次，计数+1
+}
+
+// do-while：先做再问（至少执行一次）
+int input;
+do {
+    cout << "请输入一个正数：";
+    cin >> input;
+} while (input <= 0);      // ← 输入的不是正数？再来！
+}
+
+\collapse[想一想：while 和 for 怎么选？]{
+简单原则：
+- **知道具体次数** → 用 `for`（跑 5 圈、遍历 10 个元素）
+- **不知道次数，按条件循环** → 用 `while`（等用户输入正确密码）
+- **至少要执行一次** → 用 `do-while`（先显示菜单，再问操作）
+
+其实 `for` 和 `while` 可以互相转换，但选对了读起来更自然。
+}
+
+// range-based for —— 现代遍历方式
+
+C++11 引入了**范围 for（range-based for）**，专门用来遍历数组、容器。再也不用手写 `i = 0; i < n; i++` 了——直接说"对于容器里的每个元素"。
+
+\tabs{
+\tab[传统写法]{
+\code[cpp]{
+#include <iostream>
+#include <vector>
+using namespace std;
+
+int main() {
+    vector<int> nums = {10, 20, 30, 40, 50};
+
+    // 传统for：要自己管下标，容易写错边界
+    for (int i = 0; i < nums.size(); i++) {
+        cout << nums[i] << " ";
+    }
+    return 0;
+}
+}
+}
+\tab[现代写法 (C++11)]{
+\code[cpp]{
+#include <iostream>
+#include <vector>
+using namespace std;
+
+int main() {
+    vector<int> nums = {10, 20, 30, 40, 50};
+
+    // range-for：简洁、安全、不怕下标越界
+    for (const auto& num : nums) {  // ← 对于 nums 中的每个 num
+        cout << num << " ";
+    }
+    return 0;
+}
+}
+}
+}
+
+\tip{range-for 循环中用 `const auto&` 是最安全的默认选择——不拷贝、不修改。如果你需要修改元素，改成 `auto&`。}
+
+\danger{**range-for 中不能修改容器大小！** 在遍历过程中往容器里插入或删除元素，会导致**迭代器失效（Iterator Invalidation）**，这是未定义行为（Undefined Behavior），程序可能崩溃、出错、或者"表面正常但暗中出bug"：}
+
+\code[cpp]{
+vector<int> v = {1, 2, 3};
+for (auto x : v) {
+    if (x == 2) v.push_back(4); // UB！绝对不要这样做！
+}
+}
+
+// break 和 continue —— 紧急出口与跳过
+
+- `break` —— 立刻跳出**整个循环**，不再执行后续圈数。就像跑步时突然肚子疼，直接退出比赛。
+- `continue` —— 跳过**本次循环**剩余代码，直接进入下一次。就像跑步时踩到石头，趔趄一下但继续跑。
+
+\code[cpp]{
+for (int i = 1; i <= 10; i++) {
+    if (i == 5) break;       // 到第5个就停，输出 1 2 3 4
+    cout << i << " ";
+}
+
+for (int i = 1; i <= 10; i++) {
+    if (i % 2 == 0) continue; // 跳过偶数，输出 1 3 5 7 9
+    cout << i << " ";
+}
+}
+
+// C++17 增强：if / switch 带初始化
+
+C++17 给 `if` 和 `switch` 加了一个超实用的小功能——**在条件前塞一个初始化语句**。好处是什么？变量的作用域被锁死在 `if` 块里，不会污染外面的代码。
+
+\code[cpp]{
+// 传统写法：it 泄露到外部作用域
+auto it = myMap.find("key");
+if (it != myMap.end()) {
+    use(it->second);
+}
+// 这里还能看到 it，但已经没用了——浪费名字！
+
+// C++17 写法：it 只在 if 块内可见
+if (auto it = myMap.find("key"); it != myMap.end()) {
+    use(it->second);
+}
+// 出了 if 块，it 就不存在了
+}
+
+\collapse[if constexpr — 编译期分支（进阶补充）]{
+`if constexpr`（C++17）是给**模板编程**用的高级特性。普通 `if` 在运行时判断条件，而 `if constexpr` 在**编译时**就把不走的分支彻底丢掉——那些代码根本不会被编译。
+
+现在你只需知道它的存在，等学到模板（第6章）时会深入使用。简单看一眼长什么样：
+
+\code[cpp]{
+template<typename T>
+auto toString(T value) {
+    if constexpr (std::is_same_v<T, std::string>) {
+        return value;              // T 是 string 时走这里
+    } else if constexpr (std::is_arithmetic_v<T>) {
+        return std::to_string(value); // 数字类型走这里
+    }
+}
+}
+
+关键区别：普通 `if` 即使条件永远为 `false`，分支代码仍然必须能通过编译。`if constexpr` 则会彻底忽略未选中的分支。
+}
+
+// [[fallthrough]]、[[likely]]、[[unlikely]] 属性
+
+C++17 引入了 `[[fallthrough]]`，用来告诉编译器"我是故意不写 break 的，别给我报警告"。C++20 引入了 `[[likely]]` 和 `[[unlikely]]`，给编译器分支预测的提示。
+
+\code[cpp]{
+// [[fallthrough]]: 明确标记故意贯穿
+switch (level) {
+    case 3:
+        processLevel3();
+        [[fallthrough]]; // ← "我知道我在做什么，别报警告"
+    case 2:
+        processLevel2();
+        [[fallthrough]];
+    case 1:
+        processLevel1();
+        break;
+}
+
+// [[likely]] / [[unlikely]] (C++20): 给编译器的提示
+if (result == SUCCESS) [[likely]] {
+    processSuccess();       // ← 大概率走这个分支
+} else [[unlikely]] {
+    handleError();          // ← 小概率走这里
+}
+}
+
+\collapse[这些属性有实际性能影响吗？]{
+`[[likely]]` 和 `[[unlikely]]` 只是**提示**，不是命令。编译器可以忽略它们。不过在热点代码路径上，正确标注可以帮助 CPU 的分支预测器做出更好的判断，减少流水线停顿。
+
+对于初学者来说，你**完全不需要**在自己的代码里加这些属性——编译器的自动优化已经足够好了。但了解它们的存在，以后读别人的代码时不会一脸懵。
+}
+
+/// 难点易错点分析
+
+// 悬空 else 问题
+
+\danger{**缩进在骗你！** C++ 不看缩进，`else` 永远和最近的、还没被匹配的 `if` 配对：}
+
+\code[cpp]{
+// 你以为的结构：
+if (a > 0)
+    if (b > 0)
+        doSomething();
+else                  // ← 你以为这个 else 属于外层 if？
+    doElse();         //    错！它属于内层的 if (b > 0)！
+
+// 加大括号，世界清净了：
+if (a > 0) {
+    if (b > 0) {
+        doSomething();
+    }
+} else {
+    doElse();  // ← 现在清清楚楚属于外层 if
+}
+}
+
+// for 循环的作用域陷阱
+
+\danger{**不加大括号时，循环体只有紧跟的那一行！**}
+
+\code[cpp]{
+for (int i = 0; i < 5; i++)
+    cout << i;          // ← 只有这一行在循环里
+    cout << " done ";   // ← 这行不在循环里！只执行一次！
+// 缩进骗了你，编译器不看缩进
+
+// 正确写法：
+for (int i = 0; i < 5; i++) {
+    cout << i;
+    cout << " done ";   // ← 现在两行都在循环里
+}
+}
+
+// switch 忘写 break
+
+\danger{**这可能是全 C++ 最经典的 bug。** 忘写 `break`，代码会悄悄贯穿到下一个 case，而且编译器默认不报错！建议开启编译器警告 `-Wswitch-fallthrough`。}
+
+// 无限循环
+
+\warning{`while(true)` 和 `for(;;)` 是合法的无限循环写法，在服务器、游戏主循环里很常见。但如果你不小心写出了无限循环（忘记更新循环变量），程序就会"卡死"。按 Ctrl+C 可以强制终止。}
+
+// 自测区
+
+\quiz[choice]{
+Q: 下面这段代码输出什么？
+`int x = 2;`
+`switch (x) {`
+`    case 1: cout << "A";`
+`    case 2: cout << "B";`
+`    case 3: cout << "C";`
+`    default: cout << "D";`
+`}`
+A: B
+B: BCD
+C: ABCD
+D: BD
+ANS: B
+EXP: `x == 2`，从 `case 2` 开始执行。由于每个 case 都没有 `break`，会一路贯穿到底，输出 "BCD"。这就是 switch 贯穿（fall-through）的效果——忘写 `break` 是最经典的 bug！
+}
+
+\quiz[tf]{
+Q: `if constexpr` 和普通 `if` 的区别仅仅是 `if constexpr` 的条件必须是编译期常量，其他行为完全相同。
+ANS: F
+EXP: 不只是条件不同！关键区别在于 `if constexpr` 会在编译期**丢弃**未选中的分支——那些代码不会被编译、不会被实例化。而普通 `if` 即使条件为 `false`，所有分支的代码仍然必须能通过编译。
+}
+
+\quiz[choice]{
+Q: 以下代码中，`doElse()` 在什么情况下会执行？
+`if (a > 0)`
+`    if (b > 0)`
+`        doSomething();`
+`else`
+`    doElse();`
+A: 当 `a <= 0` 时
+B: 当 `a > 0` 且 `b <= 0` 时
+C: 当 `a <= 0` 或 `b <= 0` 时
+D: 永远不会执行
+ANS: B
+EXP: 这就是经典的"悬空 else"问题！`else` 和最近的未匹配 `if` 配对，所以它属于 `if (b > 0)`，而不是 `if (a > 0)`。只有 `a > 0`（进入外层 if）且 `b <= 0`（走 else 分支）时，`doElse()` 才会执行。
+}
+
+/// 常用方法速查
+
+\table{
+语句 | 用途 | 版本 | 要点
+---
+`if / else` | 条件分支 | C++98 | 永远加大括号
+`switch / case` | 多路精确匹配 | C++98 | 别忘 `break`，只能用整数/枚举
+`for` | 已知次数循环 | C++98 | 三件套：初始化;条件;更新
+`while` | 条件循环 | C++98 | 先判断再执行
+`do-while` | 至少一次循环 | C++98 | 先执行再判断
+`range-for` | 遍历容器 | C++11 | 用 `const auto&`
+`if (init; cond)` | 限制变量作用域 | C++17 | 减少名字污染
+`if constexpr` | 编译期分支 | C++17 | 模板编程利器
+`[[fallthrough]]` | 标记故意贯穿 | C++17 | 消除编译器警告
+`[[likely]]` | 分支预测提示 | C++20 | 仅在热点代码使用
+}
+
+/// 新旧标准差异
+
+\compare{
+old: C++98/03 只有传统的 `if`/`switch`/`for`/`while`/`do-while`。想限制 `if` 里临时变量的作用域？做不到，只能多加一层大括号。想在编译期选分支？只能用模板特化或 SFINAE，写出来的代码又臭又长。switch 贯穿完全静默，编译器不会提醒你。
+
+new: C++11 引入了 range-for，从此遍历容器再也不用写下标。C++17 是流程控制的大版本更新：`if`/`switch` 带初始化语句、`if constexpr` 编译期分支、`[[fallthrough]]` 标记故意贯穿。C++20 加入 `[[likely]]`/`[[unlikely]]` 分支预测提示。整体趋势：更安全、更简洁、更多编译期能力。
+}
+
+/// 实战作业
+
+// 基础题 1：数字分类器
+
+写一个程序：用户输入一个整数，程序判断它是正数、负数还是零，同时判断它是奇数还是偶数。
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    int num;
+    cout << "请输入一个整数：";
+    cin >> num;
+
+    // TODO: 用 if-else 判断正数/负数/零
+    // 提示：正数 > 0，负数 < 0，等于0就是零
+
+    /* 你的代码写在这里 */
+
+    // TODO: 用 if-else 判断奇数/偶数
+    // 提示：num % 2 == 0 就是偶数
+
+    /* 你的代码写在这里 */
+
+    return 0;
+}
+}
+
+// 基础题 2：简易计算器
+
+用 `switch` 实现一个计算器：用户输入两个数和一个运算符（+、-、*、/），程序输出计算结果。注意处理除以零的情况！
+
+\run[cpp]{
+#include <iostream>
+using namespace std;
+
+int main() {
+    double a, b;
+    char op;
+    cout << "输入格式：数字 运算符 数字（如 3 + 5）" << endl;
+    cin >> a >> op >> b;
+
+    switch (op) {
+        // TODO: 为 +, -, *, / 各写一个 case
+        // 提示：除法要检查 b 是否为 0
+        // 别忘了每个 case 后面要 break!
+
+        /* 你的代码写在这里 */
+
+        default:
+            cout << "不支持的运算符：" << op << endl;
+            break;
+    }
+
+    return 0;
+}
+}
+
+// 进阶题：猜数字游戏
+
+用 `while` 循环实现一个猜数字游戏：程序生成一个 1-100 的随机数，玩家不断猜测，程序提示"太大"或"太小"，直到猜对为止。最后告诉玩家用了几次猜对。
+
+\collapse[提示]{
+- 用 `#include <cstdlib>` 和 `#include <ctime>` 生成随机数
+- `srand(time(0))` 设置随机种子
+- `rand() % 100 + 1` 生成 1-100 的随机数
+- 需要一个计数变量记录猜测次数
+- `do-while` 或 `while` 都可以，想想哪个更自然
+}

@@ -1,0 +1,336 @@
+/// 简介
+
+上节用矩阵表示旋转，但矩阵表示旋转存在根本缺陷：9 个浮点数只编码 3 个自由度（冗余），连续乘法累积误差导致矩阵逐渐偏离正交性，且很难在两个旋转之间做平滑插值。更要命的是，用欧拉角（Euler Angles）分离三轴旋转会遇到**万向锁（Gimbal Lock）**——丢失一个旋转自由度。
+
+**四元数（Quaternion）**用 4 个浮点数紧凑表示任意 3D 旋转，天然支持平滑插值（Slerp），没有万向锁问题。所有现代游戏引擎（Unreal、Unity、Godot）内部都用四元数存储旋转。
+
+/// 知识点列表
+
+\list{
+- 万向锁（Gimbal Lock）— 为什么需要四元数
+- 四元数的数学表示（w, x, y, z）
+- 四元数基本运算（乘法、共轭、逆、归一化）
+- 用四元数旋转向量
+- 四元数插值（Slerp / Nlerp）
+- 四元数 vs 欧拉角 vs 旋转矩阵 — 选型指南
+- 四元数在游戏中的实际应用
+}
+
+/// 知识点详解
+
+// 万向锁问题
+
+在讲四元数之前，先理解它要解决的问题。**欧拉角（Euler Angles）**用三个角度（Pitch/Yaw/Roll）分别绕 X/Y/Z 轴旋转：
+
+\code[cpp]{
+// 欧拉角旋转：依次绕三个轴
+Mat4 eulerRotation(float pitch, float yaw, float roll) {
+    return rotateY(yaw) * rotateX(pitch) * rotateZ(roll);
+}
+}
+
+当 Pitch 旋转到 ±90° 时，Y 轴和 Z 轴重合，Yaw 和 Roll 绕同一轴旋转，丢失了一个自由度。这就是**万向锁（Gimbal Lock）**——在飞行模拟中飞机机头垂直朝上/朝下时无法正确控制。
+
+\diagram[flow]{
+欧拉角 -> Pitch=90° -> Y轴与Z轴重合 -> 丢失一个自由度 -> 万向锁!
+四元数 -> 轴角表示 -> 无轴重合 -> 无万向锁 ✓
+}
+
+\note{万向锁不是"某些角度旋转不了"，而是**两个看似不同的旋转操作产生相同效果**，导致独立控制维度从 3 降为 2。这在动画插值中表现为抖动或路径偏移。}
+
+// 四元数的数学表示
+
+四元数 $q = w + xi + yj + zk$，其中 $i^2 = j^2 = k^2 = ijk = -1$。在游戏中，把四元数理解为 **"绕某个轴旋转某个角度"** 就足够了：
+
+\code[cpp]{
+struct Quat {
+    float w, x, y, z;  // w 是实部，(x,y,z) 是虚部
+
+    // 从轴角（Axis-Angle）创建 — 最直观的构造方式
+    static Quat fromAxisAngle(Vec3 axis, float angle) {
+        axis = normalize(axis);
+        float half = angle / 2.0f;
+        float s = std::sin(half);
+        return {std::cos(half), axis.x*s, axis.y*s, axis.z*s};
+    }
+
+    // 单位四元数：表示"无旋转"
+    static Quat identity() { return {1, 0, 0, 0}; }
+};
+}
+
+\tip{**为什么存半角？** 四元数的旋转公式 $p' = qpq^*$ 会旋转两倍半角，所以构造时预先除以 2，使得输入的 `angle` 就是实际旋转角度。}
+
+// 四元数运算
+
+\code[cpp]{
+// 四元数乘法：组合两个旋转（先 a 后 b → b * a）
+Quat operator*(const Quat& a, const Quat& b) {
+    return {
+        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
+    };
+}
+
+// 共轭（Conjugate）：对单位四元数等于逆（反向旋转）
+Quat conjugate(Quat q) { return {q.w, -q.x, -q.y, -q.z}; }
+
+// 归一化：保证长度为 1
+float norm(Quat q) { return std::sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z); }
+
+Quat normalized(Quat q) {
+    float n = norm(q);
+    return {q.w/n, q.x/n, q.y/n, q.z/n};
+}
+
+// 用四元数旋转向量：p' = q * p * q*
+Vec3 rotate(Quat q, Vec3 v) {
+    Quat p = {0, v.x, v.y, v.z};
+    Quat result = q * p * conjugate(q);
+    return {result.x, result.y, result.z};
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec3 { float x, y, z; };
+struct Quat {
+    float w, x, y, z;
+    static Quat fromAxisAngle(Vec3 axis, float angle) {
+        float len = std::sqrt(axis.x*axis.x+axis.y*axis.y+axis.z*axis.z);
+        axis = {axis.x/len, axis.y/len, axis.z/len};
+        float h = angle/2, s = std::sin(h);
+        return {std::cos(h), axis.x*s, axis.y*s, axis.z*s};
+    }
+};
+
+Quat qmul(Quat a, Quat b) {
+    return {a.w*b.w-a.x*b.x-a.y*b.y-a.z*b.z,
+            a.w*b.x+a.x*b.w+a.y*b.z-a.z*b.y,
+            a.w*b.y-a.x*b.z+a.y*b.w+a.z*b.x,
+            a.w*b.z+a.x*b.y-a.y*b.x+a.z*b.w};
+}
+Quat conj(Quat q) { return {q.w, -q.x, -q.y, -q.z}; }
+
+Vec3 rotateVec(Quat q, Vec3 v) {
+    Quat p = {0, v.x, v.y, v.z};
+    Quat r = qmul(qmul(q, p), conj(q));
+    return {r.x, r.y, r.z};
+}
+
+int main() {
+    float pi = 3.14159265f;
+    // 绕 Y 轴旋转 90°
+    Quat q = Quat::fromAxisAngle({0,1,0}, pi/2);
+    Vec3 v = {1, 0, 0};  // X 轴方向
+    Vec3 r = rotateVec(q, v);
+    std::cout << "旋转后: (" << r.x << ", " << r.y << ", " << r.z << ")\n";
+    // 期望: (0, 0, -1) — X轴绕Y轴转90°变为-Z轴
+}
+}
+
+// 四元数转旋转矩阵
+
+\code[cpp]{
+Mat4 quatToMatrix(Quat q) {
+    float xx=q.x*q.x, yy=q.y*q.y, zz=q.z*q.z;
+    float xy=q.x*q.y, xz=q.x*q.z, yz=q.y*q.z;
+    float wx=q.w*q.x, wy=q.w*q.y, wz=q.w*q.z;
+
+    Mat4 m = {};
+    m.m[0][0] = 1-2*(yy+zz); m.m[0][1] = 2*(xy-wz);   m.m[0][2] = 2*(xz+wy);
+    m.m[1][0] = 2*(xy+wz);   m.m[1][1] = 1-2*(xx+zz); m.m[1][2] = 2*(yz-wx);
+    m.m[2][0] = 2*(xz-wy);   m.m[2][1] = 2*(yz+wx);   m.m[2][2] = 1-2*(xx+yy);
+    m.m[3][3] = 1.0f;
+    return m;
+}
+
+// 从欧拉角创建四元数（按 YXZ 顺序，游戏中常见）
+Quat fromEuler(float pitch, float yaw, float roll) {
+    Quat qy = Quat::fromAxisAngle({0,1,0}, yaw);
+    Quat qx = Quat::fromAxisAngle({1,0,0}, pitch);
+    Quat qz = Quat::fromAxisAngle({0,0,1}, roll);
+    return qy * qx * qz;  // 组合顺序与引擎约定一致
+}
+}
+
+// Slerp 与 Nlerp
+
+**球面线性插值（Spherical Linear Interpolation, Slerp）**在两个旋转之间做匀角速度过渡，是动画系统的核心工具：
+
+\code[cpp]{
+Quat slerp(Quat a, Quat b, float t) {
+    float cosTheta = a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z;
+
+    // 确保最短路径（q 和 -q 表示同一旋转）
+    if (cosTheta < 0.0f) {
+        b = {-b.w, -b.x, -b.y, -b.z};
+        cosTheta = -cosTheta;
+    }
+
+    // 几乎相同时退化为线性插值，避免除零
+    if (cosTheta > 0.9999f) {
+        return normalized(Quat{
+            a.w + t*(b.w-a.w), a.x + t*(b.x-a.x),
+            a.y + t*(b.y-a.y), a.z + t*(b.z-a.z)
+        });
+    }
+
+    float theta = std::acos(cosTheta);
+    float sinTheta = std::sin(theta);
+    float wa = std::sin((1-t) * theta) / sinTheta;
+    float wb = std::sin(t * theta) / sinTheta;
+
+    return {wa*a.w+wb*b.w, wa*a.x+wb*b.x, wa*a.y+wb*b.y, wa*a.z+wb*b.z};
+}
+
+// Nlerp：更快（无三角函数），非匀速但大多数场景足够
+Quat nlerp(Quat a, Quat b, float t) {
+    if (a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z < 0)
+        b = {-b.w, -b.x, -b.y, -b.z};  // 最短路径
+    return normalized(Quat{
+        a.w+t*(b.w-a.w), a.x+t*(b.x-a.x),
+        a.y+t*(b.y-a.y), a.z+t*(b.z-a.z)
+    });
+}
+}
+
+\table{
+方法 | 速度 | 匀速 | 适用场景
+---
+Slerp | 较慢（含 acos/sin）| 是 | 关键帧动画、摄像机过渡
+Nlerp | 快（仅归一化）| 否 | 非关键旋转、物理模拟
+}
+
+// 旋转表示法对比
+
+\table{
+表示法 | 存储 | 万向锁 | 插值 | 组合 | 典型用途
+---
+欧拉角 | 3 float | 有 | 差 | 差 | UI 显示、用户输入
+旋转矩阵 | 9 float | 无 | 差 | 快（矩阵乘法）| GPU 传入、最终变换
+四元数 | 4 float | 无 | 优（Slerp）| 快（四元数乘法）| 引擎内部存储、骨骼动画
+}
+
+// 游戏中的应用
+
+\code[cpp]{
+// 1. 角色平滑转向
+Quat current = player.rotation;
+Quat target = Quat::fromAxisAngle({0,1,0}, targetYaw);
+player.rotation = slerp(current, target, turnSpeed * dt);
+
+// 2. 第三人称摄像机轨道旋转
+Quat orbit = Quat::fromAxisAngle({0,1,0}, yaw)
+           * Quat::fromAxisAngle({1,0,0}, pitch);
+Vec3 camPos = player.pos + rotate(orbit, Vec3{0, 2, -5});
+
+// 3. 骨骼动画：每个关节存一个四元数
+// 播放动画 = 在关键帧四元数之间 slerp
+Joint.localRotation = slerp(frame[i].rot, frame[i+1].rot, frameLerp);
+}
+
+/// 工程实践
+
+\collapse[🔧 四元数工程注意事项]{
+\list{
+- **定期重新归一化**：连续乘法累积浮点误差，四元数逐渐偏离单位长度。每帧或每 N 帧调用 `normalized()`
+- **存储与传输**：网络同步时可以只传 x/y/z，w 由约定为正的 `w = sqrt(1-x²-y²-z²)` 恢复（节省 25% 带宽）
+- **调试显示**：将四元数转为欧拉角供人类阅读，但内部计算永远用四元数
+- **避免直接修改分量**：直接改 w/x/y/z 会破坏单位性，始终通过 fromAxisAngle / fromEuler / slerp 等构造
+}
+}
+
+/// 难点易错点分析
+
+\danger{**四元数必须保持归一化！** 非单位四元数的旋转公式 $qpq^*$ 会引入缩放，模型变形或消失。连续乘法后误差累积，务必定期归一化。}
+
+\danger{**q 和 -q 表示同一旋转。** `{w,x,y,z}` 和 `{-w,-x,-y,-z}` 绕同轴旋转等价。Slerp 时如果不检查并翻转为最短路径，旋转会走"绕远路"（360°-θ 而非 θ）。}
+
+\warning{**欧拉角转四元数依赖旋转顺序约定。** YXZ、ZYX、XYZ 产生不同结果。必须与引擎/数学库的约定一致，否则角色会"歪头"。}
+
+\quiz[choice]{
+Q: 四元数 Slerp 相比直接对欧拉角做 lerp 的核心优势是？
+A: Slerp 计算速度更快
+B: Slerp 避免万向锁且保证最短路径匀速旋转
+C: Slerp 使用更少的内存
+D: 两者效果完全相同
+ANS: B
+EXP: 欧拉角 lerp 在万向锁附近会产生抖动和路径偏移，且不保证匀角速度。Slerp 在四维超球面上做大圆插值，保证匀速且无万向锁。Slerp 实际比 lerp 更慢（需要 acos/sin），但结果正确性不可替代。
+}
+
+\quiz[tf]{
+Q: 单位四元数的共轭等于其逆。
+ANS: T
+EXP: 对单位四元数 $|q|=1$，逆 $q^{-1} = q^* / |q|^2 = q^*$。共轭只需翻转虚部符号，比通用求逆快很多。
+}
+
+/// 实战作业
+
+// 🟢 基础题：四元数旋转验证
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec3 { float x, y, z; };
+struct Quat {
+    float w, x, y, z;
+    static Quat fromAxisAngle(Vec3 axis, float angle) {
+        float len = std::sqrt(axis.x*axis.x+axis.y*axis.y+axis.z*axis.z);
+        if (len>1e-8f) { axis={axis.x/len,axis.y/len,axis.z/len}; }
+        float h=angle/2, s=std::sin(h);
+        return {std::cos(h), axis.x*s, axis.y*s, axis.z*s};
+    }
+    static Quat identity() { return {1,0,0,0}; }
+};
+
+/* TODO: 实现四元数乘法 */
+Quat qmul(Quat a, Quat b) {
+    /* TODO */
+    return {0,0,0,0};
+}
+
+/* TODO: 实现共轭 */
+Quat conj(Quat q) {
+    /* TODO */
+    return {0,0,0,0};
+}
+
+/* TODO: 用 q * p * conj(q) 旋转向量 */
+Vec3 rotateVec(Quat q, Vec3 v) {
+    /* TODO */
+    return {0,0,0};
+}
+
+int main() {
+    float pi = 3.14159265f;
+    // 测试1：绕Y轴旋转90°，X轴应变为-Z轴
+    Quat q1 = Quat::fromAxisAngle({0,1,0}, pi/2);
+    Vec3 r1 = rotateVec(q1, {1,0,0});
+    std::cout << "Test1: (" << r1.x << "," << r1.y << "," << r1.z << ") 期望: (0,0,-1)\n";
+
+    // 测试2：绕Z轴旋转180°，X轴应变为-X轴
+    Quat q2 = Quat::fromAxisAngle({0,0,1}, pi);
+    Vec3 r2 = rotateVec(q2, {1,0,0});
+    std::cout << "Test2: (" << r2.x << "," << r2.y << "," << r2.z << ") 期望: (-1,0,0)\n";
+}
+}
+
+// 🟡 进阶题：Slerp 实现
+
+实现完整的 `slerp(Quat a, Quat b, float t)` 函数。要求：处理最短路径（dot < 0 翻转），角度接近零时退化为 Nlerp。用 10 个插值步骤输出从 identity 到 "绕 Y 轴旋转 180°" 的中间旋转，验证角度均匀递增。
+
+// 🔴 挑战题：万向锁可视化对比
+
+创建一个程序：分别用欧拉角和四元数控制一个 3D 方向。当 pitch 接近 90° 时，输出欧拉角方案的 yaw/roll 变化不再独立（打印角度值验证），而四元数方案始终正常。输出对比结果到终端。
+
+\collapse[🤔 参考思路]{
+构造 euler(pitch=89°, yaw=30°, roll=10°) 和 euler(pitch=89°, yaw=35°, roll=15°)，转为矩阵后再提取回欧拉角——你会发现 yaw 和 roll 的值与输入不一致（它们的组合效果相同但个体值混乱）。四元数路径则始终保持参数化独立性。
+}
+
+四元数让我们摆脱了万向锁，拥有了平滑旋转插值——下一节将向量、矩阵、四元数组合成完整的变换系统。

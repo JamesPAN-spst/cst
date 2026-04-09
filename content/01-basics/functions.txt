@@ -1,0 +1,572 @@
+/// 简介
+
+上节课你学会了各种运算符和表达式。但你有没有发现——代码一长，全堆在 `main()` 里就像把所有家务活全塞在一张清单上，看得头都大了？
+
+**函数**（Function）就是你的"分工神器"。想象你在开一家奶茶店：你不会一个人干所有事吧？你会分工——一个人负责煮茶，一个人负责加料，一个人负责封口。每个人做好自己的小任务，组合起来一杯奶茶就出来了。
+
+函数就是把一段代码打包成一个"小工人"，给它起个名字，需要的时候叫它，它就去干活，干完把结果交给你。**写函数 = 拆任务 = 代码不乱**。
+
+读完这节，你就能把自己写的程序拆成干净利落的小模块，像搭积木一样组合出复杂功能。
+
+/// 知识点列表
+
+\list{
+- 为什么需要函数——代码复用和组织
+- 函数的声明与定义
+- 参数传递：值传递、引用传递、const引用
+- 返回值：怎么把结果交回来
+- 函数重载：同名不同参数
+- 默认参数：偷懒的好办法
+- 返回值优化（RVO）：编译器帮你省拷贝
+- inline 函数与 [[nodiscard]] 属性
+- auto 返回类型推导与尾返回类型
+- 函数指针与回调：把函数当参数传
+}
+
+/// 知识点详解
+
+// 你的第一个函数
+
+先不管语法，我们直接看一个函数长什么样，跑起来感受一下：
+
+\run[cpp]{
+#include <iostream>
+
+// 这就是一个函数！它的工作是"打招呼"
+void sayHello() {
+    std::cout << "你好，我是一个函数！" << std::endl;
+}
+
+int main() {
+    sayHello();  // 叫它去干活
+    sayHello();  // 再叫一次，它又干一遍
+    sayHello();  // 三次！代码只写了一份，却执行了三次
+    return 0;
+}
+}
+
+看到了吗？`sayHello()` 里面的那句输出代码只写了**一次**，但我们在 `main()` 里叫了**三次**。这就是函数最基本的好处：**写一遍，用多次**。
+
+想象没有函数的世界——如果你要打招呼100次，就得把 `std::cout << ...` 复制粘贴100次。改了一个字？100个地方都得改。疯了。
+
+// 函数的四要素：拆解语法
+
+一个函数由四个部分组成，就像一份工作说明书：
+
+\steps{
+\step[返回类型——干完活交什么回来]{
+\code[cpp]{
+int add(int a, int b) {
+//^^^
+// "int" = 我干完活会交给你一个整数
+}
+}
+
+**类比：** 你派小弟去买奶茶。你说"帮我带一杯**奶茶**回来"——"奶茶"就是返回类型。如果你说"帮我倒个垃圾"——不需要带东西回来，返回类型就是 `void`（空的）。
+
+- `int` → 返回一个整数
+- `double` → 返回一个小数
+- `std::string` → 返回一段文字
+- `void` → 不返回任何东西（只干活不汇报）
+- `bool` → 返回真/假
+}
+\step[函数名——叫什么名字]{
+\code[cpp]{
+int add(int a, int b) {
+//  ^^^
+// "add" = 这个函数叫"add"（加法）
+}
+}
+
+名字你随便取（只要合法），但**好名字能让代码自己说话**：
+- ✅ `calculateArea` — 一看就知道是算面积
+- ✅ `isEven` — 判断是不是偶数
+- ❌ `f1` — 这是什么鬼？
+- ❌ `doStuff` — 做啥stuff啊？
+}
+\step[参数列表——干活需要什么原材料]{
+\code[cpp]{
+int add(int a, int b) {
+//     ^^^^^^^^^^^^^^
+// 两个"原材料"：整数a 和 整数b
+}
+}
+
+**类比：** 你叫小弟去买奶茶，你得告诉他"**哪家店**的**什么口味**"。这俩信息就是参数。没有参数？那就是空括号 `()`，表示"你自己去干，不用我给你任何东西"。
+}
+\step[函数体——具体怎么干]{
+\code[cpp]{
+int add(int a, int b) {
+    return a + b;  // ← 干活：把a和b加起来，交回结果
+}
+}
+
+大括号 `{}` 之间就是函数体，也就是**具体的干活步骤**。`return` 是"交结果"——把 `a + b` 的值交给调用者。
+}
+}
+
+把四步合在一起：
+
+\code[cpp]{
+// 返回类型  函数名  参数列表
+//  ↓         ↓      ↓
+   int      add   (int a, int b)
+   {                              // ← 函数体开始
+       return a + b;              // ← 干活 + 交结果
+   }                              // ← 函数体结束
+}
+
+// 声明 vs 定义——先报名后干活
+
+有时候你想在 `main()` 之前告诉编译器"等下有个函数叫 `add`"，但具体代码放在后面写。这叫**函数声明**（Declaration），也叫**函数原型**（Prototype）：
+
+\code[cpp]{
+// 声明（原型）：只告诉编译器"有这么个函数"
+int add(int a, int b);  // 注意这里有分号！
+
+int main() {
+    int result = add(3, 5);  // 编译器已经知道add，可以放心调用
+    return 0;
+}
+
+// 定义：真正写出函数的代码
+int add(int a, int b) {
+    return a + b;
+}
+}
+
+\tip{**什么时候需要声明？** 当你的函数定义写在 `main()` 后面时，编译器从上往下读代码，还没看到定义就遇到调用，就会报错"找不到这个函数"。声明就是提前**打个招呼**。}
+
+// 参数传递——你交给函数的东西会怎样？
+
+这是函数的**核心难点**之一。给函数传参数时，有三种主要方式，效果完全不同：
+
+\tabs{
+\tab[值传递（复印件）]{
+\code[cpp]{
+void addTen(int x) {  // x 是 a 的复印件
+    x = x + 10;       // 改的是复印件
+    // 原件 a 不受影响！
+}
+
+int main() {
+    int a = 5;
+    addTen(a);
+    // a 还是 5！因为函数拿到的只是复印件
+}
+}
+
+**类比：** 你把身份证**复印了一份**交给别人。别人在复印件上写写画画，跟你原来的身份证没半毛钱关系。
+
+**适合传值的类型：** `int`、`double`、`char`、`bool` 这些小家伙——复印成本极低。
+}
+\tab[引用传递（原件）]{
+\code[cpp]{
+void addTen(int& x) {  // x 就是 a 本身！& 是"引用"
+    x = x + 10;        // 直接改了 a！
+}
+
+int main() {
+    int a = 5;
+    addTen(a);
+    // a 变成了 15！函数拿到的是原件
+}
+}
+
+**类比：** 你把身份证**原件**交给别人了。别人在上面涂了一笔，你拿回来一看——真被改了！
+
+`&` 这个符号就是告诉编译器："别复印了，把原件给我。"
+}
+\tab[const引用（只读原件）]{
+\code[cpp]{
+void printName(const std::string& name) {
+    std::cout << name << std::endl;
+    // name = "别的名字";  // ← 编译错误！const 不让改
+}
+}
+
+**类比：** 你把身份证原件借给别人看，但说了一句："**只许看，不许改！**"
+
+`const&` = 不复印（省性能） + 不让改（保安全），是**大型对象最推荐的传法**。
+
+**适合 const& 的类型：** `std::string`、`std::vector`、任何自定义的大型对象。
+}
+}
+
+\diagram[flow]{
+调用 addTen(a) -> 值传递: 复制a到x -> 修改x -> 返回(a不变)
+调用 addTen(a) -> 引用传递: x绑定a -> 修改x -> 返回(a已改变)
+调用 printName(s) -> const引用: name绑定s -> 只读访问 -> 返回(s不变)
+}
+
+来，动手验证一下，看看值传递和引用传递的区别：
+
+\run[cpp]{
+#include <iostream>
+
+void byValue(int x) {
+    x = x + 100;
+    std::cout << "函数内 x = " << x << std::endl;
+}
+
+void byReference(int& x) {
+    x = x + 100;
+    std::cout << "函数内 x = " << x << std::endl;
+}
+
+int main() {
+    int a = 10;
+
+    std::cout << "=== 值传递测试 ===" << std::endl;
+    std::cout << "调用前 a = " << a << std::endl;
+    byValue(a);
+    std::cout << "调用后 a = " << a << std::endl;
+
+    std::cout << std::endl;
+
+    std::cout << "=== 引用传递测试 ===" << std::endl;
+    std::cout << "调用前 a = " << a << std::endl;
+    byReference(a);
+    std::cout << "调用后 a = " << a << std::endl;
+
+    return 0;
+}
+}
+
+\tip{**经验法则：** 类型小（`int`、`double`、指针）→ 传值。大型对象且只读 → 传 `const&`。需要修改原始对象 → 传 `&`。}
+
+// 返回值——把结果交回来
+
+函数干完活，用 `return` 把结果交回来。调用者用一个变量接住它：
+
+\code[cpp]{
+int multiply(int a, int b) {
+    return a * b;  // 把乘积交回去
+}
+
+int main() {
+    int result = multiply(4, 5);  // result 接住了返回值 20
+    std::cout << result;          // 输出 20
+}
+}
+
+如果函数不需要交东西回来（只干活），返回类型写 `void`，而且不需要 `return`：
+
+\code[cpp]{
+void greet(const std::string& name) {
+    std::cout << "你好，" << name << "！" << std::endl;
+    // 不需要 return，因为返回类型是 void
+}
+}
+
+\danger{**永远不要返回局部变量的引用！** 函数结束后局部变量就销毁了，返回它的引用就像把一个已经拆掉的房子的地址告诉别人——去了只会找到一堆废墟：}
+
+\code[cpp]{
+int& bad() {
+    int x = 42;
+    return x;  // 错误！x 马上就要被销毁了，返回它的引用是悬空的！
+}
+// 正确做法：直接返回值（不加&）
+int good() {
+    int x = 42;
+    return x;  // OK！返回的是 x 的副本
+}
+}
+
+\collapse[🤔 什么是RVO？编译器怎么帮你省拷贝？]{
+你可能会担心——返回一个 `std::vector` 或 `std::string`，不是要拷贝一大堆数据吗？
+
+其实编译器很聪明。**RVO**（Return Value Optimization，返回值优化）让编译器直接在调用者的内存空间里构造返回对象，完全跳过拷贝。从 C++17 开始，某些情况下 RVO 是**强制的**（标准要求的，不是编译器可选的优化）。
+
+\code[cpp]{
+std::vector<int> makeNumbers() {
+    return {1, 2, 3, 4, 5};  // C++17: 强制RVO，零拷贝
+}
+
+std::vector<int> v = makeNumbers();  // 直接在 v 的位置构造好了
+}
+
+结论：**放心大胆地返回值**，别为了避免"拷贝"而去返回指针或引用搞复杂化。现代编译器帮你处理得很好。
+}
+
+// 函数重载——同名不同参
+
+C++允许多个函数**名字相同**但**参数不同**。编译器会根据你传的参数类型自动选择正确的那个：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+void print(int x)    { std::cout << "整数: " << x << std::endl; }
+void print(double x) { std::cout << "小数: " << x << std::endl; }
+void print(const std::string& s) { std::cout << "字符串: " << s << std::endl; }
+
+int main() {
+    print(42);                    // 调用 print(int)
+    print(3.14);                  // 调用 print(double)
+    print(std::string("hello"));  // 调用 print(const string&)
+    return 0;
+}
+}
+
+**类比：** 你家有三部电话，号码都叫"找老王"。打座机接座机、打手机接手机、打微信接微信——名字一样，但会根据你"怎么打"自动找到对的那个。
+
+\warning{**重载的坑：** 编译器选函数的规则（**重载决议**/Overload Resolution）很复杂。当多个重载都能匹配时，可能报"二义性"错误。初学者先记住：**参数类型要区分清楚，别让编译器困惑。**}
+
+// 默认参数——不传就用默认值
+
+有时候一个参数大部分情况都是同一个值，每次都写很烦。默认参数（Default Argument）让你"不传就用默认"：
+
+\code[cpp]{
+void createWindow(int width = 800, int height = 600) {
+    std::cout << "窗口: " << width << "x" << height << std::endl;
+}
+
+int main() {
+    createWindow();          // 800x600（全用默认）
+    createWindow(1920);      // 1920x600（只改宽度）
+    createWindow(1920, 1080); // 1920x1080（全自定义）
+}
+}
+
+\danger{**默认参数必须从右往左设置，不能跳过中间的！**}
+
+\code[cpp]{
+void f(int a, int b = 10, int c = 20);  // OK
+void g(int a = 1, int b, int c = 20);   // 错误！b没有默认值，但它左边的a有
+
+f(1);        // a=1, b=10, c=20 — OK
+f(1, 2);     // a=1, b=2, c=20 — OK
+// f(1, , 3); // 错误！不能跳过 b 直接给 c
+}
+
+// inline 与 [[nodiscard]]
+
+\collapse[inline 的真正含义——跟你想的不一样]{
+很多人以为 `inline` 是"请求编译器把函数展开到调用处"——这在1990年也许是对的，但现在编译器**完全忽略这个提示**，它自己会决定要不要内联。
+
+`inline` 真正的作用是：**允许这个函数在多个文件中出现定义而不冲突**（解决 **ODR**，One Definition Rule / 单一定义规则 问题）。当你在头文件中**定义**（而非只是声明）一个函数时，要加 `inline`。
+
+\code[cpp]{
+// math_utils.h
+inline int square(int x) {  // inline 让这个定义可以出现在多个 .cpp 文件中
+    return x * x;
+}
+}
+}
+
+`[[nodiscard]]` 是 C++17 引入的**属性**（Attribute），意思是"别忽略我的返回值"：
+
+\code[cpp]{
+[[nodiscard]] int computeScore() {
+    // ... 复杂计算 ...
+    return 95;
+}
+
+int main() {
+    computeScore();      // 编译器警告：你算了个分数却不要？
+    int s = computeScore(); // OK：用变量接住了
+}
+}
+
+\tip{什么时候该用 `[[nodiscard]]`？返回错误码的函数、工厂函数（创建对象的）、纯计算函数。这样别人忘记处理返回值时编译器会提醒。}
+
+// auto 返回类型与尾返回类型
+
+C++14 允许用 `auto` 让编译器**自动推导**（Deduce）返回类型：
+
+\code[cpp]{
+// C++14: 编译器从 return 语句推导类型
+auto add(int a, int b) {
+    return a + b;  // 推导为 int
+}
+
+// C++11: 尾返回类型（Trailing Return Type）——把返回类型写在后面
+auto add(int a, int b) -> int {
+    return a + b;
+}
+}
+
+\collapse[什么时候用尾返回类型？]{
+尾返回类型在简单函数里看着多此一举，但它在某些场景很有用：
+
+\code[cpp]{
+// 当返回类型依赖参数类型时：
+template<typename T, typename U>
+auto add(T a, U b) -> decltype(a + b) {
+    return a + b;
+}
+}
+
+在 C++14 以后，大多数情况直接用 `auto` 就行了，尾返回类型主要在模板和复杂类型推导时才需要。
+}
+
+// 函数指针与回调——把函数当参数传
+
+函数也可以被当成"值"传给另一个函数。这叫**回调**（Callback）——"你帮我做事，做完**回**头**调**我给你的那个函数"：
+
+\run[cpp]{
+#include <iostream>
+
+int add(int a, int b) { return a + b; }
+int multiply(int a, int b) { return a * b; }
+
+// operation 是一个函数指针：接受两个int，返回int
+void compute(int a, int b, int (*operation)(int, int)) {
+    std::cout << "结果: " << operation(a, b) << std::endl;
+}
+
+int main() {
+    compute(3, 4, add);       // 结果: 7
+    compute(3, 4, multiply);  // 结果: 12
+    return 0;
+}
+}
+
+\tip{函数指针的语法 `int (*operation)(int, int)` 确实很丑。在后续章节你会学到 `std::function` 和 **Lambda 表达式**，它们是更现代、更好用的替代方案。现在先理解"函数可以当参数传"这个概念就够了。}
+
+/// 难点易错点分析
+
+// 易错点1：修改值传递的参数以为能改原始值
+
+\danger{**最经典的新手坑！** 值传递拿到的是复印件，改了复印件原件不变。想改原件，必须加 `&`。}
+
+\code[cpp]{
+void tryToChange(int x) {  // 值传递——复印件
+    x = 999;
+}
+int main() {
+    int a = 1;
+    tryToChange(a);
+    // a 还是 1！你以为改了，其实没有
+}
+}
+
+// 易错点2：重载和默认参数打架
+
+\danger{**当重载和默认参数同时存在时，可能产生"二义性"——编译器不知道该调谁：**}
+
+\code[cpp]{
+void f(int x);
+void f(int x, int y = 0);
+
+f(42); // 编译错误！两个函数都能匹配 f(42)，编译器懵了
+}
+
+// 易错点3：返回局部变量的引用
+
+\danger{**永远不要这么做！** 函数结束后局部变量已销毁，引用变成了**悬空引用**（Dangling Reference），访问它是**未定义行为**（Undefined Behavior）：}
+
+\code[cpp]{
+int& getNumber() {
+    int n = 42;
+    return n;  // 错误！n 马上就没了
+}
+// 正确：返回值（不加&），让编译器帮你做 RVO
+int getNumber() {
+    int n = 42;
+    return n;  // OK
+}
+}
+
+// 来做几道题检验一下！
+
+\quiz[choice]{
+Q: 以下代码执行后，`a` 的值是多少？\n```cpp\nvoid modify(int x) { x = 100; }\nint main() { int a = 5; modify(a); }\n```
+A: 100
+B: 5
+C: 0
+D: 编译错误
+ANS: B
+EXP: `modify` 使用的是值传递，函数内修改的是 `a` 的副本（复印件），原始的 `a` 不会被改变，仍然是 5。如果想改变 `a`，需要把参数改成引用：`void modify(int& x)`。
+}
+
+\quiz[tf]{
+Q: 函数 `void doSomething()` 可以使用 `return 0;` 来返回。
+ANS: F
+EXP: `void` 表示这个函数不返回任何值。在 `void` 函数中可以使用不带值的 `return;` 来提前退出，但不能 `return 0;`——编译器会报错，因为你说了不返回东西却试图返回一个整数。
+}
+
+\quiz[choice]{
+Q: 如果要传递一个很大的 `std::vector<int>` 给函数，但函数内部不会修改它，最推荐的参数类型是？
+A: `std::vector<int> v`（值传递）
+B: `std::vector<int>& v`（引用传递）
+C: `const std::vector<int>& v`（const引用传递）
+D: `std::vector<int>* v`（指针传递）
+ANS: C
+EXP: `const&` 既避免了拷贝整个 vector 的开销（只传了一个"地址"），又保证函数内不会意外修改原始数据。这是 C++ 中传递大型只读对象的标准做法。
+}
+
+\diagram[memory]{
+stack:
+  [main 栈帧] int a = 5
+  [main 栈帧] int b = 10
+  ---调用 add(a, b)---
+  [add 栈帧] int x = 5 (a的副本)
+  [add 栈帧] int y = 10 (b的副本)
+  [add 栈帧] return 15
+  ---返回到 main---
+  [main 栈帧] int result = 15
+}
+
+/// 实战作业
+
+// 🟢 基础题1：写一个计算器函数
+
+**任务：** 完成下面的 `calculate` 函数。它接收两个数和一个运算符字符（`+`、`-`、`*`、`/`），返回计算结果。
+
+\run[cpp]{
+#include <iostream>
+
+double calculate(double a, double b, char op) {
+    /* TODO: 你的代码
+       根据 op 的值（'+', '-', '*', '/'）返回对应的运算结果。
+       如果 op 是 '/' 且 b 为 0，输出错误提示并返回 0。
+    */
+    return 0; // 替换这行
+}
+
+int main() {
+    std::cout << "3 + 5 = " << calculate(3, 5, '+') << std::endl;   // 应输出 8
+    std::cout << "10 - 4 = " << calculate(10, 4, '-') << std::endl; // 应输出 6
+    std::cout << "6 * 7 = " << calculate(6, 7, '*') << std::endl;   // 应输出 42
+    std::cout << "15 / 3 = " << calculate(15, 3, '/') << std::endl; // 应输出 5
+    return 0;
+}
+}
+
+// 🟢 基础题2：交换两个变量（引用传参）
+
+**任务：** 完成 `mySwap` 函数，使用引用传参来交换两个整数的值。
+
+\run[cpp]{
+#include <iostream>
+
+void mySwap(/* TODO: 参数用什么传递方式？ */) {
+    /* TODO: 交换 a 和 b 的值（提示：需要一个临时变量） */
+}
+
+int main() {
+    int x = 10, y = 20;
+    std::cout << "交换前: x=" << x << ", y=" << y << std::endl;
+    mySwap(x, y);
+    std::cout << "交换后: x=" << x << ", y=" << y << std::endl;
+    // 应输出：交换后: x=20, y=10
+    return 0;
+}
+}
+
+// 🟡 进阶题：函数重载练习
+
+**任务：** 实现三个重载的 `maxOf` 函数：
+1. `maxOf(int, int)` 返回较大的整数
+2. `maxOf(double, double)` 返回较大的浮点数
+3. `maxOf(int, int, int)` 返回三个整数中最大的
+
+\collapse[参考思路]{
+- 两个数取最大：用 `if` 比较，或者用三元运算符 `a > b ? a : b`
+- 三个数取最大：可以两两比较，也可以复用你写的两个数版本——`maxOf(maxOf(a, b), c)`
+- 返回类型和参数类型一致
+}
+
+这节课你学会了把代码拆成函数、用不同方式传参数、靠返回值拿结果。下一节我们来聊**输入输出与文件操作**——让你的程序不只是自说自话，还能和用户互动、读写文件。

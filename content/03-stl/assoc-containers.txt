@@ -1,0 +1,647 @@
+/// 简介
+
+上一节我们学习了顺序容器（Sequential Containers）——`vector`、`deque`、`list` 按照元素插入的先后存放数据。但有一个现实问题它们解决不好：**快速查找**。想象你在开发一款 RPG 游戏，玩家背包里有上千种道具，每次需要通过道具 ID 找到对应的道具信息——用 `vector` 线性查找是 O(n)，太慢了。
+
+**关联容器（Associative Containers）** 就是为"按键查找"而生的。它们通过**键（key）**而非下标组织元素，让查找效率从 O(n) 跃升到 O(log n) 甚至平均 O(1)。C++ 提供两大类关联容器：**有序容器**（基于红黑树，元素自动排序）和**无序容器**（基于哈希表，查找更快但不排序）。选对容器，直接决定了你的游戏引擎在查找密集场景下的性能。
+
+/// 知识点列表
+
+\list{
+- std::map / std::multimap — 有序键值对（红黑树）
+- std::set / std::multiset — 有序集合（红黑树）
+- std::unordered_map / std::unordered_set — 哈希表容器
+- 自定义比较器（Custom Comparator）与哈希函数（Hash Function）
+- 结构化绑定遍历（Structured Bindings，C++17）
+- insert vs emplace vs try_emplace — 插入策略对比
+- contains()（C++20）及其他现代 API
+- 性能对比：有序容器 vs 无序容器的选型决策
+}
+
+/// 知识点详解
+
+// std::map — 有序键值对映射
+
+为什么需要 `map`？假设你要存储游戏中所有角色的分数排行榜，不仅要快速查询某个角色的分数，还希望随时按名字顺序输出——`std::map` 同时满足这两点。
+
+**std::map**（映射）是一个**有序键值对容器**，底层用**红黑树（Red-Black Tree）** 实现。它保证：
+- 键唯一——同一个键只能出现一次
+- 按键自动排序——遍历时总是从小到大
+- 查找、插入、删除都是 **O(log n)**
+
+\run[cpp]{
+#include <iostream>
+#include <map>
+#include <string>
+
+int main() {
+    // 创建一个 map：角色名 -> 分数
+    std::map<std::string, int> scoreboard;
+
+    // 插入元素的三种方式
+    scoreboard["Alice"] = 100;             // operator[] 插入或覆盖
+    scoreboard.insert({"Bob", 85});        // insert：键已存在则不覆盖
+    scoreboard.emplace("Charlie", 90);     // emplace：原地构造，效率更高
+
+    // 遍历——自动按 key 排序输出！
+    for (const auto& [name, score] : scoreboard) {  // C++17 结构化绑定
+        std::cout << name << ": " << score << "\n";
+    }
+    // 输出：Alice: 100, Bob: 85, Charlie: 90（字母序）
+
+    // 查找
+    auto it = scoreboard.find("Bob");
+    if (it != scoreboard.end()) {
+        std::cout << "Found Bob with score: " << it->second << "\n";
+    }
+
+    std::cout << "Total players: " << scoreboard.size() << "\n";
+    return 0;
+}
+}
+
+\danger{**`operator[]` 的隐形陷阱：** 对 `map` 使用 `[]` 访问**不存在的键**时，会自动插入一个默认值元素！这在"只想查询"时会意外改变 map 的大小。只读查找请用 `find()` 或 `at()`。}
+
+\run[cpp]{
+#include <iostream>
+#include <map>
+#include <string>
+
+int main() {
+    std::map<std::string, int> m;
+    m["Alice"] = 42;
+
+    // 危险！"Bob" 不存在，但 operator[] 会插入 {"Bob", 0}
+    int val = m["Bob"];
+    std::cout << "val = " << val << "\n";       // 0
+    std::cout << "size = " << m.size() << "\n"; // 2！不是 1
+
+    // 安全做法：用 find()
+    auto it = m.find("Charlie");
+    if (it != m.end()) {
+        std::cout << "Found\n";
+    } else {
+        std::cout << "Not found, and map is unchanged\n";
+    }
+    std::cout << "size still = " << m.size() << "\n"; // 仍然是 2
+    return 0;
+}
+}
+
+**std::multimap** 允许同一个键出现多次。比如游戏日志中一个玩家可能有多条记录：
+
+\code[cpp]{
+#include <map>
+#include <string>
+
+std::multimap<std::string, int> logs;
+logs.insert({"Alice", 100});
+logs.insert({"Alice", 200});  // 同一个键，允许！
+logs.insert({"Bob", 150});
+// logs.count("Alice") == 2
+
+// 查找某个键的所有值
+auto [begin, end] = logs.equal_range("Alice");
+for (auto it = begin; it != end; ++it) {
+    // it->second 依次是 100, 200
+}
+}
+
+// std::set / std::multiset — 有序集合
+
+**std::set**（集合）只存储键，不存储值——你可以把它理解为"只有 key 没有 value 的 map"。它自动去重并排序，非常适合维护一组不重复的 ID、标签等。
+
+\code[cpp]{
+#include <set>
+
+std::set<int> activeEnemyIDs = {5, 3, 1, 4, 1, 5};
+// 实际存储：{1, 3, 4, 5}——自动去重 + 排序
+
+activeEnemyIDs.insert(2);   // {1, 2, 3, 4, 5}
+activeEnemyIDs.erase(3);    // {1, 2, 4, 5}
+
+// 检查某个 ID 是否存在
+if (activeEnemyIDs.count(4)) {  // count() 返回 0 或 1
+    // 敌人 #4 还活着
+}
+}
+
+**std::multiset** 允许重复元素，且保持有序。适合需要排序但允许重复的场景，比如按伤害值排序的攻击记录。
+
+\tip{`set` 和 `map` 共享同一套红黑树底层，复杂度完全相同。选择依据很简单：需要键值对用 `map`，只需要键用 `set`。}
+
+// std::unordered_map / std::unordered_set — 哈希容器
+
+有序容器的 O(log n) 已经很快了，但在游戏开发中，当你每帧要查找成百上千次时，O(log n) 和 O(1) 的差距就很明显了。**无序容器（Unordered Containers）** 使用**哈希表（Hash Table）** 实现，提供**平均 O(1)** 的查找性能。
+
+\code[cpp]{
+#include <unordered_map>
+#include <string>
+
+// 游戏资源缓存：资源路径 -> 资源 ID
+std::unordered_map<std::string, int> resourceCache;
+resourceCache["textures/hero.png"] = 1001;
+resourceCache["sounds/explosion.wav"] = 2001;
+
+// 平均 O(1) 查找！
+auto it = resourceCache.find("textures/hero.png");
+}
+
+无序容器的核心机制是**桶（Bucket）**：哈希函数把键映射到某个桶，每个桶内用链表（或其他结构）存储哈希冲突的元素。
+
+\diagram[tree]{
+root: unordered_map 桶数组
+  L: 桶[0]: {"age", 25}
+  R: 桶[1]: {"name", "Alice"} -> {"score", 100}
+}
+
+\warning{**哈希冲突导致最坏 O(n)。** 当大量键映射到同一个桶时，退化为链表遍历。预分配桶数量可以有效缓解：}
+
+\code[cpp]{
+std::unordered_map<std::string, int> cache;
+cache.reserve(10000);              // 预分配桶，避免频繁 rehash
+cache.max_load_factor(0.7f);       // 负载因子（Load Factor）阈值
+// 当 size > bucket_count * max_load_factor 时触发 rehash
+}
+
+// 自定义比较器与哈希函数
+
+标准类型（`int`、`std::string` 等）可以直接作为 `map` 或 `unordered_map` 的键。但对于自定义类型，你需要告诉容器"怎么比较"或"怎么哈希"。
+
+\tabs{
+\tab[有序容器：自定义比较]{
+有序容器（`map`/`set`）需要一个**严格弱序（Strict Weak Ordering）** 的比较方式。最简单的做法是使用 C++20 的**三路比较运算符（Spaceship Operator）** `<=>`：
+
+\code[cpp]{
+struct Vec2 {
+    float x, y;
+    // C++20: 自动生成 <, <=, >, >=, ==, != 六个运算符
+    auto operator<=>(const Vec2&) const = default;
+};
+
+std::map<Vec2, std::string> labels;  // 直接可用！
+labels[{1.0f, 2.0f}] = "origin";
+}
+
+如果需要自定义排序逻辑（比如按距离远近排序），传入比较器：
+
+\code[cpp]{
+struct CloserToOrigin {
+    bool operator()(const Vec2& a, const Vec2& b) const {
+        return (a.x*a.x + a.y*a.y) < (b.x*b.x + b.y*b.y);
+    }
+};
+
+std::set<Vec2, CloserToOrigin> sortedByDist;
+}
+}
+\tab[无序容器：自定义哈希]{
+无序容器需要**哈希函数**和 **`operator==`**。推荐用"异或+移位"组合多个字段的哈希值：
+
+\code[cpp]{
+struct Vec2 {
+    float x, y;
+    bool operator==(const Vec2&) const = default; // C++20
+};
+
+struct Vec2Hash {
+    size_t operator()(const Vec2& v) const {
+        auto h1 = std::hash<float>{}(v.x);
+        auto h2 = std::hash<float>{}(v.y);
+        return h1 ^ (h2 << 1);  // 简单但实用的组合方式
+    }
+};
+
+std::unordered_set<Vec2, Vec2Hash> visited;
+visited.insert({3.0f, 4.0f});
+}
+}
+}
+
+\note{C++20 的 `operator<=>` 和 `operator==` 的 `= default` 写法极大简化了自定义类型用于关联容器的工作量。如果你的项目使用 C++20，优先用这种方式。}
+
+// 结构化绑定遍历（C++17）
+
+C++17 引入的**结构化绑定（Structured Bindings）** 让遍历 `map` 时再也不用写丑陋的 `.first` 和 `.second` 了。
+
+\compare{
+old: C++11/14 遍历 map 需要手动取 `.first`/`.second`，代码可读性差：
+\code[cpp]{
+for (const auto& p : scoreboard) {
+    std::cout << p.first << ": " << p.second;
+}
+}
+
+new: C++17 结构化绑定，直接给键和值命名，一目了然：
+\code[cpp]{
+for (const auto& [name, score] : scoreboard) {
+    std::cout << name << ": " << score;
+}
+}
+}
+
+结构化绑定也可以配合 `find()` 使用——但要注意，`find()` 返回的是**迭代器（iterator）**，不是 pair，所以绑定写法不同：
+
+\code[cpp]{
+if (auto it = scoreboard.find("Alice"); it != scoreboard.end()) {
+    auto& [name, score] = *it;  // 解引用迭代器后再绑定
+    score += 10;                 // 可以修改值（key 是 const 不可改）
+}
+}
+
+// insert vs emplace vs try_emplace
+
+`map` 提供了多种插入方式，它们的语义差别直接影响性能和正确性：
+
+\table{
+方法 | 键已存在时 | 值构造时机 | 推荐场景
+---
+`operator[]` | 覆盖旧值 | 总是构造（即使键已存在） | 插入或更新，简单赋值
+`insert({k,v})` | **不覆盖**，返回 false | 先构造 pair，再判断 | 仅插入不覆盖
+`emplace(k,v)` | **不覆盖** | 原地构造，避免临时对象 | 值类型构造成本高时
+`try_emplace(k,args)` | **不覆盖**，不构造值 | 键不存在时才构造值 | ⭐ 最高效的"不覆盖"插入
+`insert_or_assign(k,v)` | **覆盖**旧值 | 总是构造 | ⭐ 最高效的"覆盖"插入
+}
+
+\run[cpp]{
+#include <iostream>
+#include <map>
+#include <string>
+
+int main() {
+    std::map<int, std::string> items;
+
+    // try_emplace：键不存在 -> 构造值并插入
+    auto [it1, inserted1] = items.try_emplace(1, "Sword");
+    std::cout << "Inserted Sword: " << inserted1 << "\n";  // 1 (true)
+
+    // try_emplace：键已存在 -> 什么都不做，连值都不会构造
+    auto [it2, inserted2] = items.try_emplace(1, "Shield");
+    std::cout << "Inserted Shield: " << inserted2 << "\n"; // 0 (false)
+    std::cout << "Item 1 is still: " << it2->second << "\n"; // Sword
+
+    // insert_or_assign：键已存在 -> 覆盖
+    auto [it3, inserted3] = items.insert_or_assign(1, "Axe");
+    std::cout << "Assigned Axe: " << inserted3 << "\n";    // 0 (false, 表示覆盖)
+    std::cout << "Item 1 is now: " << it3->second << "\n";  // Axe
+
+    return 0;
+}
+}
+
+\tip{**选择经验法则：** 想覆盖就用 `insert_or_assign`，不想覆盖就用 `try_emplace`。忘掉 `operator[]` + `find()` 的老套路吧。}
+
+// 性能对比：有序 vs 无序
+
+选 `map` 还是 `unordered_map`？这是一个高频面试题，也是实际开发中必须做出的决策。
+
+\table{
+维度 | `map` / `set` | `unordered_map` / `unordered_set`
+---
+底层结构 | 红黑树（Red-Black Tree） | 哈希表（Hash Table）
+查找复杂度 | O(log n) 稳定 | 平均 O(1)，最坏 O(n)
+插入复杂度 | O(log n) | 平均 O(1)，可能触发 rehash
+有序遍历 | ✅ 按键排序 | ❌ 无序
+迭代器稳定性 | insert 不失效 | rehash 时**全部失效**
+内存局部性 | 差（节点分散堆上） | 较差（桶 + 链表节点）
+键的要求 | `operator<` 或比较器 | `std::hash` + `operator==`
+}
+
+\collapse[🤔 什么时候该选 map？]{
+以下场景优先选有序容器：
+- 需要按键排序遍历（如排行榜、时间线）
+- 需要范围查询：`lower_bound()`、`upper_bound()`
+- 数据量小（< 1000），红黑树的常数因子反而比哈希表小
+- 需要稳定的最坏情况性能（实时系统，不能容忍偶尔的 rehash 延迟）
+- 键是自定义类型且哈希函数难以设计
+}
+
+\diagram[tree]{
+root: 如何选择关联容器？
+  L: 需要键值对？
+    L: 键可重复？ -> multimap
+    R: 键唯一？
+      L: 需要有序？ -> map
+      R: 不需要有序？ -> unordered_map
+  R: 只需要键？
+    L: 键可重复？ -> multiset
+    R: 键唯一？
+      L: 需要有序？ -> set
+      R: 不需要有序？ -> unordered_set
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17 新增
+
+**`try_emplace` 和 `insert_or_assign`** 已在上节详述。另一个重要特性是**节点句柄（Node Handle）**——允许你在不复制的情况下从一个 map 移动元素到另一个 map，甚至**修改 key**：
+
+\code[cpp]{
+std::map<std::string, int> scores = {{"Bob", 85}, {"Alice", 100}};
+
+// extract 取出节点（从 map 中移除，但不销毁）
+auto node = scores.extract("Bob");
+node.key() = "Robert";                // 修改 key！普通方式无法做到
+scores.insert(std::move(node));        // 重新插入
+
+// merge：将一个 map 的所有节点移入另一个 map
+std::map<std::string, int> extra = {{"Eve", 88}};
+scores.merge(extra);  // extra 中键不冲突的节点被移走
+}
+
+// C++20 新增
+
+**`contains()`** 终于让"检查键是否存在"变得简洁：
+
+\compare{
+old: C++17 之前检查键是否存在，需要写 `find() != end()` 或 `count() > 0`：
+\code[cpp]{
+if (scores.find("Alice") != scores.end()) { /* ... */ }
+if (scores.count("Alice")) { /* ... */ }  // 可读性一般
+}
+
+new: C++20 的 `contains()` 一目了然：
+\code[cpp]{
+if (scores.contains("Alice")) { /* ... */ }  // 语义清晰
+}
+}
+
+**`std::erase_if()`**（C++20）让批量删除在关联容器上也变得简洁：
+
+\code[cpp]{
+std::map<std::string, int> scores = {{"A", 10}, {"B", 90}, {"C", 30}};
+// 删除分数低于 50 的所有条目
+std::erase_if(scores, [](const auto& pair) {
+    return pair.second < 50;
+});
+// scores 只剩 {"B", 90}
+}
+
+// C++23 展望
+
+C++23 引入了 **`std::flat_map`** 和 **`std::flat_set`**——底层用**排序的 `vector`** 代替红黑树。因为数据连续存储在内存中，**缓存命中率（Cache Hit Rate）** 远高于节点式容器，适合"先批量插入、再频繁查找"的只读场景。这是一个值得关注的新选项，后续版本课程会详细展开。
+
+/// 工程实践
+
+// 最佳实践清单
+
+\list{
+- 默认选 `unordered_map`/`unordered_set`，需要排序或范围查询时再换有序容器
+- 对无序容器调用 `reserve()` 预分配桶，避免运行时 rehash 导致的性能抖动
+- 用 `try_emplace` 替代 `operator[]` + `find()` 的二次查找模式
+- 用 `contains()`（C++20）替代 `count()` 检查键是否存在，语义更清晰
+- 循环中删除元素要用 `erase()` 返回值更新迭代器，或直接用 `std::erase_if()`
+- 自定义哈希函数时，确保分布均匀——差的哈希函数比没有还糟
+- 遍历 `map` 时用 `const auto& [k, v]` 结构化绑定，提升可读性
+}
+
+// 游戏开发中的典型用法
+
+\code[cpp]{
+// 1. 资源管理器：路径 -> 资源句柄（查找频繁，用 unordered_map）
+std::unordered_map<std::string, ResourceHandle> resourceCache;
+
+// 2. 实体组件系统：entity ID -> component（快速查找组件）
+std::unordered_map<EntityID, TransformComponent> transforms;
+
+// 3. 排行榜：分数 -> 玩家名（需要有序遍历 top-N，用 map 降序）
+std::map<int, std::string, std::greater<>> leaderboard;
+
+// 4. 碰撞检测已处理集合：避免重复处理同一对碰撞
+std::unordered_set<std::pair<int,int>, PairHash> processedPairs;
+}
+
+/// 难点易错点分析
+
+\danger{**陷阱 1：`operator[]` 的副作用。** 仅对 `map` 使用 `operator[]` 读取时，不存在的键会被自动插入默认值。在 `const map` 上甚至无法使用 `[]`，因为它可能要修改容器。解决：用 `find()`、`at()`、或 `contains()` + `at()`。}
+
+\danger{**陷阱 2：遍历中删除元素。** 在 `for (auto it = m.begin(); it != m.end(); ++it)` 循环中直接 `m.erase(it)` 会导致**迭代器失效（Iterator Invalidation）**，后续 `++it` 是未定义行为。正确做法：}
+
+\code[cpp]{
+// 正确写法：用 erase 的返回值
+for (auto it = m.begin(); it != m.end(); ) {
+    if (shouldRemove(it->second)) {
+        it = m.erase(it);  // erase 返回下一个有效迭代器
+    } else {
+        ++it;
+    }
+}
+
+// C++20 更好的写法
+std::erase_if(m, [](const auto& p) { return shouldRemove(p.second); });
+}
+
+\danger{**陷阱 3：unordered 容器的 rehash 使所有迭代器失效。** `insert()` 可能触发 rehash（当 `size() > bucket_count() * max_load_factor()`），此时所有迭代器、指针、引用全部失效。不要在遍历 `unordered_map` 的同时插入元素。}
+
+\danger{**陷阱 4：浮点数作为键。** 由于浮点精度问题，`float`/`double` 做 `map` 的键极不可靠——两个"看起来相同"的浮点数可能因为微小的精度差异而被视为不同的键。解决：用整数键，或把浮点数量化为整数网格坐标。}
+
+\quiz[tf]{
+Q: `std::map` 的 `operator[]` 在键不存在时会抛出 `std::out_of_range` 异常。
+ANS: F
+EXP: `operator[]` 不会抛异常——它会**静默插入**一个默认值元素。会抛异常的是 `at()` 方法。这是 map 最经典的陷阱之一。
+}
+
+\quiz[choice]{
+Q: 以下哪种插入方式在键已存在时**不会构造值对象**？
+A: `m.insert({key, value})`
+B: `m.emplace(key, value)`
+C: `m.try_emplace(key, value)`
+D: `m[key] = value`
+ANS: C
+EXP: `try_emplace` 在键已存在时**完全跳过值的构造**，是最高效的"不覆盖"插入方式。`insert` 和 `emplace` 虽然也不覆盖，但可能先构造值再发现键已存在。`operator[]` 则总是构造并覆盖。
+}
+
+\quiz[choice]{
+Q: 游戏中需要维护一个按分数排序的排行榜（相同分数允许多人），应该选择哪个容器？
+A: `std::map<int, std::string>`
+B: `std::unordered_map<int, std::string>`
+C: `std::multimap<int, std::string, std::greater<>>`
+D: `std::unordered_set<int>`
+ANS: C
+EXP: 排行榜需要**有序遍历**（排除 unordered）、**相同分数允许多人**（排除 map/set 的唯一键约束）、按分数**从高到低**（需要 `std::greater<>` 比较器）。所以 `multimap` 加降序比较器是最佳选择。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：游戏道具仓库
+
+用 `std::map` 实现一个简单的道具仓库系统：根据道具名查找数量，添加和消耗道具。
+
+\run[cpp]{
+#include <iostream>
+#include <map>
+#include <string>
+
+int main() {
+    std::map<std::string, int> inventory;
+
+    // TODO 1: 向仓库添加以下道具
+    // "HealthPotion" x 5, "ManaPotion" x 3, "Sword" x 1
+
+    /* TODO: 你的代码 */
+
+    // TODO 2: 消耗 2 瓶 HealthPotion（减少数量）
+    // 提示：先检查 contains() 或 find()，再修改
+
+    /* TODO: 你的代码 */
+
+    // TODO 3: 遍历并打印所有道具（使用结构化绑定）
+    // 格式：道具名: 数量
+
+    /* TODO: 你的代码 */
+
+    // 验证：应输出 HealthPotion: 3, ManaPotion: 3, Sword: 1
+    return 0;
+}
+}
+
+// 🟢 基础题 2：去重统计
+
+用 `std::set` 统计一组怪物击杀记录中有多少种不同的怪物。
+
+\run[cpp]{
+#include <iostream>
+#include <set>
+#include <vector>
+#include <string>
+
+int main() {
+    std::vector<std::string> killLog = {
+        "Slime", "Goblin", "Slime", "Dragon",
+        "Goblin", "Slime", "Skeleton", "Dragon"
+    };
+
+    // TODO: 将 killLog 中的怪物名放入 set，统计不同种类数
+    // 提示：set 自动去重
+
+    /* TODO: 你的代码 */
+
+    // 验证：应输出 "Unique monster types: 4"
+    // 并按字母序列出：Dragon, Goblin, Skeleton, Slime
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：词频统计器
+
+用 `std::unordered_map` 统计一段文本中每个单词出现的次数，然后找出出现次数最多的单词。
+
+\run[cpp]{
+#include <iostream>
+#include <unordered_map>
+#include <string>
+#include <sstream>
+
+int main() {
+    std::string text = "the quick brown fox jumps over the lazy dog "
+                       "the fox the fox jumps high";
+
+    std::unordered_map<std::string, int> freq;
+
+    // TODO 1: 用 istringstream 逐词读取，统计词频
+    // 提示：std::istringstream iss(text); std::string word;
+    //       while (iss >> word) { ... }
+
+    /* TODO: 你的代码 */
+
+    // TODO 2: 遍历 freq，找出出现次数最多的单词
+    // 提示：维护一个 maxWord 和 maxCount
+
+    /* TODO: 你的代码 */
+
+    // 验证：应输出 "Most frequent: the (4 times)"
+
+    // TODO 3: 打印所有词频
+    for (const auto& [word, count] : freq) {
+        std::cout << word << ": " << count << "\n";
+    }
+
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：碰撞对去重
+
+游戏物理引擎中，碰撞检测可能对同一对物体报告多次碰撞。用 `std::set` 去重碰撞对（注意 (A,B) 和 (B,A) 算同一对）。
+
+\run[cpp]{
+#include <iostream>
+#include <set>
+#include <vector>
+#include <utility>
+#include <algorithm>
+
+int main() {
+    // 模拟碰撞检测结果：(entityA_id, entityB_id)
+    std::vector<std::pair<int,int>> rawCollisions = {
+        {1, 3}, {2, 5}, {3, 1}, {5, 2}, {1, 3}, {4, 7}, {7, 4}
+    };
+
+    // TODO: 用 set<pair<int,int>> 存储去重后的碰撞对
+    // 关键：插入前将 pair 规范化为 (min, max)，这样 (1,3) 和 (3,1) 变成同一个
+
+    std::set<std::pair<int,int>> uniqueCollisions;
+
+    /* TODO: 你的代码 */
+
+    // 验证：uniqueCollisions 应包含 3 对：(1,3), (2,5), (4,7)
+    std::cout << "Unique collision pairs: " << uniqueCollisions.size() << "\n";
+    for (const auto& [a, b] : uniqueCollisions) {
+        std::cout << "(" << a << ", " << b << ")\n";
+    }
+
+    return 0;
+}
+}
+
+// 🔴 挑战题：LRU 缓存
+
+实现一个**LRU（Least Recently Used，最近最少使用）缓存**——这是游戏资源管理中的经典数据结构。
+
+**需求：**
+- `LRUCache(int capacity)` — 创建指定容量的缓存
+- `int get(int key)` — 获取键对应的值，若不存在返回 -1；获取操作算作"最近使用"
+- `void put(int key, int value)` — 插入或更新键值对；缓存满时淘汰**最久未使用**的条目
+- `get` 和 `put` 均要求 **O(1)** 时间复杂度
+
+**提示：** 用 `std::unordered_map` + `std::list` 组合实现。`list` 维护访问顺序（最近访问的放前面），`unordered_map` 存储 key -> list 迭代器的映射以实现 O(1) 定位。
+
+\collapse[参考思路]{
+\code[cpp]{
+#include <list>
+#include <unordered_map>
+
+class LRUCache {
+    int capacity;
+    std::list<std::pair<int,int>> order;  // front = 最近使用
+    std::unordered_map<int, std::list<std::pair<int,int>>::iterator> cache;
+
+public:
+    LRUCache(int cap) : capacity(cap) {}
+
+    int get(int key) {
+        auto it = cache.find(key);
+        if (it == cache.end()) return -1;
+        // 移到 list 头部（标记为最近使用）
+        order.splice(order.begin(), order, it->second);
+        return it->second->second;
+    }
+
+    void put(int key, int value) {
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            it->second->second = value;
+            order.splice(order.begin(), order, it->second);
+            return;
+        }
+        if ((int)cache.size() >= capacity) {
+            // 淘汰末尾（最久未使用）
+            auto last = order.back();
+            cache.erase(last.first);
+            order.pop_back();
+        }
+        order.emplace_front(key, value);
+        cache[key] = order.begin();
+    }
+};
+}
+}

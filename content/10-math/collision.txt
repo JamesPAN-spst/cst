@@ -1,0 +1,413 @@
+/// 简介
+
+游戏对象需要彼此交互——子弹命中敌人、角色站在地面上、鼠标点击选中物体。所有这些都依赖**碰撞检测（Collision Detection）**：判断两个几何体是否重叠，如果重叠则计算穿透深度和碰撞法线。
+
+碰撞检测是每帧最密集的计算之一。1000 个对象暴力两两检测需要约 50 万次测试。本节从简单形状（圆/AABB）讲到通用凸多边形（SAT），再到空间分区优化策略，覆盖 2D 碰撞检测的完整工具链。
+
+/// 知识点列表
+
+\list{
+- AABB（Axis-Aligned Bounding Box）碰撞
+- 圆/球形碰撞（Circle/Sphere）
+- OBB（Oriented Bounding Box）概念
+- 射线投射（Raycasting）— Slab Method
+- 分离轴定理（SAT）简介
+- 宽相（Broad Phase）vs 窄相（Narrow Phase）
+- 空间分区：均匀网格、四叉树
+}
+
+/// 知识点详解
+
+// AABB 碰撞
+
+**轴对齐包围盒（Axis-Aligned Bounding Box, AABB）** 是最简单也最快速的碰撞体——一个边与坐标轴平行的矩形（2D）或长方体（3D）：
+
+\code[cpp]{
+struct AABB {
+    Vec2 min, max;  // 左下角和右上角
+
+    bool contains(Vec2 point) const {
+        return point.x >= min.x && point.x <= max.x
+            && point.y >= min.y && point.y <= max.y;
+    }
+    Vec2 center() const { return (min + max) * 0.5f; }
+    Vec2 halfSize() const { return (max - min) * 0.5f; }
+};
+
+// AABB vs AABB：在任何一个轴上不重叠即不碰撞
+bool aabbVsAabb(const AABB& a, const AABB& b) {
+    if (a.max.x < b.min.x || a.min.x > b.max.x) return false;
+    if (a.max.y < b.min.y || a.min.y > b.max.y) return false;
+    return true;
+}
+}
+
+碰撞检测不仅要知道"是否碰撞"，还要计算**碰撞信息**用于响应：
+
+\code[cpp]{
+struct CollisionInfo {
+    bool hit;
+    Vec2 normal;  // 碰撞法线（a→b 方向）
+    float depth;  // 穿透深度
+};
+
+CollisionInfo resolveAABB(const AABB& a, const AABB& b) {
+    Vec2 delta = b.center() - a.center();
+    Vec2 overlap = a.halfSize() + b.halfSize()
+                 - Vec2{std::abs(delta.x), std::abs(delta.y)};
+
+    if (overlap.x <= 0 || overlap.y <= 0) return {false, {}, 0};
+
+    // 选择穿透最浅的轴作为分离轴（最小穿透方向）
+    if (overlap.x < overlap.y) {
+        float sign = (delta.x > 0) ? 1.0f : -1.0f;
+        return {true, {sign, 0}, overlap.x};
+    } else {
+        float sign = (delta.y > 0) ? 1.0f : -1.0f;
+        return {true, {0, sign}, overlap.y};
+    }
+}
+}
+
+\tip{**AABB 检测只需 4 次比较（2D）或 6 次比较（3D），是所有碰撞形状中最快的。** 即使最终需要精确碰撞，也先用 AABB 粗筛淘汰大量不可能碰撞的对。}
+
+// 圆/球形碰撞
+
+**圆形碰撞（Circle Collision）** 利用两圆心距离与半径之和的比较：
+
+\code[cpp]{
+struct Circle {
+    Vec2 center;
+    float radius;
+};
+
+bool circleVsCircle(const Circle& a, const Circle& b) {
+    Vec2 delta = b.center - a.center;
+    float distSq = lengthSq(delta);
+    float radiusSum = a.radius + b.radius;
+    return distSq <= radiusSum * radiusSum;  // 不开方！
+}
+
+CollisionInfo resolveCircles(const Circle& a, const Circle& b) {
+    Vec2 delta = b.center - a.center;
+    float dist = length(delta);
+    float overlap = (a.radius + b.radius) - dist;
+    if (overlap <= 0) return {false, {}, 0};
+    Vec2 normal = delta / dist;  // 碰撞法线：a→b 方向
+    return {true, normal, overlap};
+}
+
+// 圆 vs AABB
+bool circleVsAABB(const Circle& c, const AABB& box) {
+    // 找到 AABB 上离圆心最近的点
+    Vec2 closest = {
+        std::clamp(c.center.x, box.min.x, box.max.x),
+        std::clamp(c.center.y, box.min.y, box.max.y)
+    };
+    return lengthSq(c.center - closest) <= c.radius * c.radius;
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+
+struct Vec2 {
+    float x, y;
+    Vec2 operator-(const Vec2& v) const { return {x-v.x, y-v.y}; }
+    Vec2 operator+(const Vec2& v) const { return {x+v.x, y+v.y}; }
+    Vec2 operator*(float s) const { return {x*s, y*s}; }
+};
+float lengthSq(Vec2 v) { return v.x*v.x + v.y*v.y; }
+float length(Vec2 v) { return std::sqrt(lengthSq(v)); }
+
+struct Circle { Vec2 center; float radius; };
+struct AABB { Vec2 min, max; };
+
+bool circleVsCircle(const Circle& a, const Circle& b) {
+    float rSum = a.radius + b.radius;
+    return lengthSq(b.center - a.center) <= rSum * rSum;
+}
+
+bool circleVsAABB(const Circle& c, const AABB& box) {
+    Vec2 closest = {std::clamp(c.center.x, box.min.x, box.max.x),
+                    std::clamp(c.center.y, box.min.y, box.max.y)};
+    return lengthSq(c.center - closest) <= c.radius * c.radius;
+}
+
+int main() {
+    Circle a{{0,0}, 2}, b{{3,0}, 2};
+    std::cout << "圆-圆碰撞: " << circleVsCircle(a, b) << " (期望: 1, 重叠1单位)\n";
+
+    Circle c{{5,5}, 1};
+    AABB box{{3,3}, {7,4}};
+    std::cout << "圆-AABB碰撞: " << circleVsAABB(c, box) << " (期望: 1)\n";
+
+    Circle d{{0,0}, 1};
+    std::cout << "不碰撞: " << circleVsAABB(d, box) << " (期望: 0)\n";
+}
+}
+
+// OBB 概念
+
+**有向包围盒（Oriented Bounding Box, OBB）** 是随物体旋转的矩形包围盒，比 AABB 更紧密地贴合旋转后的物体：
+
+\code[cpp]{
+struct OBB {
+    Vec2 center;
+    Vec2 halfExtents;  // 沿局部轴的半尺寸
+    float rotation;    // 旋转角度（弧度）
+
+    // 获取旋转后的两个局部轴
+    Vec2 axisX() const { return {std::cos(rotation), std::sin(rotation)}; }
+    Vec2 axisY() const { return {-std::sin(rotation), std::cos(rotation)}; }
+};
+// OBB 碰撞检测使用 SAT（分离轴定理），见下文
+}
+
+// 射线投射
+
+**射线投射（Raycasting）** 从一个点沿方向发射射线，检测命中的第一个物体。**Slab Method** 是射线与 AABB 碰撞检测的标准算法：
+
+\code[cpp]{
+struct Ray { Vec2 origin, direction; };
+struct RayHit { bool hit; float t; Vec2 point, normal; };
+
+RayHit rayVsAABB(const Ray& ray, const AABB& box) {
+    Vec2 invDir = {1.0f / ray.direction.x, 1.0f / ray.direction.y};
+
+    float tx1 = (box.min.x - ray.origin.x) * invDir.x;
+    float tx2 = (box.max.x - ray.origin.x) * invDir.x;
+    float ty1 = (box.min.y - ray.origin.y) * invDir.y;
+    float ty2 = (box.max.y - ray.origin.y) * invDir.y;
+
+    float tmin = std::max(std::min(tx1, tx2), std::min(ty1, ty2));
+    float tmax = std::min(std::max(tx1, tx2), std::max(ty1, ty2));
+
+    if (tmax < 0 || tmin > tmax) return {false};
+
+    float t = (tmin >= 0) ? tmin : tmax;
+    Vec2 point = ray.origin + ray.direction * t;
+
+    // 法线：判断命中的是哪个面
+    Vec2 normal = {};
+    float eps = 1e-4f;
+    if (std::abs(point.x - box.min.x) < eps) normal = {-1, 0};
+    else if (std::abs(point.x - box.max.x) < eps) normal = {1, 0};
+    else if (std::abs(point.y - box.min.y) < eps) normal = {0, -1};
+    else normal = {0, 1};
+
+    return {true, t, point, normal};
+}
+}
+
+\note{**射线投射的应用极其广泛：** FPS 命中检测、鼠标拾取（屏幕射线→世界碰撞）、地面检测（角色脚下射线）、AI 视线检测（能否看到玩家）、光线追踪渲染。}
+
+\warning{**射线方向分量为零时：** `1/direction.x` 产生 `±inf`。Slab Method 在 IEEE 754 浮点规则下仍然正确（inf 的比较合法），但避免让 `0 * inf = NaN` 污染后续计算。}
+
+// 分离轴定理
+
+**分离轴定理（Separating Axis Theorem, SAT）**：如果存在一条轴使两个凸形状的投影不重叠，则它们不碰撞。适用于**任意凸多边形**：
+
+\code[cpp]{
+struct Polygon {
+    std::vector<Vec2> vertices;
+};
+
+// 将多边形投影到轴上，返回 (min, max)
+std::pair<float, float> projectPoly(const Polygon& p, Vec2 axis) {
+    float mn = dot(p.vertices[0], axis), mx = mn;
+    for (size_t i = 1; i < p.vertices.size(); ++i) {
+        float proj = dot(p.vertices[i], axis);
+        mn = std::min(mn, proj);
+        mx = std::max(mx, proj);
+    }
+    return {mn, mx};
+}
+
+// SAT 碰撞检测
+bool satTest(const Polygon& a, const Polygon& b) {
+    // 检查 a 的所有边法线
+    auto checkAxes = [](const Polygon& src, const Polygon& a, const Polygon& b) {
+        for (size_t i = 0; i < src.vertices.size(); ++i) {
+            Vec2 edge = src.vertices[(i+1)%src.vertices.size()] - src.vertices[i];
+            Vec2 axis = normalize(Vec2{-edge.y, edge.x}); // 法线
+
+            auto [aMin, aMax] = projectPoly(a, axis);
+            auto [bMin, bMax] = projectPoly(b, axis);
+            if (aMax < bMin || bMax < aMin) return false; // 分离轴！
+        }
+        return true;
+    };
+
+    return checkAxes(a, a, b) && checkAxes(b, a, b);
+}
+}
+
+\collapse[🤔 SAT 为什么有效？]{
+直觉：想象用一盏灯从不同角度照两个物体，看它们的"影子"是否重叠。如果所有角度的影子都重叠，物体一定碰撞。如果任何一个角度出现间隙（分离轴），它们一定不碰撞。对凸多边形，只需检查每条边的法线方向即可。
+}
+
+// 宽相 vs 窄相
+
+碰撞检测分两个阶段，避免 $O(n^2)$ 的暴力检测：
+
+\table{
+阶段 | 目标 | 算法 | 复杂度
+---
+宽相（Broad Phase）| 快速找出可能碰撞的对 | 空间分区、排序裁剪 | O(n) ~ O(n log n)
+窄相（Narrow Phase）| 精确检测候选对 | AABB/Circle/SAT/GJK | O(k)，k 为候选对数
+}
+
+// 空间分区
+
+\tabs{
+\tab[均匀网格]{
+\code[cpp]{
+// 将空间划分为固定大小的格子
+// 每个物体注册到它覆盖的格子中
+// 只检测同格/相邻格子中的物体对
+struct Grid {
+    float cellSize;
+    int width, height;
+    std::vector<std::vector<int>> cells; // cells[i] = 该格子中的对象ID列表
+
+    int cellIndex(float x, float y) const {
+        int cx = static_cast<int>(x / cellSize);
+        int cy = static_cast<int>(y / cellSize);
+        return cy * width + cx;
+    }
+};
+// 适合物体大小均匀的场景（如弹幕游戏）
+}
+}
+\tab[四叉树]{
+\code[cpp]{
+// 递归将空间分为4个象限
+// 物体多的区域继续细分，空白区域不分
+struct QuadTree {
+    AABB boundary;
+    int maxObjects = 4;
+    std::vector<int> objects;
+    QuadTree* children[4] = {};
+
+    void insert(int objId, const AABB& objBounds) {
+        if (!aabbVsAabb(boundary, objBounds)) return;
+        if (objects.size() < maxObjects || !children[0]) {
+            objects.push_back(objId);
+            // 超过阈值时细分...
+        } else {
+            for (auto* c : children) c->insert(objId, objBounds);
+        }
+    }
+};
+// 适合物体分布不均匀的场景（如开放世界）
+}
+}
+}
+
+\diagram[tree]{
+root: 世界空间
+  L: NW象限
+    L: NW-NW (空)
+    R: NW-NE (3个对象)
+  R: NE象限 (1个对象)
+}
+
+/// 工程实践
+
+\collapse[🔧 碰撞系统设计建议]{
+\list{
+- **碰撞层（Collision Layers）**：用位掩码标记物体类别（玩家/敌人/子弹/地形），只检测需要交互的层对
+- **连续碰撞检测（CCD）**：高速物体用射线检测替代离散重叠测试，防止"隧穿"
+- **碰撞回调（Callbacks）**：OnCollisionEnter / Stay / Exit 事件驱动，而非每帧轮询
+- **碰撞体与渲染网格分离**：碰撞体用简单形状（AABB/Circle/Capsule），不要用原始多边形网格
+}
+}
+
+/// 难点易错点分析
+
+\danger{**高速物体隧穿（Tunneling）：** 子弹一帧移动 100 单位，薄墙只有 2 单位厚——子弹直接穿过。解决：1）限制最大速度 2）CCD（射线检测） 3）增大碰撞体。}
+
+\danger{**浮点比较使用 `==`：** 碰撞法线计算中 `if (point.x == box.min.x)` 几乎永远不成立。使用 epsilon 容差比较。}
+
+\warning{**四叉树的物体跨象限问题：** 大物体可能跨多个子节点，需要存储在父节点或同时插入多个子节点。处理不当导致漏检。}
+
+\quiz[choice]{
+Q: 场景中有 1000 个物体。不使用空间分区时，碰撞检测需要多少次两两测试？
+A: 1,000
+B: 10,000
+C: 499,500
+D: 1,000,000
+ANS: C
+EXP: C(1000, 2) = 1000 × 999 / 2 = 499,500。使用空间分区后通常减少到几百次窄相测试。
+}
+
+\quiz[tf]{
+Q: SAT 可以检测任意形状（包括凹多边形）的碰撞。
+ANS: F
+EXP: SAT 仅适用于**凸形状**。凹多边形需要先分解为凸多边形（凸分解），或使用 GJK 等更通用的算法。
+}
+
+/// 实战作业
+
+// 🟢 基础题：完整碰撞检测套件
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+#include <algorithm>
+
+struct Vec2 {
+    float x, y;
+    Vec2 operator-(const Vec2& v) const { return {x-v.x, y-v.y}; }
+    Vec2 operator+(const Vec2& v) const { return {x+v.x, y+v.y}; }
+    Vec2 operator*(float s) const { return {x*s, y*s}; }
+};
+float lengthSq(Vec2 v){return v.x*v.x+v.y*v.y;}
+
+struct Circle { Vec2 center; float radius; };
+struct AABB { Vec2 min, max; };
+
+/* TODO: 实现以下三种碰撞检测 */
+bool circleVsCircle(const Circle& a, const Circle& b) {
+    /* TODO */ return false;
+}
+bool aabbVsAabb(const AABB& a, const AABB& b) {
+    /* TODO */ return false;
+}
+bool circleVsAABB(const Circle& c, const AABB& box) {
+    /* TODO */ return false;
+}
+
+int main() {
+    Circle c1{{0,0},3}, c2{{4,0},2};
+    std::cout << "圆-圆: " << circleVsCircle(c1,c2) << " (期望: 1)\n";
+
+    AABB a1{{0,0},{4,4}}, a2{{3,3},{7,7}};
+    std::cout << "AABB: " << aabbVsAabb(a1,a2) << " (期望: 1)\n";
+
+    Circle c3{{6,6},1};
+    AABB a3{{0,0},{4,4}};
+    std::cout << "圆-AABB: " << circleVsAABB(c3,a3) << " (期望: 0)\n";
+}
+}
+
+// 🟡 进阶题：射线碰撞 + 碰撞响应
+
+实现射线 vs AABB 的 Slab Method，以及圆-圆碰撞响应（计算碰撞后的分离位移向量和反弹速度）。提供测试用例验证射线命中点坐标和法线方向。
+
+// 🔴 挑战题一：SAT 凸多边形碰撞
+
+实现完整的 SAT 碰撞检测，支持任意凸多边形。测试三角形 vs 矩形、五边形 vs 五边形。输出碰撞的最小穿透向量（MTV, Minimum Translation Vector）用于分离物体。
+
+// 🔴 挑战题二：简易空间分区
+
+实现均匀网格或四叉树宽相。在 1000 个随机圆形对象的场景中，对比暴力检测和空间分区的检测次数，输出统计数据。
+
+\collapse[🤔 参考思路]{
+均匀网格更易实现：选择 `cellSize` ≥ 最大物体直径。每帧：1）清空所有格子 2）将每个物体插入覆盖的格子 3）只检测同格/相邻格中的对。四叉树适合物体大小不一的场景，但实现更复杂。
+}
+
+碰撞检测让游戏对象"看到"彼此——后续的物理章节将在此基础上添加力、动量、约束。

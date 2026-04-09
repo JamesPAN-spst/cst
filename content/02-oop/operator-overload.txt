@@ -1,0 +1,639 @@
+/// 简介
+
+上一节你学会了拷贝和移动语义，让自定义类型能够安全地复制与转移资源。这一节我们解决另一个问题：**如何让自定义类型像内置类型一样自然地使用运算符？**
+
+想象你正在写一个 2D 游戏引擎，需要大量的向量运算。如果每次加两个向量都得写 `Vec2 c = Vec2::add(a, b);`，代码会变得又臭又长。而**运算符重载（Operator Overloading）**让你可以直接写 `Vec2 c = a + b;`——不仅更直观，还和数学公式一模一样。
+
+但运算符重载是一把双刃剑：用好了代码如诗，滥用了代码如谜。本节将带你从语法基础到工程最佳实践，系统掌握这一 C++ 核心特性。
+
+/// 知识点列表
+
+\list{
+- 运算符重载的基本语法：成员函数（Member Function）vs 非成员函数（Non-member Function）
+- 算术运算符重载（+, -, *, /）与复合赋值惯用法
+- 比较运算符重载（==, !=, <, >, <=, >=）
+- C++20 三路比较运算符 <=>（Spaceship Operator）
+- 输入输出运算符（<<, >>）
+- 下标运算符 []
+- 函数调用运算符 ()：函数对象（Function Object）/ 仿函数（Functor）
+- 类型转换运算符（Conversion Operator）
+- 自增自减运算符（前置 / 后置）
+- 不能重载的运算符
+}
+
+/// 知识点详解
+
+// 运算符重载的基本语法
+
+**运算符重载的本质是什么？** 其实就是给运算符写一个特殊名字的函数。当编译器看到 `a + b`，如果 `a` 或 `b` 是自定义类型，它就会去找名为 `operator+` 的函数来调用。
+
+重载运算符有两种写法：
+
+\table{
+方式 | 语法 | 左操作数 | 典型用途
+---
+成员函数 | `T operator+(const T& rhs)` | 隐式为 `*this` | 赋值=、下标[]、调用()、箭头->
+非成员函数 | `T operator+(const T& a, const T& b)` | 显式参数 | 算术+、比较==、流<<
+}
+
+\code[cpp]{
+struct Vec2 {
+    float x = 0, y = 0;
+
+    // 成员函数重载：左操作数一定是 Vec2
+    Vec2 operator-() const {            // 一元取反
+        return {-x, -y};
+    }
+
+    Vec2& operator+=(const Vec2& rhs) { // 复合赋值
+        x += rhs.x;
+        y += rhs.y;
+        return *this;                   // 返回自身引用，支持链式调用
+    }
+};
+
+// 非成员函数重载：两边都是显式参数
+Vec2 operator+(Vec2 lhs, const Vec2& rhs) {
+    return lhs += rhs;  // lhs 是值传递的副本，直接修改并返回
+}
+}
+
+\note{**怎么选成员还是非成员？** 有一个简单判断法：如果左操作数必须是你的类型（如 `=`、`[]`、`()`），用成员函数；如果你希望左操作数可以是其他类型（如 `3.0f * vec`），用非成员函数。}
+
+\collapse[🤔 想一想：为什么 `operator+` 的 lhs 参数用值传递？]{
+因为 `a + b` 不应该修改 `a` 和 `b` 中的任何一个。值传递会自动创建一份副本，我们在副本上调用 `+=` 然后返回——既复用了 `+=` 的逻辑，又避免了代码重复。这是 C++ 社区公认的惯用法（Canonical Form）。
+}
+
+// 算术运算符（+, -, *, /）
+
+游戏开发中，向量的加减乘除是最基本的操作。惯用法是：**先实现复合赋值运算符（`+=`, `-=` 等），再用它们实现对应的二元运算符（`+`, `-` 等）。**
+
+\run[cpp]{
+#include <iostream>
+
+struct Vec2 {
+    float x = 0, y = 0;
+
+    // ---- 复合赋值（成员函数）----
+    Vec2& operator+=(const Vec2& r) { x += r.x; y += r.y; return *this; }
+    Vec2& operator-=(const Vec2& r) { x -= r.x; y -= r.y; return *this; }
+    Vec2& operator*=(float s)       { x *= s;   y *= s;   return *this; }
+    Vec2& operator/=(float s)       { x /= s;   y /= s;   return *this; }
+
+    // 一元运算符
+    Vec2 operator-() const { return {-x, -y}; }
+};
+
+// ---- 二元运算符（非成员，基于复合赋值）----
+Vec2 operator+(Vec2 a, const Vec2& b) { return a += b; }
+Vec2 operator-(Vec2 a, const Vec2& b) { return a -= b; }
+Vec2 operator*(Vec2 v, float s)       { return v *= s; }
+Vec2 operator*(float s, Vec2 v)       { return v *= s; } // 支持 2.0f * vec
+Vec2 operator/(Vec2 v, float s)       { return v /= s; }
+
+// 辅助输出
+std::ostream& operator<<(std::ostream& os, const Vec2& v) {
+    return os << "(" << v.x << ", " << v.y << ")";
+}
+
+int main() {
+    Vec2 pos{10, 20};
+    Vec2 vel{1, -0.5f};
+
+    pos += vel * 60.0f;              // 每帧更新位置：pos = pos + vel * dt
+    std::cout << "位置: " << pos << "\n";
+
+    Vec2 dir = -vel;                 // 反方向
+    std::cout << "反方向: " << dir << "\n";
+
+    Vec2 mid = (pos + Vec2{0, 0}) / 2.0f;  // 中点
+    std::cout << "中点: " << mid << "\n";
+}
+}
+
+\tip{**标量乘法要写两个方向！** `vec * 2.0f` 和 `2.0f * vec` 在数学上等价，但编译器会分别去找 `operator*(Vec2, float)` 和 `operator*(float, Vec2)`，两个都得写。}
+
+// 比较运算符（==, !=, <, >, <=, >=）
+
+在 C++20 之前，要为一个类型支持所有比较运算符，你需要手写最多 6 个函数——这不仅繁琐，而且容易写错。
+
+\compare{
+old: C++17 及之前：手写每个比较运算符
+
+\code[cpp]{
+// 以 Color（颜色）为例——需要按亮度比较大小
+struct Color {
+    uint8_t r, g, b;
+    int brightness() const { return r + g + b; }
+};
+// 至少要写这些...
+bool operator==(const Color& a, const Color& b) {
+    return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+bool operator!=(const Color& a, const Color& b) { return !(a == b); }
+bool operator<(const Color& a, const Color& b) {
+    return a.brightness() < b.brightness();
+}
+bool operator>(const Color& a, const Color& b)  { return b < a; }
+bool operator<=(const Color& a, const Color& b) { return !(b < a); }
+bool operator>=(const Color& a, const Color& b) { return !(a < b); }
+// 6 个函数，任何一个写错都可能导致逻辑 Bug
+}
+
+new: C++20：一行 `<=>` 全部搞定（详见下节）
+}
+
+// C++20 三路比较运算符 <=>（Spaceship Operator）
+
+C++20 引入的**三路比较运算符（Three-way Comparison Operator）** `<=>` 像一面太空飞船（名字来源！），一次比较就能告诉你"小于、等于还是大于"。更强大的是，编译器可以根据 `<=>` **自动生成**其他所有比较运算符。
+
+`<=>` 返回三种比较类别之一：
+
+\table{
+返回类型 | 含义 | 典型场景
+---
+`std::strong_ordering` | 相等的对象完全不可区分 | `int`、`string`
+`std::weak_ordering` | 等价但可能不完全相同 | 不区分大小写的字符串比较
+`std::partial_ordering` | 可能存在不可比较的值 | 浮点数（`NaN` 无法比较）
+}
+
+\run[cpp20]{
+#include <iostream>
+#include <compare>
+#include <string>
+
+struct Player {
+    std::string name;
+    int score = 0;
+    int level = 0;
+
+    // = default: 编译器按声明顺序逐成员比较
+    // 先比 name，再比 score，最后比 level
+    auto operator<=>(const Player&) const = default;
+};
+
+struct ScoreEntry {
+    std::string name;
+    int score;
+
+    // 自定义：只按 score 排序
+    auto operator<=>(const ScoreEntry& other) const {
+        return score <=> other.score;
+    }
+    // 注意：自定义 <=> 时，== 不会自动生成，需要单独写
+    bool operator==(const ScoreEntry& other) const {
+        return score == other.score;
+    }
+};
+
+int main() {
+    Player a{"Alice", 100, 5};
+    Player b{"Bob",   100, 3};
+
+    // <=> 自动生成了 ==, !=, <, >, <=, >=
+    std::cout << std::boolalpha;
+    std::cout << "a == b: " << (a == b) << "\n";  // false（name不同）
+    std::cout << "a > b:  " << (a > b)  << "\n";  // false（"Alice" < "Bob"）
+
+    ScoreEntry s1{"Alice", 500};
+    ScoreEntry s2{"Bob",   300};
+    std::cout << "s1 > s2: " << (s1 > s2) << "\n"; // true（500 > 300）
+}
+}
+
+\warning{**自定义 `<=>` 时，`==` 不会自动生成！** 这是一个常见陷阱。原因是性能：`==` 通常可以做短路优化（比如先比长度），而 `<=>` 做的是完整三路比较。所以 C++ 标准要求你显式提供 `operator==`。只有 `= default` 的 `<=>` 才会同时生成 `==`。}
+
+// 输入输出运算符（<<, >>）
+
+当你用 `std::cout << player;` 打印自定义对象时，编译器需要找到对应的**流插入运算符（Stream Insertion Operator）** `<<`。因为左操作数是 `std::ostream&`（不是你的类型），所以 `<<` **必须用非成员函数**重载。通常在类内用 `friend` 定义，这样既是非成员，又能访问私有成员。
+
+\code[cpp]{
+struct Color {
+    uint8_t r, g, b;
+
+    friend std::ostream& operator<<(std::ostream& os, const Color& c) {
+        // +c.r 把 uint8_t 提升为 int，否则会被当字符输出！
+        return os << "rgb(" << +c.r << ", " << +c.g << ", " << +c.b << ")";
+    }
+
+    friend std::istream& operator>>(std::istream& is, Color& c) {
+        int r, g, b;
+        is >> r >> g >> b;
+        c.r = static_cast<uint8_t>(r);
+        c.g = static_cast<uint8_t>(g);
+        c.b = static_cast<uint8_t>(b);
+        return is;
+    }
+};
+}
+
+// 下标运算符 []
+
+游戏中经常需要用下标访问容器元素，比如 `tilemap[row][col]`。你的自定义容器也可以通过重载 `operator[]` 获得同样的语法。
+
+\code[cpp]{
+class Matrix3x3 {
+    float data[9] = {};  // 3x3 矩阵按行存储
+public:
+    // 返回引用：允许 mat[i] = 5.0f 这样的写法
+    float& operator[](int i)             { return data[i]; }
+    const float& operator[](int i) const { return data[i]; }  // const 版本
+
+    // C++23 多维下标：mat[row, col]
+    // float& operator[](int row, int col) { return data[row * 3 + col]; }
+};
+}
+
+\tip{**总是提供 `const` 和非 `const` 两个版本的 `operator[]`。** 非 `const` 版本返回可修改的引用，`const` 版本返回只读引用。这样 `const Matrix3x3&` 类型的参数也能使用下标访问。}
+
+// 函数调用运算符 ()（仿函数）
+
+如果一个类重载了 `operator()`，它的对象就可以像函数一样被调用——这种对象叫**函数对象（Function Object）**，也叫**仿函数（Functor）**。仿函数的优势在于它可以**携带状态**。
+
+\code[cpp]{
+struct DamageMultiplier {
+    float multiplier;
+    float operator()(float baseDamage) const {
+        return baseDamage * multiplier;
+    }
+};
+
+DamageMultiplier crit{2.5f};
+float dmg = crit(40.0f);   // 像调用函数一样！结果 = 100.0f
+
+// 仿函数可以作为 STL 算法的参数
+std::vector<float> damages = {10, 20, 30, 40};
+std::transform(damages.begin(), damages.end(),
+               damages.begin(), DamageMultiplier{1.5f});
+// damages 变为 {15, 30, 45, 60}
+}
+
+\note{C++11 之后，**Lambda 表达式**在很多场景下替代了手写仿函数（详见 03-stl 的 functional 章节）。但理解仿函数原理仍然重要——Lambda 本质上就是编译器自动生成的匿名仿函数类。}
+
+// 类型转换运算符
+
+有时你希望自定义类型能转换为其他类型，比如让 `Meters` 能转为 `double`。这就需要**类型转换运算符（Conversion Operator）**。
+
+\code[cpp]{
+class Meters {
+    double value;
+public:
+    explicit Meters(double v) : value(v) {}
+    explicit operator double() const { return value; }  // 必须 static_cast 才能转换
+    explicit operator bool() const { return value != 0.0; }
+};
+
+Meters dist{3.5};
+// double d = dist;                   // ❌ 编译错误！explicit 禁止隐式转换
+double d = static_cast<double>(dist); // ✅ 显式转换
+if (dist) { /* ✅ explicit operator bool 在条件语境中允许隐式 */ }
+}
+
+\danger{**非 `explicit` 的类型转换运算符极其危险！** 它允许对象在你毫不知情的情况下被隐式转换，导致代码含义完全改变。规则很简单：**除非你有充分理由，所有类型转换运算符都加 `explicit`。**}
+
+// 自增自减运算符（前置 / 后置）
+
+前置和后置的 `++`、`--` 虽然功能相似，但它们是不同的运算符。C++ 用一个巧妙的方法区分它们：**后置版本多一个 `int` 哑参数（Dummy Parameter）**。
+
+\code[cpp]{
+struct FrameCounter {
+    int frame = 0;
+
+    // 前置 ++：先加后用，返回引用
+    FrameCounter& operator++() {
+        ++frame;
+        return *this;
+    }
+
+    // 后置 ++：先用后加，返回旧值的副本
+    // 注意那个 int 参数——它没有名字，纯粹用来区分前置/后置
+    FrameCounter operator++(int) {
+        FrameCounter old = *this;  // 保存旧值
+        ++frame;                   // 自增
+        return old;                // 返回旧值
+    }
+};
+}
+
+\tip{**前置版本更高效**（无需创建副本），所以当你不需要旧值时，永远优先用 `++i` 而非 `i++`。对于内置类型编译器通常能优化掉差异，但对自定义类型这个差别是实实在在的。}
+
+// 不能重载的运算符
+
+C++ 中有少数运算符**不允许重载**，因为它们的语义对语言机制至关重要：
+
+\table{
+运算符 | 名称 | 不能重载的原因
+---
+`::` | 作用域解析（Scope Resolution）| 编译期用于命名空间和类作用域，不作用于对象
+`.` | 成员访问（Member Access）| 对象访问成员的基础机制，重载会导致歧义
+`.*` | 成员指针访问 | 与 `.` 同理
+`?:` | 三元条件 | 控制流运算符，涉及短路求值
+`sizeof` | 大小查询 | 编译期计算，不作用于运算
+`typeid` | 类型查询 | RTTI 机制的一部分
+}
+
+\warning{**`&&`、`||`、`,` 虽然可以重载，但强烈不建议！** 重载后它们会失去**短路求值（Short-circuit Evaluation）**特性和保证的求值顺序，行为与内置版本完全不同，几乎一定会让使用者困惑。}
+
+/// 新版特性（C++17/20/23）
+
+\tabs{
+\tab[C++17]{
+C++17 没有对运算符重载引入重大变化，但**结构化绑定（Structured Bindings）**间接改善了体验：
+
+\code[cpp]{
+struct Vec2 { float x, y; };
+
+Vec2 result = a + b;
+auto [rx, ry] = result;  // C++17 结构化绑定，直接拆出分量
+}
+}
+\tab[C++20]{
+**最大变革：三路比较运算符 `<=>`。**
+
+\list{
+- `= default` 可自动生成全部 6 个比较运算符
+- 自定义 `<=>` 时需单独提供 `operator==`
+- `std::strong_ordering` / `std::weak_ordering` / `std::partial_ordering` 三种返回类型
+- 编译器支持**反转（Rewrite）**规则：`a != b` 可自动改写为 `!(a == b)`
+}
+}
+\tab[C++23]{
+**多维下标运算符 `operator[]`：**
+
+\code[cpp]{
+class Matrix {
+    std::vector<float> data;
+    int cols;
+public:
+    Matrix(int r, int c) : data(r * c), cols(c) {}
+
+    float& operator[](int row, int col) {      // C++23 多参数 []
+        return data[row * cols + col];
+    }
+};
+
+Matrix m(4, 4);
+m[2, 3] = 1.0f;   // 终于不用 m[2][3] 的代理对象技巧了！
+}
+
+**`static operator()` 和 `static operator[]`：** 对于不需要访问对象状态的仿函数或下标访问，可以声明为 `static`，避免不必要的 `this` 指针开销。
+}
+}
+
+/// 工程实践
+
+// 运算符重载设计原则
+
+\list{
+- **语义一致性：** 重载的运算符含义必须符合直觉。`+` 就该是某种"相加"，别用它做删除操作
+- **对称性：** 如果 `a + b` 有意义，`b + a` 也应该有意义（除非类型不同且顺序确实重要）
+- **先 `+=` 后 `+`：** 所有二元算术运算符都应基于对应的复合赋值运算符实现
+- **`const` 正确性：** 不修改对象的运算符必须标记 `const`
+- **返回值类型：** 赋值运算符返回 `T&`，算术运算符返回 `T`（值），比较运算符返回 `bool`
+- **C++20 项目优先用 `<=>`：** 一行 `= default` 胜过 6 个手写函数
+}
+
+\diagram[flow]{
+选择运算符实现方式 -> 必须是成员？(=, [], (), ->, 类型转换)
+必须是成员？(=, [], (), ->, 类型转换) -> 成员函数
+选择运算符实现方式 -> 需要左操作数隐式转换？
+需要左操作数隐式转换？ -> 非成员函数
+选择运算符实现方式 -> 对称的二元运算？(+, -, ==, <)
+对称的二元运算？(+, -, ==, <) -> 非成员函数（基于复合赋值）
+}
+
+/// 难点易错点分析
+
+\danger{**陷阱 1：`operator=` 忘记处理自赋值。**
+当执行 `obj = obj;` 时，如果 `operator=` 先释放资源再拷贝，就会访问已释放的内存。推荐用 **copy-and-swap 惯用法**（详见上一节 copy-move），它天然免疫自赋值问题。}
+
+\code[cpp]{
+// ❌ 危险的实现
+Buffer& operator=(const Buffer& other) {
+    delete[] data;               // 先释放了自己的数据
+    data = new char[other.size]; // 如果 this == &other，other.size 已经无效！
+    // ...
+}
+
+// ✅ copy-and-swap 惯用法
+Buffer& operator=(Buffer other) {  // 注意：参数是值传递（触发拷贝）
+    swap(*this, other);            // 交换内容
+    return *this;                  // 旧内容随 other 析构自动释放
+}
+}
+
+\danger{**陷阱 2：算术运算符返回引用。**
+`operator+` 应该返回新对象（值），不是引用！返回局部变量的引用是未定义行为（Undefined Behavior）。}
+
+\code[cpp]{
+// ❌ 返回局部对象的引用——UB！
+Vec2& operator+(const Vec2& a, const Vec2& b) {
+    Vec2 result{a.x + b.x, a.y + b.y};
+    return result;  // result 在函数结束后已销毁
+}
+
+// ✅ 返回值
+Vec2 operator+(Vec2 a, const Vec2& b) {
+    return a += b;
+}
+}
+
+\danger{**陷阱 3：重载 `&&` / `||` 失去短路求值。** 重载后它们变成普通函数调用，两个操作数**都会被求值**，行为与内置版本完全不同。}
+
+\danger{**陷阱 4：非 `explicit` 的类型转换导致意外重载决议。** 同时定义 `operator int()` 和 `operator double()` 可能产生歧义（Ambiguity）。始终用 `explicit` 防止隐式转换。}
+
+\quiz[choice|单选]{
+Q: 对于自定义类型 `Vec2`，`operator+` 应该优先选择哪种实现方式？
+A: 成员函数，直接实现加法逻辑
+B: 非成员函数，直接实现加法逻辑
+C: 成员函数实现 `+=`，再用非成员函数基于 `+=` 实现 `+`
+D: 只实现 `+`，不需要 `+=`
+ANS: C
+EXP: 惯用法是先实现成员函数 `operator+=`（直接修改 `*this`），再用非成员函数 `operator+`（值传递左参数后调用 `+=`）。这样避免代码重复，且 `+` 和 `+=` 行为保证一致。
+}
+
+\quiz[tf|判断]{
+Q: 在 C++20 中，只要定义了 `operator<=>` 并设为 `= default`，编译器就会自动生成 `==`、`!=`、`<`、`>`、`<=`、`>=` 共 6 个比较运算符。
+ANS: T
+EXP: 当 `<=>` 使用 `= default` 时，编译器确实会自动生成所有 6 个比较运算符（包括 `==`）。但如果你自定义了 `<=>` 的实现（不是 `= default`），则 `==` 不会自动生成，需要单独提供。
+}
+
+\quiz[choice|单选]{
+Q: 下面哪个运算符**不能**被重载？
+A: `+`（加法）
+B: `[]`（下标）
+C: `.`（成员访问）
+D: `()`（函数调用）
+ANS: C
+EXP: `.`（成员访问运算符）是 C++ 中不能重载的运算符之一。同样不能重载的还有 `::`、`.*`、`?:`、`sizeof`、`typeid` 等。
+}
+
+\quiz[tf|判断]{
+Q: `operator+` 应该返回 `Vec2&`（引用）以避免不必要的拷贝。
+ANS: F
+EXP: `operator+` 必须返回新对象（值类型 `Vec2`），而不是引用。返回对局部变量的引用是未定义行为。复合赋值 `operator+=` 才返回 `T&`（返回的是 `*this`，不是局部变量）。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：完善 Vec2 运算符
+
+完成以下 `Vec2` 类的运算符重载，使程序输出与预期一致。
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec2 {
+    float x = 0, y = 0;
+
+    Vec2& operator+=(const Vec2& rhs) { /* TODO */ return *this; }
+    Vec2 operator-() const { /* TODO */ return {0, 0}; }
+    bool operator==(const Vec2& rhs) const { /* TODO */ return false; }
+    float length() const { return std::sqrt(x * x + y * y); }
+};
+
+Vec2 operator+(Vec2 lhs, const Vec2& rhs) { /* TODO: 基于 += */ return lhs; }
+
+std::ostream& operator<<(std::ostream& os, const Vec2& v) {
+    return os << "(" << v.x << ", " << v.y << ")";
+}
+
+int main() {
+    Vec2 a{3, 4}, b{1, 2};
+    std::cout << "a + b = " << (a + b) << "\n";        // 预期: (4, 6)
+    std::cout << "-a = " << -a << "\n";               // 预期: (-3, -4)
+    std::cout << "a == a: " << (a == a) << "\n";       // 预期: 1
+    std::cout << "a == b: " << (a == b) << "\n";       // 预期: 0
+    std::cout << "|a| = " << a.length() << "\n";       // 预期: 5
+}
+}
+
+// 🟢 基础题 2：实现仿函数
+
+实现一个 `Clamp` 仿函数，将数值限制在 `[min, max]` 范围内。
+
+\run[cpp]{
+#include <iostream>
+
+struct Clamp {
+    float minVal, maxVal;
+    // TODO: 重载 operator()，将 value 限制在 [minVal, maxVal] 范围内
+    float operator()(float value) const { /* TODO */ return value; }
+};
+
+int main() {
+    Clamp hp{0.0f, 100.0f};
+    std::cout << hp(150.0f) << "\n";   // 预期: 100
+    std::cout << hp(-20.0f) << "\n";   // 预期: 0
+    std::cout << hp(55.5f)  << "\n";   // 预期: 55.5
+}
+}
+
+// 🟡 进阶题 1：完整 Color 类
+
+实现一个 `Color` 类型，支持加法（颜色混合，分量相加并钳位到 255）、`==` 比较、`<<` 输出。
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+#include <algorithm>
+
+struct Color {
+    uint8_t r = 0, g = 0, b = 0;
+
+    Color& operator+=(const Color& rhs) { /* TODO: 分量相加并钳位到255 */ return *this; }
+    bool operator==(const Color& rhs) const { /* TODO */ return false; }
+    friend std::ostream& operator<<(std::ostream& os, const Color& c) {
+        /* TODO: 输出格式 "rgb(r, g, b)"，提示：用 +c.r 提升为 int */
+        return os;
+    }
+};
+
+Color operator+(Color lhs, const Color& rhs) { return lhs += rhs; }
+
+int main() {
+    Color red{255, 0, 0}, green{0, 255, 0};
+    std::cout << "Mixed: " << (red + green) << "\n";     // 预期: rgb(255, 255, 0)
+    Color bright = Color{255,255,255} + red;
+    std::cout << "Bright: " << bright << "\n";            // 预期: rgb(255, 255, 255)
+    std::cout << "red == red: " << (red == red) << "\n"; // 预期: 1
+}
+}
+
+// 🟡 进阶题 2：带 <=> 的排行榜条目（C++20）
+
+使用 C++20 的 `<=>` 实现一个 `LeaderboardEntry`，按分数降序、名字升序排列。
+
+\run[cpp20]{
+#include <iostream>
+#include <compare>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+struct LeaderboardEntry {
+    std::string name;
+    int score;
+
+    // TODO: 实现 operator<=> —— 先按 score 降序，同分按 name 升序
+    // 提示：降序可用 other.score <=> score
+    auto operator<=>(const LeaderboardEntry& other) const {
+        /* TODO */
+        return std::strong_ordering::equal;
+    }
+    bool operator==(const LeaderboardEntry& other) const {
+        /* TODO */
+        return false;
+    }
+};
+
+int main() {
+    std::vector<LeaderboardEntry> board = {
+        {"Charlie", 500}, {"Alice", 800}, {"Bob", 800}, {"Diana", 300}
+    };
+    std::sort(board.begin(), board.end());
+    for (auto& e : board)
+        std::cout << e.name << ": " << e.score << "\n";
+    // 预期: Alice:800, Bob:800, Charlie:500, Diana:300
+}
+}
+
+// 🔴 挑战题：实现 Matrix2x2 运算符全家桶
+
+设计一个 `Matrix2x2` 类，支持以下运算符：
+
+\list{
+- `+`、`-`（矩阵加减法）
+- `*`（矩阵乘法 + 标量乘法）
+- `==`（比较）
+- `[]`（下标访问单个元素，`mat[0]` 到 `mat[3]`）
+- `<<`（输出，格式：`[[a, b], [c, d]]`）
+- `()`（作为变换函数，接收 `Vec2` 返回变换后的 `Vec2`）
+}
+
+验收标准：
+\list{
+- 矩阵乘法结果正确（`identity * any == any`）
+- `operator()` 可将 2D 向量进行线性变换（旋转、缩放等）
+- 提供 `static Matrix2x2 identity()` 和 `static Matrix2x2 rotation(float radians)` 工厂函数
+- 所有运算符 `const` 正确性完备
+}
+
+\collapse[参考思路]{
+矩阵用 `float data[4]` 存储（行优先），下标访问按 `data[i]` 直接映射。
+
+矩阵乘法公式（2x2）：
+`result[0] = a[0]*b[0] + a[1]*b[2]`
+`result[1] = a[0]*b[1] + a[1]*b[3]`
+`result[2] = a[2]*b[0] + a[3]*b[2]`
+`result[3] = a[2]*b[1] + a[3]*b[3]`
+
+`operator()(Vec2 v)` 实现矩阵-向量乘法：
+`return {data[0]*v.x + data[1]*v.y, data[2]*v.x + data[3]*v.y};`
+
+旋转矩阵：
+`{cos(θ), -sin(θ), sin(θ), cos(θ)}`
+}
+
+下一节将进入**静态成员与单例模式（static & Singleton）**，学习如何让类的某些数据和行为"属于类本身"而非某个对象。

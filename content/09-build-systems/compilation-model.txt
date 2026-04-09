@@ -1,0 +1,578 @@
+/// 简介
+
+每一行 C++ 代码在变成可执行机器指令前，都要穿越一条精密的流水线——预处理（Preprocessing）、编译（Compilation）、汇编（Assembly）、链接（Linking）。这条流水线的设计决定了 C++ 为什么需要头文件、为什么会出现"undefined reference"、为什么编译时间如此漫长。理解**编译模型（Compilation Model）**，是诊断链接错误、控制符号可见性、优化构建速度乃至正确使用 C++20 Modules 的前提。
+
+上一章我们完成了设计模式的学习；从本章开始，我们关注「代码如何变成程序」——构建系统板块的第一块砖。
+
+/// 知识点列表
+
+\list{
+- 翻译单元（Translation Unit）的定义
+- 四阶段流水线：预处理→编译→汇编→链接
+- 头文件 vs 源文件的职责划分
+- Include Guard 与 #pragma once
+- ODR（One Definition Rule，单一定义规则）
+- 链接属性（Linkage）：internal / external / no linkage
+- inline 函数/变量与 ODR 的关系
+- 编译时间优化：前向声明、Pimpl、预编译头
+- C++20 Modules 对编译模型的变革
+}
+
+/// 知识点详解
+
+// 翻译单元
+
+**翻译单元（Translation Unit, TU）**是 C++ 编译的基本粒度——一个 `.cpp` 源文件经过预处理展开所有 `#include` 后得到的完整文本，就是一个翻译单元。编译器独立处理每个 TU，彼此看不到对方的内容；它们之间的联系，完全靠链接器在最后阶段通过**符号（Symbol）**匹配建立。
+
+这意味着：如果你在 `a.cpp` 里定义了函数 `foo()`，在 `b.cpp` 里想调用它，`b.cpp` 必须通过声明（通常放在头文件里）告知编译器 `foo()` 的存在——编译器信任这个声明，生成一个"待解析符号"，留给链接器去找实际定义。
+
+\diagram[flow]{
+main.cpp + headers -> 预处理展开 -> 翻译单元A -> 编译 -> main.o
+engine.cpp + headers -> 预处理展开 -> 翻译单元B -> 编译 -> engine.o
+main.o + engine.o -> 链接器 -> 可执行文件
+}
+
+// 四阶段流水线
+
+每个 `.cpp` 文件从源码到可执行文件，经历四个阶段。用 GCC 可以分步观察每个阶段的输出：
+
+\steps{
+\step[阶段 1：预处理（Preprocessing）]{
+展开所有 `#include`、宏替换（`#define`）、条件编译（`#ifdef`）。输出是一个巨大的纯 C++ 文本文件（`.i`），可能从几百行膨胀到几万行——标准库头文件 `<iostream>` 展开后约 3 万行。
+
+\code[bash]{
+# 输出预处理结果到 main.i（观察 #include 展开）
+g++ -E main.cpp -o main.i
+wc -l main.i   # 通常数万行
+}
+}
+\step[阶段 2：编译（Compilation）]{
+编译器把预处理后的 C++ 代码翻译为汇编代码（`.s`）。这一步执行语法分析、语义检查、类型检查和优化。所有编译错误（语法错误、类型不匹配等）都在此阶段报出。
+
+\code[bash]{
+# 输出汇编代码到 main.s
+g++ -S main.cpp -o main.s
+# 可以打开 .s 文件观察函数名如何被 name mangling
+}
+}
+\step[阶段 3：汇编（Assembly）]{
+汇编器把汇编文本翻译为二进制的**目标文件（Object File）**（`.o` / `.obj`）。目标文件包含机器码和一张**符号表（Symbol Table）**——记录了哪些符号在本文件中定义、哪些需要外部提供。
+
+\code[bash]{
+# 输出目标文件 main.o
+g++ -c main.cpp -o main.o
+# 查看符号表
+nm main.o | head -20
+}
+}
+\step[阶段 4：链接（Linking）]{
+链接器（Linker）把多个 `.o` 文件合并，解析所有**未定义符号（Undefined Symbol）**的引用——把每个调用点接到实际定义的地址上。如果某个符号找不到定义，就是经典的 "undefined reference" 错误。
+
+\code[bash]{
+# 链接多个目标文件生成可执行文件
+g++ main.o engine.o math.o -o app
+}
+}
+}
+
+\run[bash]{
+# 演示：分步编译一个两文件项目
+cat > math.hpp << 'EOF'
+#pragma once
+double square(double x);
+EOF
+
+cat > math.cpp << 'EOF'
+#include "math.hpp"
+double square(double x) { return x * x; }
+EOF
+
+cat > main.cpp << 'EOF'
+#include <iostream>
+#include "math.hpp"
+int main() {
+    std::cout << "5^2 = " << square(5.0) << "\n";
+}
+EOF
+
+g++ -c math.cpp -o math.o
+g++ -c main.cpp -o main.o
+g++ math.o main.o -o app
+./app
+}
+
+// 头文件 vs 源文件
+
+头文件（`.hpp` / `.h`）和源文件（`.cpp`）的分工本质是**声明（Declaration）**与**定义（Definition）**的分离：
+
+\table{
+角色 | 内容 | 原因
+---
+头文件 | 类声明、函数声明、inline 函数/变量、模板、常量 | 需要在多个 TU 中共享的接口
+源文件 | 函数定义、类成员函数实现、全局变量定义 | 每个符号只能有一份定义（ODR）
+}
+
+\warning{**绝对不要在头文件中放非 inline 的函数定义或全局变量定义。** 一旦该头文件被两个 `.cpp` 文件 `#include`，链接器会看到同一符号的两份定义——触发 ODR 违规，通常报错 "multiple definition of ..."。}
+
+// Include Guard 与 #pragma once
+
+同一个头文件可能被间接 `#include` 多次（A.hpp 包含 B.hpp，C.hpp 也包含 B.hpp，main.cpp 同时包含 A.hpp 和 C.hpp）。没有保护机制，B.hpp 的内容会在同一 TU 中重复出现，导致重复定义错误。
+
+\tabs{
+\tab[传统 Include Guard]{
+\code[cpp]{
+// math.hpp
+#ifndef MYPROJECT_MATH_HPP   // 宏名建议：项目名_路径_文件名_HPP
+#define MYPROJECT_MATH_HPP
+
+double square(double x);
+
+#endif // MYPROJECT_MATH_HPP
+}
+优点：100% 标准兼容。缺点：宏名需要手动保证唯一性，如果两个头文件碰巧用了同名宏，其中一个会被"吞掉"。
+}
+\tab[#pragma once]{
+\code[cpp]{
+// math.hpp
+#pragma once
+
+double square(double x);
+}
+优点：简洁、编译器可优化（跳过重复打开文件）。缺点：非标准（但 GCC / Clang / MSVC 全部支持），在符号链接或网络挂载等文件系统怪异场景下可能误判。
+}
+}
+
+\tip{**工程实践中 `#pragma once` 是主流选择。** 绝大多数现代 C++ 项目（包括 LLVM、Qt、Unreal Engine）都使用它。只有需要极端可移植性的嵌入式项目才坚持传统 Include Guard。}
+
+// ODR（One Definition Rule）
+
+**ODR（单一定义规则）**是 C++ 编译模型最核心的约束之一：
+
+\list{
+- 在整个程序中，每个非 inline 的函数和变量最多只能有**一个定义**
+- 在每个翻译单元中，每个类、枚举、模板最多只能有**一个定义**
+- 如果一个 inline 函数/变量在多个 TU 中定义，所有定义必须**完全相同**（token-by-token identical）
+}
+
+违反 ODR 是**未定义行为（UB）**——编译器和链接器不保证报错。有时会得到链接错误，有时程序能链接通过但运行行为诡异。
+
+\code[cpp]{
+// ❌ 违反 ODR：两个 TU 中定义了不同版本的同一 inline 函数
+// --- config.hpp ---
+#pragma once
+#ifdef DEBUG_MODE
+inline int getLevel() { return 0; }   // TU-A 看到这个版本
+#else
+inline int getLevel() { return 1; }   // TU-B 看到这个版本
+#endif
+// 链接器随机选一个——UB！这就是"ODR 陷阱"
+}
+
+\danger{**ODR 违规最险恶之处在于"不报错"。** 链接器合并 inline 符号时通常随机选一个定义，不检查它们是否一致。错误可能在线上运行数月后才暴露。防御方法：确保所有 TU 用相同的编译选项和宏定义。}
+
+// 链接属性（Linkage）
+
+C++ 中每个名字（name）都有一种**链接属性（Linkage）**，决定了它能否被其他翻译单元引用：
+
+\table{
+链接属性 | 含义 | 典型示例
+---
+外部链接（External Linkage） | 符号可被其他 TU 引用 | 普通函数、全局变量、`extern` 声明
+内部链接（Internal Linkage） | 符号仅在本 TU 可见 | `static` 全局函数/变量、匿名 namespace、`const` 全局变量
+无链接（No Linkage） | 局部作用域，不参与链接 | 局部变量、函数参数
+}
+
+\code[cpp]{
+// 外部链接
+int globalCounter = 0;          // 其他 TU 可通过 extern int globalCounter; 访问
+void processFrame() { /*...*/ } // 其他 TU 可通过声明调用
+
+// 内部链接——三种方式
+static int fileLocal = 42;            // C 风格 static
+namespace { int anonLocal = 42; }     // C++ 推荐：匿名命名空间
+const int kMaxSize = 1024;            // const 全局变量默认内部链接
+
+// constexpr 全局变量也是内部链接（隐含 const）
+constexpr int kBufferSize = 4096;
+
+// 如果需要 const/constexpr 变量拥有外部链接：
+extern const int kSharedConst = 99;    // 显式 extern → 外部链接
+inline constexpr int kInlineConst = 7; // C++17: inline → 外部链接（ODR 安全）
+}
+
+\collapse[🤔 想一想：为什么 C++ 把 const 全局变量默认为内部链接？]{
+因为 `const` 全局变量通常定义在头文件中（如 `const int kMaxSize = 1024;`）。如果它是外部链接，被多个 `.cpp` 包含后就会有多份定义——违反 ODR。默认内部链接让每个 TU 各有一份独立副本，互不冲突。这是 C++ 相对于 C 的一个有意设计差异（C 中 `const` 全局变量默认外部链接）。
+}
+
+// inline 与 ODR
+
+`inline` 关键字在现代 C++ 中的核心含义并非"请内联展开"，而是**对 ODR 的豁免**——它告诉链接器："这个符号可能在多个 TU 中出现，但它们是同一个东西，选一份即可。"
+
+\code[cpp]{
+// 头文件中可以安全地定义 inline 函数/变量
+// --- utils.hpp ---
+#pragma once
+
+// inline 函数：每个包含此头文件的 TU 都有一份定义，链接器合并
+inline int clamp(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// C++17 inline 变量：同理，链接器保证全局唯一一份
+inline constexpr double PI = 3.14159265358979323846;
+
+// 类内定义的成员函数隐含 inline
+struct Vec2 {
+    float x, y;
+    float length() const { return std::sqrt(x*x + y*y); } // 隐含 inline
+};
+
+// 模板函数/类也有类似 ODR 豁免（即使不写 inline）
+template<typename T>
+T maximum(T a, T b) { return a > b ? a : b; }
+}
+
+\run[cpp]{
+// 演示：inline 变量在多个"逻辑翻译单元"中的行为
+// （单文件模拟——真实场景需多文件验证）
+#include <iostream>
+
+// 模拟头文件中的 inline 变量
+inline int sharedCounter = 0;
+
+void incrementA() { ++sharedCounter; }
+void incrementB() { ++sharedCounter; }
+
+int main() {
+    incrementA();
+    incrementB();
+    incrementB();
+    // 如果 sharedCounter 不是 inline，多 TU 中会各有一份副本
+    // inline 保证所有 TU 共享同一份
+    std::cout << "Counter: " << sharedCounter << "\n"; // 期望: 3
+}
+}
+
+// 编译时间优化
+
+C++ 的 `#include` 是文本拷贝——每个 TU 都重新解析所有包含的头文件。一个包含 `<iostream>` 的 TU 预处理后膨胀到数万行。大型项目的编译时间因此成为工程痛点。三种主要缓解策略：
+
+\tabs{
+\tab[前向声明（Forward Declaration）]{
+如果只需要使用指针或引用，不需要包含完整的头文件——用前向声明代替 `#include`，大幅减少预处理展开量。
+
+\code[cpp]{
+// ❌ 不必要的 #include
+#include "Renderer.hpp"  // 展开 Renderer 及其所有依赖
+class Game {
+    Renderer* renderer_;  // 只用了指针，不需要完整定义
+};
+
+// ✅ 前向声明
+class Renderer;  // 告诉编译器 Renderer 是个类
+class Game {
+    Renderer* renderer_;  // OK：指针大小已知
+    // Renderer renderer_; // ❌ 错误：需要完整定义来计算大小
+};
+}
+}
+\tab[Pimpl 惯用法]{
+**Pimpl（Pointer to Implementation）**把类的私有实现细节藏在一个不透明指针后面，头文件只暴露接口。修改实现不需要重新编译所有依赖者。
+
+\code[cpp]{
+// --- engine.hpp --- 头文件极轻量
+#pragma once
+#include <memory>
+class Engine {
+public:
+    Engine();
+    ~Engine();
+    void run();
+private:
+    struct Impl;                    // 前向声明
+    std::unique_ptr<Impl> pImpl_;   // 不透明指针
+};
+
+// --- engine.cpp --- 实现细节全在这里
+#include "engine.hpp"
+#include "Renderer.hpp"   // 重量级头文件只在 .cpp 中包含
+#include "AudioManager.hpp"
+struct Engine::Impl {
+    Renderer renderer;
+    AudioManager audio;
+};
+Engine::Engine() : pImpl_(std::make_unique<Impl>()) {}
+Engine::~Engine() = default; // 必须在 .cpp 中（Impl 完整类型可见）
+void Engine::run() { pImpl_->renderer.draw(); }
+}
+}
+\tab[预编译头（PCH）]{
+**预编译头（Precompiled Header）**把很少变化的头文件预先编译一次，之后每个 TU 直接加载二进制结果。
+
+\code[cmake]{
+# CMake 中启用 PCH
+target_precompile_headers(engine PRIVATE
+    <vector>
+    <string>
+    <memory>
+    <unordered_map>
+    <algorithm>
+    <iostream>
+)
+# 标准库头文件只编译一次，后续 TU 复用
+# 对大型项目可减少 30-50% 编译时间
+}
+}
+}
+
+// C++20 Modules 对编译模型的变革
+
+传统的 `#include` 模型有根本性缺陷：每个 TU 都重复解析相同的头文件，宏定义会泄漏和互相干扰，编译时间因文本拷贝而爆炸。**C++20 Modules** 提供了替代方案：
+
+\code[cpp]{
+// --- math.cppm --- 模块接口单元（Module Interface Unit）
+export module math;           // 声明模块名
+
+export double square(double x) { return x * x; }
+export double cube(double x)   { return x * x * x; }
+
+// 未标记 export 的内容对导入者不可见
+double internal_helper() { return 0.0; }
+
+// --- main.cpp --- 消费模块
+import math;                  // 导入模块（非文本拷贝！）
+import <iostream>;            // 头文件单元（Header Unit）
+
+int main() {
+    std::cout << square(5.0) << "\n";
+    // internal_helper(); // ❌ 编译错误：未 export
+}
+}
+
+\compare{
+old: **#include 模型**：文本拷贝→宏泄漏→每个 TU 重复解析→编译慢→ODR 隐患。模板必须定义在头文件中。
+
+new: **C++20 Modules**：二进制缓存→无宏泄漏→只编译一次→显著加速→更强的封装。CMake 3.28+ 开始支持，但截至 2025 年 GCC/Clang 支持仍在演进中。
+}
+
+\collapse[Modules 的当前工具链支持状况（2025）]{
+\table{
+编译器 | import std | 命名模块 | 头文件单元 | CMake 集成
+---
+MSVC 17.6+ | ✅ | ✅ | ✅ | ✅（CMake 3.28+）
+GCC 14+ | ⚠ 实验性 | ⚠ 基本支持 | ⚠ 有限 | ⚠ 进行中
+Clang 18+ | ⚠ 实验性 | ⚠ 基本支持 | ⚠ 有限 | ⚠ 进行中
+}
+结论：如果锁定 MSVC 工具链，可以在新项目中使用 Modules。跨平台项目建议保留传统头文件作为后备——等 GCC/Clang 支持稳定后再全面迁移。
+}
+
+/// 工程实践
+
+// 头文件组织的最佳实践
+
+\list{
+- **每个类一个头文件**——文件名与类名一致（`Renderer.hpp` → `class Renderer`）
+- **前向声明优先**——头文件中只 `#include` 必需的头文件，能前向声明就前向声明
+- **自包含原则**——每个头文件必须能独立编译（不依赖外部先 `#include` 某些东西）
+- **`#include` 顺序**——推荐 Google 风格：1）对应 `.hpp`、2）C 标准库、3）C++ 标准库、4）第三方库、5）项目内部
+- **避免在头文件中 `using namespace`**——会污染所有包含该头文件的 TU
+}
+
+// 诊断链接错误的快速检查清单
+
+\steps{
+\step[undefined reference to `foo(int)`]{
+1. 确认 `foo` 的定义所在的 `.cpp` 参与了编译和链接
+2. 检查声明与定义的签名是否**完全匹配**（参数类型、const、命名空间）
+3. 如果是 C 库函数，检查是否缺少 `extern "C"` 包裹
+}
+\step[multiple definition of `bar`]{
+1. 检查 `bar` 是否在头文件中定义但未标记 `inline`
+2. 检查全局变量是否误放在头文件中（应在 `.cpp` 中定义，头文件中 `extern` 声明）
+3. 检查是否有两个 `.cpp` 文件意外定义了同名函数
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+\table{
+标准 | 特性 | 对编译模型的影响
+---
+C++17 | inline 变量 | 可以在头文件中安全定义全局变量
+C++20 | Modules | 彻底替代 #include 模型（逐步迁移中）
+C++20 | `consteval` | 编译期求值函数，不产生运行期符号
+C++23 | `import std` | 标准库作为单一模块导入
+C++23 | `constexpr` 放宽 | 更多函数可在编译期计算
+}
+
+/// 难点易错点分析
+
+\danger{**静态初始化顺序灾难（Static Initialization Order Fiasco, SIOF）：**不同翻译单元中的全局/静态变量初始化顺序是未定义的。如果全局变量 A 的构造依赖全局变量 B，但 B 尚未初始化——UB。经典解决方案是 **Meyers Singleton**：用函数内 `static` 局部变量替代全局变量，C++11 保证线程安全的首次初始化。}
+
+\code[cpp]{
+// ❌ SIOF 风险
+// file_a.cpp
+extern Logger globalLogger;
+Config globalConfig(globalLogger); // globalLogger 可能还没初始化！
+
+// ✅ Meyers Singleton 解决
+Logger& getLogger() {
+    static Logger instance;    // 首次调用时初始化，C++11 线程安全
+    return instance;
+}
+Config& getConfig() {
+    static Config instance(getLogger()); // 确保 Logger 先初始化
+    return instance;
+}
+}
+
+\warning{**`extern "C"` 遗漏：**C++ 使用 name mangling（名字修饰）编码函数签名。链接 C 语言库却不用 `extern "C"` 包裹声明，链接器会查找 mangled 名字——找不到。}
+
+\quiz[choice|单选]{
+Q: 以下哪种情况 **不会** 导致 ODR 违规？
+A: 头文件中定义了 `int globalCount = 0;`，被两个 .cpp 包含
+B: 头文件中定义了 `inline int getCount() { return 42; }`，被两个 .cpp 包含
+C: 两个 .cpp 文件中各自定义了 `void helper() {}`（同名同签名但实现不同）
+D: 头文件中定义了一个类的非 inline 成员函数
+ANS: B
+EXP: `inline` 函数允许在多个 TU 中出现相同定义，链接器合并为一份。A 和 D 在两个 TU 中产生两份非 inline 定义。C 中同名外部链接函数有两份不同定义，违反 ODR。
+}
+
+\quiz[choice|单选]{
+Q: 在 C++ 中，`const int kValue = 42;` 在全局作用域的默认链接属性是什么？
+A: 外部链接（External Linkage）
+B: 内部链接（Internal Linkage）
+C: 无链接（No Linkage）
+D: 取决于编译器实现
+ANS: B
+EXP: C++ 中全局作用域的 `const` 变量默认具有内部链接（与 C 不同）。这样设计是为了让 `const` 变量可以安全地定义在头文件中——每个 TU 各有一份独立副本而不冲突。若需要外部链接，须显式加 `extern`。
+}
+
+\quiz[tf|判断]{
+Q: 在头文件中直接定义一个普通（非 inline、非 template）全局函数，如果该头文件被两个 `.cpp` 文件 `#include`，链接时会报 "multiple definition" 错误。
+ANS: T
+EXP: 非 inline 函数具有外部链接，在两个 TU 中各有一份定义，违反 ODR。解决方法：在头文件中只放声明，或加 `inline` 关键字。
+}
+
+/// 实战作业
+
+// 🟢 基础题：翻译单元与链接
+
+\run[cpp]{
+// 练习：理解声明与定义的分离
+// 下方代码模拟一个两文件项目合并在一起
+// TODO: 在此处添加 add 和 multiply 的函数声明，使 main 能编译通过
+
+/* TODO: 你的代码 */
+
+double add(double a, double b) { return a + b; }
+double multiply(double a, double b) { return a * b; }
+
+#include <iostream>
+int main() {
+    std::cout << "3 + 4 = " << add(3, 4) << "\n";
+    std::cout << "3 * 4 = " << multiply(3, 4) << "\n";
+}
+}
+
+// 🟡 进阶题：ODR 违规诊断
+
+\run[cpp]{
+// 练习：找出并修复 ODR 相关问题
+// 以下代码模拟了常见的头文件定义错误
+#include <iostream>
+#include <string>
+
+// 问题1：如果这是头文件中的定义，被多个 .cpp 包含会怎样？如何修复？
+// 试试加 inline 关键字观察效果
+inline int debugLevel = 3;
+
+// 问题2：这个函数定义在头文件中安全吗？
+inline int getMaxRetries() { return 5; }
+
+// 问题3：模板函数为什么不需要 inline 就能放在头文件中？
+template<typename T>
+std::string toString(const T& val) {
+    return std::to_string(val);
+}
+
+int main() {
+    std::cout << "Debug level: " << debugLevel << "\n";
+    std::cout << "Max retries: " << getMaxRetries() << "\n";
+    std::cout << "Pi string: " << toString(3.14) << "\n";
+}
+}
+
+// 🟡 进阶题：前向声明与依赖控制
+
+在 IDE 中完成以下任务：
+
+\list{
+- 创建一个三文件项目：`Engine.hpp/cpp`、`Renderer.hpp/cpp`、`main.cpp`
+- `Engine` 类持有 `Renderer*` 指针成员——在 `Engine.hpp` 中只使用前向声明
+- `Engine.cpp` 中 `#include "Renderer.hpp"` 并实现具体逻辑
+- 验证：修改 `Renderer.hpp` 后，只有引用它的 `.cpp` 需要重新编译
+}
+
+\collapse[参考思路]{
+\code[cpp]{
+// Engine.hpp — 轻量头文件
+#pragma once
+#include <memory>
+class Renderer; // 前向声明
+class Engine {
+public:
+    Engine();
+    ~Engine();
+    void run();
+private:
+    std::unique_ptr<Renderer> renderer_;
+};
+
+// Engine.cpp
+#include "Engine.hpp"
+#include "Renderer.hpp"
+Engine::Engine() : renderer_(std::make_unique<Renderer>()) {}
+Engine::~Engine() = default;
+void Engine::run() { renderer_->draw(); }
+}
+}
+
+// 🔴 挑战题：编译时间分析与优化
+
+\list{
+- 创建一个中等规模项目（至少 8 个翻译单元），故意引入"include 膨胀"
+- 用 `-ftime-report`（GCC）或 `-ftime-trace`（Clang）测量编译时间
+- 依次应用前向声明、Pimpl、PCH 三种优化，记录编译时间对比
+- 尝试将一个模块用 C++20 Module 重写（如工具链支持），比较编译速度
+}
+
+\collapse[参考思路]{
+使用 Clang `-ftime-trace` 生成 JSON，在 Chrome `about:tracing` 可视化。关注 "Source" 和 "ParseTemplate" 的耗时占比。PCH 对标准库头文件的重复解析效果最显著。MSVC 可用 `/Bt+` 查看前端/后端耗时。
+}
+
+// 🔴 挑战题：静态初始化顺序灾难重现
+
+\list{
+- 创建包含 3 个全局对象的项目，构造函数之间存在依赖
+- 通过调整 `.o` 文件链接顺序触发 SIOF
+- 用 Meyers Singleton 重构，验证修复后行为稳定
+- 额外：用 C++20 `constinit` 探索编译期初始化方案
+}
+
+\collapse[参考思路]{
+\code[cpp]{
+// SIOF 演示：改变链接顺序可能改变行为
+// g++ a.o b.o → 正常 | g++ b.o a.o → 崩溃
+
+// 修复：函数级 static 保证初始化顺序
+Registry& getRegistry() {
+    static Registry instance;
+    return instance;
+}
+// C++20 constinit：保证编译期初始化（仅限字面类型）
+constinit int globalFlag = 0;
+}
+}
+
+构建模型是 C++ 区别于其他语言的核心特征之一。下一节我们将学习 CMake——现代 C++ 项目事实上的标准构建工具，把手动的 `g++` 命令自动化为可维护的构建配置。

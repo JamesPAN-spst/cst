@@ -1,0 +1,424 @@
+﻿/// 简介
+
+上一节我们学了 STL 的基础容器和算法，这一节进入一个每天都在用却很少深入思考的话题——**字符串（String）**。
+
+游戏开发中字符串无处不在：聊天系统解析消息、日志拼接调试信息、本地化管理多语言文本、配置文件读写键值对。但字符串操作隐藏大量性能陷阱——一个参数传递就可能触发堆分配，一次不经意的拷贝就让帧率掉 10%。这一节让你搞清楚 `std::string` 的内部原理、高效操作手法，以及现代 C++ 提供的零拷贝视图、格式化库和正则工具。
+
+/// 知识点列表
+
+\list{
+- std::string 内部机制 — SSO 优化与堆分配
+- std::string_view — C++17 零拷贝只读视图
+- 字符串查找与替换 — find / substr / replace
+- 字符串分割 — 手动实现 + C++20 ranges
+- 数值与字符串转换 — to_string / stoi / from_chars / to_chars
+- std::format / std::print — C++20/23 现代格式化
+- 正则表达式 — std::regex 基础与性能警告
+- 字符编码基础 — ASCII 与 UTF-8 注意事项
+}
+
+/// 知识点详解
+
+// std::string 内部机制
+
+**动机：** `std::string name = "Elf";` 这 3 个字符存在哪里？变成 1000 字符后存储策略会变吗？理解内部机制才能写出高效代码。
+
+`std::string` 内部维护三个信息：**数据指针、当前长度（size）、已分配容量（capacity）**。如果每个短字符串都去堆上 `new`，传个角色名字的开销都不可接受。所以现代标准库实现了 **SSO（Small String Optimization，短字符串优化）**——`string` 对象本身（通常 32 字节）内有一块空间可以直接存放短字符，完全不需要堆分配。超过阈值时才分配堆内存。
+
+\diagram[memory]{
+stack:
+  [string 对象 32B] "Elf\0" (SSO: 嵌在对象内部, 无堆分配)
+  [string 对象 32B] ptr=0x5500, size=50, cap=64
+heap:
+  [0x5500] "This is a long string that exceeds SSO..."
+arrow: ptr -> 0x5500
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+int main() {
+    std::string short_str = "Elf";
+    std::string long_str(100, 'A');
+
+    std::cout << "short_str: size=" << short_str.size()
+              << " cap=" << short_str.capacity()
+              << " data=" << (void*)short_str.data()
+              << " obj=" << (void*)&short_str << "\n";
+
+    std::cout << "long_str:  size=" << long_str.size()
+              << " cap=" << long_str.capacity()
+              << " data=" << (void*)long_str.data()
+              << " obj=" << (void*)&long_str << "\n";
+    // SSO 时 data 和 obj 地址接近（同在栈上）
+    // 非 SSO 时 data 在堆上，远离 obj
+    return 0;
+}
+}
+
+\tip{SSO 阈值因实现而异：GCC/MSVC 约 15 字节，Clang libc++ 约 22 字节。运行上面的代码观察地址差异。}
+
+// std::string_view — 零拷贝只读视图
+
+**动机：** 函数参数写 `const std::string&` 时，传入字面量 `"Hero"` 会隐式构造临时 `string`。长字符串还会触发堆分配，仅仅为了"看一眼"就付出拷贝代价。
+
+**`std::string_view`（字符串视图）** 是 C++17 引入的轻量只读视图，内部只存一个 `const char*` 指针和长度。不拥有数据、不分配、不拷贝——像一扇窗户，透过它看别人家的字符串。
+
+\code[cpp]{
+#include <string_view>
+#include <iostream>
+
+void log_message(std::string_view msg) {  // 接受 string / const char* / string_view
+    std::cout << "[LOG] " << msg << "\n";
+}
+
+std::string player = "Warrior";
+log_message(player);     // string → string_view，零拷贝
+log_message("Alert!");   // const char* → string_view，零拷贝
+}
+
+\danger{**string_view 不拥有数据！** 原始字符串销毁后 view 变成**悬垂引用（Dangling Reference）**，访问即 UB：
+\code[cpp]{
+std::string_view bad() {
+    std::string temp = "hello";
+    return temp;  // temp 销毁，view 悬垂！
+}
+std::string_view sv = std::string("temp"); // 临时对象语句结束销毁，sv 悬垂！
+}
+}
+
+\quiz[choice]{
+Q: 下面哪种 `string_view` 用法是**安全**的？
+A: `std::string_view sv = std::string("tmp");` 然后下一行使用 `sv`
+B: `std::string s = "hi"; std::string_view sv = s;` 只要 `s` 存活且未触发重分配
+C: 函数返回局部 `std::string` 的 `string_view`
+D: 把 `string_view` 存为类成员，构造时绑定一个局部 `string`
+ANS: B
+EXP: A 不安全——临时 string 语句结束即销毁。B 安全——s 存活期间 sv 有效。C 不安全——局部变量出作用域销毁。D 不安全——局部变量销毁后成员悬垂。
+}
+
+// 字符串查找与替换
+
+**动机：** 聊天系统检测敏感词、日志提取关键信息——查找替换是基本功。
+
+\table{
+方法 | 功能 | 返回值
+---
+`find(str, pos)` | 从 pos 找首个匹配 | 下标 或 `npos`
+`rfind(str)` | 从后向前找 | 同上
+`find_first_of(chars)` | 找首个属于 chars 的字符 | 同上
+`substr(pos, len)` | 取子串 | 新 `string`（拷贝！）
+`replace(pos, len, str)` | 替换范围 | 自身引用
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+int main() {
+    std::string msg = "Player[Warrior] hit Enemy[Dragon]";
+
+    // 提取方括号中的名字
+    auto s = msg.find('['), e = msg.find(']');
+    if (s != std::string::npos && e != std::string::npos)
+        std::cout << "攻击者: " << msg.substr(s + 1, e - s - 1) << "\n";
+
+    // replace_all：标准库没有，手写循环
+    std::string text = "hp:100 mp:50 hp:80";
+    std::string from = "hp", to = "HP";
+    size_t pos = 0;
+    while ((pos = text.find(from, pos)) != std::string::npos) {
+        text.replace(pos, from.size(), to);
+        pos += to.size();  // 跳过已替换部分
+    }
+    std::cout << text << "\n";  // HP:100 mp:50 HP:80
+    return 0;
+}
+}
+
+\warning{`substr()` 返回新 `string`（有拷贝）。只读场景优先用 `string_view` 的 `substr()`——返回 view，零拷贝。}
+
+// 字符串分割
+
+**动机：** 服务器收到 `"/attack Dragon 150"`，需要拆成 `["/attack", "Dragon", "150"]`。标准库长期没有内置 `split`。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+
+std::vector<std::string> split(const std::string& s, char delim) {
+    std::vector<std::string> tokens;
+    std::istringstream stream(s);
+    std::string token;
+    while (std::getline(stream, token, delim)) {
+        if (!token.empty()) tokens.push_back(token);
+    }
+    return tokens;
+}
+
+int main() {
+    auto parts = split("/attack Dragon 150", ' ');
+    for (size_t i = 0; i < parts.size(); ++i)
+        std::cout << "[" << i << "] " << parts[i] << "\n";
+    return 0;
+}
+}
+
+\collapse[C++20 ranges 零拷贝分割]{
+C++20 `std::views::split` 懒惰求值（Lazy Evaluation），返回原字符串的视图，不产生新 `string`：
+
+\code[cpp]{
+#include <ranges>
+#include <string>
+#include <iostream>
+
+int main() {
+    std::string cmd = "/attack Dragon 150";
+    for (auto word : std::views::split(cmd, ' ')) {
+        std::string_view sv(word.begin(), word.end());
+        std::cout << sv << "\n";
+    }
+}
+}
+}
+
+// 数值与字符串转换
+
+**动机：** 配置文件读出 `"1920"` 需转为整数；UI 要把分数 `42000` 显示为文字。
+
+\tabs{
+\tab[stoi 系列（简单）]{
+\code[cpp]{
+#include <string>
+std::string s = std::to_string(42);        // "42"
+int n = std::stoi("1920");                 // 1920
+float f = std::stof("60.5");              // 60.5f
+// 非法输入抛 std::invalid_argument
+}
+简单好用，但会抛异常，且内部用 C locale，**多线程可能有锁竞争**。
+}
+\tab[from_chars（C++17 高性能）]{
+\code[cpp]{
+#include <charconv>
+int value = 0;
+const char* str = "1920";
+auto [ptr, ec] = std::from_chars(str, str + 4, value);
+if (ec == std::errc{}) { /* value == 1920 */ }
+
+char buf[32];
+auto [p, e] = std::to_chars(buf, buf + 32, 42);
+}
+**零分配、无异常、无 locale**，高性能场景首选。
+}
+}
+
+// std::format 与 std::print
+
+**动机：** `printf` 类型不安全，`stringstream` 冗长，`+` 拼接效率低。C++20 的 `std::format` 兼具安全与简洁。
+
+\code[cpp]{
+#include <format>
+#include <string>
+
+auto s = std::format("Player {} dealt {} dmg", "Mage", 250);
+auto hp = std::format("HP: {:>8.1f}/{:>8.1f}", 75.5, 100.0);
+auto hex = std::format("Color: #{:06X}", 0xFF8800);  // "#FF8800"
+// C++23: std::print("Level {}\n", 5);  直接输出
+}
+
+\table{
+说明符 | 含义 | 示例
+---
+`{:x}`/`{:X}` | 十六进制 | `"ff"`/`"FF"`
+`{:b}` | 二进制 | `"1010"`
+`{:.2f}` | 定点2位小数 | `"3.14"`
+`{:>10}` | 右对齐宽度10 | `"        hi"`
+`{:<10}` | 左对齐宽度10 | `"hi        "`
+`{:0>5}` | 0填充宽度5 | `"00042"`
+}
+
+// 正则表达式基础
+
+**动机：** 从日志 `"[14:32:05] Player killed Boss"` 提取时间戳，手写查找太繁琐。**正则表达式（Regular Expression, Regex）** 用模式描述字符串结构。
+
+\code[cpp]{
+#include <iostream>
+#include <string>
+#include <regex>
+
+int main() {
+    std::string log = "[14:32:05] Player killed Boss";
+    std::regex pat(R"(\[(\d{2}:\d{2}:\d{2})\])");
+    std::smatch m;
+    if (std::regex_search(log, m, pat))
+        std::cout << "时间: " << m[1] << "\n";  // 14:32:05
+
+    // 替换所有数字
+    std::string text = "HP:100 MP:50";
+    std::cout << std::regex_replace(text, std::regex(R"(\d+)"), "X") << "\n";
+}
+}
+
+\danger{**`std::regex` 性能差！** 构造 regex 对象时会编译成内部状态机，非常慢。**必须在循环外预构造** `regex` 对象并复用。对性能敏感的场景用手写解析器或 RE2/CTRE 库替代。}
+
+// 字符编码基础
+
+**动机：** 游戏要支持中文用户名，一个汉字占几个字节？`std::string` 能正确处理中文吗？
+
+**ASCII** 定义 128 个字符，每个 1 字节。**UTF-8** 是变长编码（Variable-Length Encoding）：ASCII 占 1 字节，中文占 3 字节，emoji 占 4 字节。UTF-8 向后兼容 ASCII。
+
+\code[cpp]{
+std::string en = "Hello";  // size() = 5
+std::string cn = "你好";    // size() = 6（不是 2！UTF-8 每汉字 3 字节）
+// std::string 的 size() 和 [] 按字节计算，不是按字符！
+}
+
+\warning{对 UTF-8 字符串做 `substr(0, 4)` 可能截断多字节字符中间，产生乱码。按字符操作需用专门库（如 utfcpp）或手动计算 UTF-8 边界。}
+
+\tip{**游戏实用建议：** 源文件统一 UTF-8。内部用 `std::string` + UTF-8 存储。只在 UI 渲染层做编码转换。}
+
+/// 新版特性（C++17/20/23）
+
+\compare{old:
+// C++14: 判断前缀/后缀、包含子串
+if (s.find("texture_") == 0) { ... }
+if (s.find("ERROR") != std::string::npos) { ... }
+new:
+// C++20/23: 语义清晰的专用方法
+if (s.starts_with("texture_")) { ... }    // C++20
+if (s.contains("ERROR")) { ... }          // C++23
+}
+
+\list{
+- **C++17:** `string_view`、`from_chars/to_chars`、`string::data()` 返回 `char*`
+- **C++20:** `starts_with/ends_with`、`std::format`
+- **C++23:** `contains()`、`std::print/println`、`resize_and_overwrite()`
+}
+
+/// 工程实践
+
+\table{
+场景 | 推荐签名 | 原因
+---
+只读，不需存储 | `string_view` | 零拷贝
+需要存为成员 | `const string&` 或按值 | 需要所有权
+需要修改原串 | `string&` | 引用修改
+}
+
+\list{
+- 循环拼接：先 `reserve()` 再 `append()`，避免反复重分配
+- 格式化：用 `std::format` 替代 `stringstream`
+- 数值转换热路径：用 `from_chars/to_chars`
+}
+
+/// 难点易错点分析
+
+\danger{**易错 1：string_view 悬垂引用** — 返回局部 string 的 view、绑定到临时 string 的 view 都会悬垂。**原则：view 引用的数据生命期必须长于 view 本身。**}
+
+\danger{**易错 2：UTF-8 截断** — 对中文 string 按字节 `substr` 会截断多字节字符产生乱码。}
+
+\danger{**易错 3：find 返回 npos 未检查** — `find()` 失败返回 `npos`（`size_t` 最大值），直接用作下标会越界崩溃。}
+
+\danger{**易错 4：循环内构造 regex** — 每次构造都重新编译状态机。正则对象必须在循环外创建并复用。}
+
+\quiz[tf]{
+Q: `std::string_view` 可以安全地作为类的成员变量长期存储，只要构造时传入了有效字符串。
+ANS: F
+EXP: 不安全。`string_view` 不拥有数据，原始 string 销毁或重新分配后 view 悬垂。成员变量通常应用 `std::string` 存储。
+}
+
+/// 实战作业
+
+// 🟢 基础题：敏感词过滤器
+
+将消息中所有出现的敏感词替换为等长 `*` 号。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+std::string censor(std::string msg, const std::string& word) {
+    /* TODO: 你的代码
+     * 1. 用 find() 循环查找 word
+     * 2. 用 replace() 替换为 string(word.size(), '*')
+     * 3. 更新搜索位置避免死循环
+     */
+    return msg;
+}
+
+int main() {
+    std::cout << censor("You are a noob and all noobs leave", "noob") << "\n";
+    // 期望: "You are a **** and all ****s leave"
+    std::cout << censor("damn this damn game", "damn") << "\n";
+    // 期望: "**** this **** game"
+    return 0;
+}
+}
+
+// 🟡 进阶题：聊天命令解析器
+
+解析 `"/cmd arg1 arg2 ..."` 格式的游戏聊天命令。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+
+struct Command {
+    std::string name;
+    std::vector<std::string> args;
+};
+
+Command parse_command(const std::string& input) {
+    /* TODO: 你的代码
+     * 1. 检查是否以 '/' 开头
+     * 2. 按空格分割（istringstream 或 find）
+     * 3. 首段为命令名，其余为参数
+     */
+    return {};
+}
+
+int main() {
+    auto c1 = parse_command("/whisper Alice Hello!");
+    std::cout << "cmd=" << c1.name;
+    for (auto& a : c1.args) std::cout << " [" << a << "]";
+    std::cout << "\n";  // cmd=/whisper [Alice] [Hello!]
+
+    auto c2 = parse_command("/tp 100 200 300");
+    std::cout << "cmd=" << c2.name;
+    for (auto& a : c2.args) std::cout << " [" << a << "]";
+    std::cout << "\n";  // cmd=/tp [100] [200] [300]
+
+    auto c3 = parse_command("not a command");
+    std::cout << "invalid: '" << c3.name << "'\n";  // invalid: ''
+    return 0;
+}
+}
+
+// 🔴 挑战题：简易本地化系统
+
+设计游戏本地化（Localization）系统，解析下面的翻译格式，支持 `{0}`、`{1}` 参数替换：
+
+\code[text]{
+en.greeting=Hello, {0}! Welcome to {1}.
+en.damage={0} dealt {2} damage to {1}.
+cn.greeting=你好，{0}！欢迎来到{1}。
+cn.damage={0} 对 {1} 造成了 {2} 点伤害。
+}
+
+\list{
+- 存储结构：`map<string, map<string, string>>`（语言 → 键 → 模板）
+- 实现 `load_translations()` 解析上述格式
+- 实现 `translate(lang, key, args...)` 做占位符替换
+- 找不到 key 时返回 key 本身作 fallback
+}
+
+\collapse[参考思路]{
+1. 按 `\n` 逐行分割，每行用 `find('.')` 分出语言、`find('=')` 分出键和模板
+2. 替换时遍历 `{0}`、`{1}`... 用 `find` + `replace`
+3. 参数存 `vector<string>`，下标对应占位符编号
+}

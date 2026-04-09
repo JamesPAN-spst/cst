@@ -1,0 +1,491 @@
+/// 简介
+
+CMake 描述"构建什么"，而**工具链（Toolchain）**决定"用什么来构建"。编译器（GCC / Clang / MSVC）的选择影响错误信息质量、优化特性、平台兼容性；编译选项的调配决定了二进制的性能和安全性；调试器和分析器是定位问题的核心武器；包管理器则解决"别人的代码怎么引入"的问题。
+
+上一节学习了 CMake 构建系统；本节关注：编译器选哪个，选项怎么配，工具怎么用——把工具链打造成趁手的武器。
+
+/// 知识点列表
+
+\list{
+- GCC / Clang / MSVC 差异与选择策略
+- 编译选项：优化级别（-O0 ~ -O3）、警告（-Wall/-Werror）、Sanitizer
+- 调试器：GDB / LLDB / Visual Studio Debugger
+- 静态分析工具：clang-tidy / cppcheck
+- 包管理器：vcpkg / Conan
+- CI/CD 基础概念
+}
+
+/// 知识点详解
+
+// GCC / Clang / MSVC 差异与选择
+
+三大编译器各有所长，选择取决于目标平台和团队需求：
+
+\table{
+维度 | GCC | Clang | MSVC
+---
+平台 | Linux/Mac/Windows(MinGW) | 全平台 | Windows
+错误信息可读性 | 良好 | 最佳（彩色/精准） | 良好
+编译速度 | 中 | 快 | 中
+优化质量 | 优秀 | 优秀 | 优秀
+C++23 支持 | 好 | 好 | 好
+Sanitizer | ASan/TSan/UBSan | 全部（含 MSan） | ASan
+Modules 支持 | 基本 | 进行中 | 最成熟
+独有优势 | Linux 生态最成熟 | 架构清晰（LLVM）、工具链最丰富 | Windows/Xbox 原生支持
+}
+
+\tip{**实用选择策略：** 开发阶段用 Clang（最好的错误信息 + 最全的 Sanitizer）——CI 中同时跑 GCC 和 MSVC 确保跨编译器兼容——发布构建用目标平台的原生编译器（Linux→GCC/Clang、Windows→MSVC）。}
+
+\collapse[🤔 为什么推荐开发时使用 Clang？]{
+Clang 基于 LLVM 架构，设计上注重诊断信息质量。比较同一个错误的输出：
+
+\code[text]{
+# GCC 的错误信息
+error: 'x' was not declared in this scope
+
+# Clang 的错误信息
+error: use of undeclared identifier 'x'; did you mean 'y'?
+    int result = x + 1;
+                 ^
+                 y
+}
+Clang 会给出修复建议（Fix-it Hints）、指出精确的错误位置、支持彩色输出——对学习阶段尤其友好。此外 Clang 是 clang-tidy、clang-format、clangd（LSP）等整套工具链的基础。
+}
+
+// 编译选项
+
+编译选项是工具链最精细的调节旋钮。分三类：优化、警告、调试/安全。
+
+\tabs{
+\tab[优化级别]{
+\table{
+选项 | 效果 | 适用场景
+---
+`-O0` | 无优化，编译最快 | 开发调试
+`-O1` | 基本优化 | 较少使用
+`-O2` | 推荐的发布优化（安全且快） | Release 构建
+`-O3` | 激进优化（循环展开/向量化） | 计算密集型
+`-Os` | 优化代码体积 | 嵌入式
+`-Ofast` | `-O3` + 不遵守 IEEE 浮点标准 | 慎用！
+}
+
+\code[bash]{
+# LTO（链接时优化 Link-Time Optimization）：跨 TU 优化
+g++ -O2 -flto main.cpp engine.cpp -o app
+# 效果：跨文件内联、死代码消除——构建更慢但运行更快
+
+# PGO（Profile-Guided Optimization）：基于运行数据优化
+g++ -O2 -fprofile-generate main.cpp -o app  # 第一步：插桩构建
+./app                                         # 第二步：运行收集热点
+g++ -O2 -fprofile-use main.cpp -o app        # 第三步：基于数据优化
+}
+}
+\tab[警告选项]{
+\code[bash]{
+# 基础警告套装（每个项目都应该开启）
+g++ -Wall -Wextra -Wpedantic main.cpp
+
+# 进阶警告（推荐用于新项目）
+g++ -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+
+# -Werror 把警告变成错误——CI 中推荐，开发中按需
+g++ -Wall -Wextra -Werror main.cpp
+
+# MSVC 等价选项
+cl /W4 /permissive- /WX main.cpp
+}
+
+\warning{**`-Wall` 并不是"所有警告（All Warnings）"——这是一个历史误导。** 它只启用一组常见警告。`-Wextra` 启用更多，`-Wpedantic` 检查标准合规性。真正的"全部警告"需要 `-Weverything`（Clang 独有），但通常太严格，不推荐直接使用。}
+}
+\tab[Sanitizer]{
+\code[bash]{
+# AddressSanitizer（ASan）：检测内存错误——越界、use-after-free、内存泄漏
+g++ -O1 -g -fsanitize=address -fno-omit-frame-pointer main.cpp -o app
+
+# UndefinedBehaviorSanitizer（UBSan）：检测未定义行为——有符号溢出、空指针解引
+g++ -O1 -g -fsanitize=undefined main.cpp -o app
+
+# ThreadSanitizer（TSan）：检测数据竞争（不能和 ASan 同时使用）
+g++ -O1 -g -fsanitize=thread main.cpp -o app
+
+# 组合使用 ASan + UBSan（推荐开发阶段默认开启）
+g++ -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer main.cpp -o app
+}
+
+\danger{**Sanitizer 不能混用 ASan 和 TSan——它们使用不兼容的运行时。** ASan + UBSan 可以组合；TSan 必须单独构建。完整检测方案：一个 Debug 版开 ASan+UBSan，另一个 Debug 版开 TSan。}
+}
+}
+
+\run[cpp]{
+// 演示：UBSan 能检测到的未定义行为
+// 用 -fsanitize=undefined 编译运行此程序
+#include <iostream>
+#include <climits>
+
+int main() {
+    // 有符号整数溢出——C++ 中是未定义行为！
+    int x = INT_MAX;
+    int y = x + 1;  // UBSan 会在这里报错
+    std::cout << "INT_MAX + 1 = " << y << "\n";
+
+    // 数组越界
+    int arr[5] = {1, 2, 3, 4, 5};
+    // int bad = arr[10]; // ASan 会在这里报错
+
+    return 0;
+}
+}
+
+// 调试器
+
+调试器是诊断运行时问题的核心工具。GDB（GCC 配套）和 LLDB（Clang 配套）命令虽不同但概念相通；VS Code 的 C/C++ 扩展为两者提供了图形化界面。
+
+\steps{
+\step[编译时加 -g（生成调试信息）]{
+\code[bash]{
+g++ -O0 -g main.cpp -o app    # -O0 避免变量被优化掉
+}
+}
+\step[启动调试器并设置断点]{
+\code[bash]{
+# GDB
+gdb ./app
+(gdb) break main.cpp:42        # 在第 42 行设断点
+(gdb) break Engine::update      # 在函数入口设断点
+(gdb) run                        # 运行程序
+
+# LLDB（Clang 配套，命令略有不同）
+lldb ./app
+(lldb) breakpoint set -f main.cpp -l 42
+(lldb) run
+}
+}
+\step[常用调试命令]{
+\table{
+操作 | GDB | LLDB
+---
+步过（不进入函数） | `next` / `n` | `next` / `n`
+步入（进入函数） | `step` / `s` | `step` / `s`
+继续执行 | `continue` / `c` | `continue` / `c`
+打印变量 | `print var` | `frame variable var`
+打印表达式 | `print x+y` | `expression x+y`
+调用栈 | `backtrace` / `bt` | `thread backtrace`
+监视变量变化 | `watch var` | `watchpoint set variable var`
+查看线程 | `info threads` | `thread list`
+}
+}
+\step[分析崩溃的 core dump]{
+\code[bash]{
+ulimit -c unlimited          # 允许生成 core dump
+./app                         # 崩溃后生成 core 文件
+gdb ./app core               # 加载 core dump
+(gdb) backtrace              # 查看崩溃时的调用栈
+}
+}
+}
+
+\tip{**VS Code 中的调试体验最佳。** 安装 C/C++ 扩展后，在 `launch.json` 中配置调试目标，就能用图形界面设断点、查看变量、单步执行。底层依然是 GDB/LLDB，但可视化大幅降低了使用门槛。}
+
+// 静态分析工具
+
+**静态分析（Static Analysis）**在不运行程序的情况下检测 bug 和代码异味。两大主流工具互补使用：
+
+\tabs{
+\tab[clang-tidy]{
+\code[bash]{
+# 需要编译数据库 compile_commands.json
+cmake -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+clang-tidy -p build -checks='bugprone-*,modernize-*,performance-*' src/*.cpp
+clang-tidy -fix -p build src/main.cpp  # 自动修复
+}
+
+\code[text]{
+# .clang-tidy 配置文件
+Checks: '-*,bugprone-*,modernize-*,performance-*,readability-*,-modernize-use-trailing-return-type'
+WarningsAsErrors: 'bugprone-*'
+HeaderFilterRegex: 'include/.*\.hpp'
+}
+}
+\tab[cppcheck]{
+\code[bash]{
+cppcheck --enable=all --std=c++23 --suppress=missingInclude src/
+# CMake 集成：每次编译自动检查
+cmake -B build -DCMAKE_CXX_CPPCHECK="cppcheck;--enable=warning,performance"
+}
+cppcheck 更轻量快速，但检测深度不如 clang-tidy。
+}
+}
+
+// 包管理器
+
+C++ 长期没有统一的包管理器。目前两大主流方案：
+
+\compare{
+old: **手动管理依赖**：下载源码、复制到 `third_party/`、手写 CMake 集成。每加一个库重复这个过程——版本升级痛苦，跨平台需要维护多份脚本。
+
+new: **vcpkg / Conan**：声明式依赖管理，自动下载、编译、集成。版本锁定、二进制缓存、跨平台——接近 pip / npm 的体验。
+}
+
+\tabs{
+\tab[vcpkg（Microsoft）]{
+\code[bash]{
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg && ./bootstrap-vcpkg.sh
+./vcpkg install fmt glm sdl2
+# CMake 集成
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=./vcpkg/scripts/buildsystems/vcpkg.cmake
+}
+推荐使用 `vcpkg.json` 清单模式锁定版本。与 CMake `find_package` 无缝集成，2500+ 库。
+}
+\tab[Conan]{
+\code[bash]{
+pip install conan
+# conanfile.txt 声明依赖后：
+conan install . --build=missing -of=build
+cmake -B build --preset conan-release
+cmake --build build
+}
+更灵活的版本管理，支持自建 package 服务器。
+}
+}
+
+// CI/CD 基础概念
+
+**CI/CD（持续集成 Continuous Integration / 持续部署 Continuous Deployment）**把构建→测试→分析自动化。每次提交触发管线，在代码进入主分支前捕获问题。
+
+\diagram[flow]{
+开发者 push -> CI 触发 -> 编译(-Werror) -> 单元测试 -> 静态分析 -> 全部通过? -> 允许合并
+}
+
+\code[text]{
+# .github/workflows/ci.yml — 最小化配置
+name: CI
+on: [push, pull_request]
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake --preset release
+      - run: cmake --build --preset release
+      - run: ctest --preset release --output-on-failure
+}
+
+关键原则：CI 中开 `-Werror`、跑全部测试、至少覆盖两个编译器/平台、缓存依赖加速构建。
+
+/// 工程实践
+
+// 推荐的开发/测试/发布编译选项组合
+
+\table{
+场景 | 编译选项 | CMake BUILD_TYPE
+---
+开发调试 | `-O0 -g -Wall -Wextra -fsanitize=address,undefined` | Debug
+性能分析 | `-O2 -g` | RelWithDebInfo
+CI 测试 | `-O2 -g -Werror -fsanitize=address,undefined` | Debug + custom
+正式发布 | `-O2 -DNDEBUG`（或 `-O3 -flto`） | Release
+嵌入式 | `-Os -DNDEBUG` | MinSizeRel
+}
+
+// 代码格式化
+
+\code[text]{
+# .clang-format（放在项目根目录）
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 120
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+SortIncludes: CaseSensitive
+}
+
+\code[bash]{
+# 格式化所有源文件
+find src include -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i
+
+# CI 中检查格式（不修改，只报告差异）
+clang-format --dry-run --Werror src/*.cpp
+}
+
+/// 新版特性（工具链演进）
+
+\table{
+年份 | 特性 | 意义
+---
+2018+ | AddressSanitizer 进入主流 | 内存 bug 从"运行时偶发"变为"编译时可测"
+2020+ | clang-tidy 检查项突破 400+ | 最全面的 C++ 静态分析
+2021+ | vcpkg 清单模式（manifest） | C++ 包管理走向声明式
+2023+ | CMake Presets 成熟 | 构建配置标准化
+2024+ | C++20 Modules 工具链逐步就绪 | 编译模型变革进行中
+}
+
+/// 难点易错点分析
+
+\danger{**调试优化后的代码极其困难。** `-O2` 及以上会内联函数、消除变量、重排代码。断点可能不在期望位置，变量显示为"optimized out"。**调试必须用 `-O0 -g`。** 如果需要在优化代码上保留调试能力，用 `-O2 -g`（RelWithDebInfo），但仍会有部分信息丢失。}
+
+\danger{**`-Ofast` 不遵守 IEEE 浮点标准。** 它启用 `-ffast-math`，可能改变浮点运算结果——重排序、简化、不正确处理 NaN/Inf。物理引擎和金融计算中**绝对禁止**使用。}
+
+\warning{**Sanitizer 带来 2-5 倍性能开销。** ASan 以 2x 内存开销换取精确的错误检测；TSan 开销更大。不要在 Release 构建中启用 Sanitizer。正确做法：CI 中有专门的 Sanitizer 构建配置。}
+
+\quiz[choice|单选]{
+Q: 在开发阶段，以下哪组编译选项最合理？
+A: `-O3 -DNDEBUG`
+B: `-O0 -g -fsanitize=address,undefined`
+C: `-Ofast -ffast-math`
+D: `-O2 -Werror`
+ANS: B
+EXP: 开发阶段需要快速编译（`-O0`）、完整调试信息（`-g`）和运行时错误检测（Sanitizer）。A 和 C 是发布/高性能选项，调试困难。D 适合 CI，但 `-Werror` 在开发迭代中会打断工作流。
+}
+
+\quiz[tf|判断]{
+Q: `-Wall` 选项会启用 GCC/Clang 的所有编译警告。
+ANS: F
+EXP: 尽管名字是"All"，`-Wall` 只启用一组常见警告。`-Wextra` 启用更多额外警告，`-Wpedantic` 检查标准合规性。Clang 有 `-Weverything` 才是真正的全部警告（通常太严格，不推荐直接使用）。
+}
+
+\quiz[choice|单选]{
+Q: AddressSanitizer（ASan）和 ThreadSanitizer（TSan）为什么不能同时启用？
+A: 它们的编译选项互相冲突
+B: 它们使用不兼容的运行时库，会导致链接错误或运行时崩溃
+C: 同时启用会使程序速度降低 100 倍以上
+D: TSan 是 ASan 的超集，同时启用是冗余的
+ANS: B
+EXP: ASan 和 TSan 各自替换了内存分配器和线程运行时，两者的替换不兼容。正确做法是分别构建两个版本——一个 ASan+UBSan、一个 TSan——在 CI 中分别运行。
+}
+
+/// 实战作业
+
+// 🟢 基础题：编译选项对比实验
+
+\run[cpp]{
+// 用不同优化级别编译并运行此程序，观察行为差异
+// 编译命令：
+//   g++ -O0 -g main.cpp -o app_debug
+//   g++ -O2 main.cpp -o app_release
+//   g++ -O2 -g -fsanitize=undefined main.cpp -o app_ubsan
+#include <iostream>
+#include <climits>
+#include <chrono>
+
+// 这个函数在高优化级别下可能被完全消除
+volatile int sink = 0;
+
+void benchmark() {
+    auto start = std::chrono::high_resolution_clock::now();
+    long long sum = 0;
+    for (int i = 0; i < 100'000'000; ++i) {
+        sum += i;
+    }
+    sink = static_cast<int>(sum);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+    std::cout << "Sum: " << sum << " Time: " << ms.count() << "ms\n";
+}
+
+int main() {
+    benchmark();
+
+    // UBSan 测试点
+    int x = INT_MAX;
+    std::cout << "INT_MAX = " << x << "\n";
+    // TODO: 取消下面一行的注释，用 -fsanitize=undefined 编译观察效果
+    // int overflow = x + 1;
+
+    return 0;
+}
+}
+
+// 🟡 进阶题：clang-tidy 配置与应用
+
+\list{
+- 为项目创建 `.clang-tidy` 配置文件，启用 `bugprone-*`、`modernize-*`、`performance-*` 检查组
+- 编写一个故意包含问题的 `.cpp` 文件（如：使用 `new` 而非智能指针、C 风格类型转换、未使用 `override`）
+- 用 `clang-tidy -p build` 检测问题，并用 `clang-tidy -fix` 自动修复
+- 在 CMakeLists.txt 中集成 clang-tidy：`set(CMAKE_CXX_CLANG_TIDY "clang-tidy")`
+}
+
+\collapse[参考思路]{
+\code[text]{
+# .clang-tidy
+Checks: '-*,bugprone-*,modernize-*,performance-*,readability-braces-around-statements'
+WarningsAsErrors: 'bugprone-use-after-move'
+HeaderFilterRegex: 'include/.*'
+}
+
+常见可检测问题：`modernize-use-auto`、`modernize-use-override`、`bugprone-use-after-move`、`performance-unnecessary-copy-initialization`。
+}
+
+// 🟡 进阶题：GDB 调试演练
+
+\list{
+- 编写一个包含段错误（空指针解引用）和逻辑错误（数组下标差一）的程序
+- 用 `-O0 -g` 编译，用 GDB 或 VS Code 调试器定位两个 bug
+- 练习以下调试技巧：条件断点、watchpoint、查看调用栈、检查内存
+- 对比：关闭 Sanitizer 调试 vs 开启 ASan 调试——哪种方式更快定位问题？
+}
+
+\collapse[参考思路]{
+\code[bash]{
+# GDB 条件断点
+(gdb) break main.cpp:25 if i == 99   # 只在 i == 99 时停下
+# GDB watchpoint
+(gdb) watch array[5]                  # array[5] 被修改时停下
+# GDB 打印内存
+(gdb) x/10d array                     # 以十进制打印 array 的 10 个元素
+}
+}
+
+// 🔴 挑战题：完整开发环境搭建
+
+\list{
+- 配置完整工具链：CMake + Ninja + ccache + clang-format + clang-tidy
+- 编写 `.clang-format`（基于 LLVM 风格，4 空格缩进，120 列宽）和 `.clang-tidy`
+- 配置 `CMakePresets.json`：debug / release / asan / tsan / profile 五个预设
+- 在 CMake 中集成 ccache（`CMAKE_CXX_COMPILER_LAUNCHER=ccache`）
+- 对比有无 ccache 的重复编译时间
+}
+
+\collapse[参考思路]{
+\code[cmake]{
+# 自动检测并启用 ccache
+find_program(CCACHE_FOUND ccache)
+if(CCACHE_FOUND)
+    set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
+    message(STATUS "ccache found and enabled")
+endif()
+}
+}
+
+// 🔴 挑战题：CI/CD 管线设计
+
+\list{
+- 为项目编写 GitHub Actions CI 配置（`.github/workflows/ci.yml`）
+- 构建矩阵：Linux(GCC + Clang) × Windows(MSVC) × macOS(Clang)
+- 每个平台运行：编译（`-Werror`）→ 单元测试 → clang-tidy 检查
+- 添加 ASan 专用任务（仅 Linux，与 GoogleTest 配合）
+- 缓存 vcpkg 或 FetchContent 下载内容加速 CI
+- 可选：添加代码覆盖率报告（gcov + lcov 或 llvm-cov）
+}
+
+\collapse[参考思路]{
+\code[text]{
+# CI 关键步骤
+- uses: actions/cache@v4
+  with:
+    path: build/_deps          # 缓存 FetchContent 下载
+    key: deps-${{ hashFiles('CMakeLists.txt') }}
+
+# ASan 任务
+- name: Build (ASan)
+  run: cmake --preset asan && cmake --build build/asan
+- name: Test (ASan)
+  run: ctest --test-dir build/asan --output-on-failure
+  env:
+    ASAN_OPTIONS: detect_leaks=1
+}
+}
+
+工具链是开发者与机器之间的桥梁——选对工具、配好选项，能让 bug 无处藏身、性能有据可查。下一节的项目将把编译模型、CMake 和工具链三方面知识整合为一个完整的实战练习。

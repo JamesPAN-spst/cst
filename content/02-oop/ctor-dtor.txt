@@ -1,0 +1,515 @@
+﻿/// 简介
+
+上一节我们认识了类的基本结构。但还有一个核心问题：**对象是怎么出生的，又是怎么消亡的？**
+
+想象你在开发游戏——子弹出现时要加载贴图、分配内存、注册物理系统（**构造**）；飞出边界时要注销、释放贴图、回收内存（**析构**）。少做一步对象就出 bug，忘了清理内存就会泄漏。C++ 把这一切交给**构造函数（Constructor）**和**析构函数（Destructor）**，并发展出最重要的设计原则：**RAII（Resource Acquisition Is Initialization，资源获取即初始化）**。
+
+/// 知识点列表
+
+\list{
+- 默认构造函数
+- 带参构造函数与成员初始化列表
+- 委托构造函数（C++11）
+- 析构函数与资源释放
+- RAII 原则
+- explicit 关键字
+- = default 与 = delete（C++11）
+- 构造/析构的调用顺序（基类→成员→自身）
+- 聚合初始化（C++17/20）
+- Most Vexing Parse
+}
+
+/// 知识点详解
+
+// 默认构造函数
+
+写 `Enemy e;` 时，编译器调用不带参数的**默认构造函数（Default Constructor）**。不写任何构造函数，编译器隐式生成一个；但只要写了带参构造，默认构造就不再自动生成。
+
+\code[cpp]{
+class Enemy {
+    int hp;
+    float speed;
+public:
+    // 编译器生成的默认构造不会初始化 int/float！
+    // hp 和 speed 的值是垃圾数据
+};
+
+class Bullet {
+    int damage;
+public:
+    Bullet(int dmg) : damage(dmg) {}
+    // Bullet b; ← 编译错误！默认构造不再自动生成
+};
+}
+
+\warning{编译器生成的默认构造**不会初始化内置类型**（`int`、`float`、指针等）——新手最常见的 bug 来源。}
+
+// 带参构造函数与成员初始化列表
+
+**成员初始化列表（Member Initializer List）**写在参数列表后、函数体前，用 `:` 引导。它"直接构造"一步到位，而函数体内赋值是"先默认构造再赋值"两步。
+
+\code[cpp]{
+class Sprite {
+    std::string texture;
+    float x, y;
+    int layer;
+public:
+    Sprite(std::string tex, float posX, float posY, int lay = 0)
+        : texture(std::move(tex)), x(posX), y(posY), layer(lay) {}
+};
+}
+
+\danger{**必须用初始化列表的场景：** `const` 成员、引用成员、没有默认构造函数的成员类型——在函数体内赋值为时已晚。}
+
+\warning{**经典陷阱：初始化顺序取决于成员声明顺序，而非列表书写顺序！**}
+
+\run[cpp]{
+#include <iostream>
+
+class Trap {
+    int a;  // 先声明 -> 先初始化
+    int b;  // 后声明 -> 后初始化
+public:
+    Trap(int val) : b(val), a(b) {}  // a 先初始化，此时 b 是垃圾值！
+    void print() const {
+        std::cout << "a = " << a << ", b = " << b << std::endl;
+    }
+};
+
+int main() {
+    Trap t(42);
+    t.print();  // a 不可预测, b = 42
+    return 0;   // 正确做法: Trap(int val) : a(val), b(val) {}
+}
+}
+
+// 委托构造函数（C++11）
+
+**委托构造函数（Delegating Constructor）**让一个构造函数直接调用本类另一个构造函数，消除重复初始化逻辑。
+
+\code[cpp]{
+class GameEntity {
+    std::string name;
+    int hp;
+    float x, y;
+public:
+    GameEntity(std::string n, int health, float posX, float posY)
+        : name(std::move(n)), hp(health), x(posX), y(posY) {}
+    GameEntity(std::string n) : GameEntity(std::move(n), 100, 0.0f, 0.0f) {}
+    GameEntity() : GameEntity("unnamed") {}
+};
+}
+
+\note{委托构造的初始化列表中**只能有被委托的那一个调用**，不能同时初始化其他成员。}
+
+// 析构函数与 RAII 原则
+
+析构函数 `~类名()` 在对象生命周期结束时自动调用——即使中间抛异常也不例外（**栈展开 / Stack Unwinding**）。**RAII** 的核心：**构造时获取资源，析构时释放资源**——保证资源不管怎样都会被释放。
+
+\run[cpp]{
+#include <iostream>
+#include <stdexcept>
+
+class AudioChannel {
+    int channelID;
+public:
+    AudioChannel(int id) : channelID(id) {
+        std::cout << "  [RAII] 通道 " << channelID << " 打开\n";
+    }
+    ~AudioChannel() {
+        std::cout << "  [RAII] 通道 " << channelID << " 关闭\n";
+    }
+    void play(const char* s) {
+        std::cout << "  [播放] 通道 " << channelID << ": " << s << "\n";
+    }
+};
+
+void playSFX() {
+    AudioChannel ch1(1);
+    ch1.play("explosion.wav");
+    AudioChannel ch2(2);
+    ch2.play("powerup.wav");
+    throw std::runtime_error("音频设备断开");  // ch1, ch2 照样析构！
+}
+
+int main() {
+    std::cout << "=== RAII: 异常安全自动清理 ===\n";
+    try { playSFX(); }
+    catch (const std::exception& e) { std::cout << "  [捕获] " << e.what() << "\n"; }
+    std::cout << "=== 所有通道已自动关闭 ===\n";
+    return 0;
+}
+}
+
+\tip{标准库 RAII 典范：`std::unique_ptr`（堆内存）、`std::lock_guard`（互斥锁）、`std::fstream`（文件）。优先用它们。}
+
+// explicit 关键字
+
+**`explicit`（显式的）**阻止编译器通过单参数构造函数隐式转换类型。
+
+\tabs{
+\tab[没有 explicit]{
+\code[cpp]{
+class Damage {
+    int value;
+public:
+    Damage(int v) : value(v) {}
+};
+void applyDamage(Damage dmg) {}
+applyDamage(42);   // 编译器偷偷 42 -> Damage(42)
+Damage d = 100;    // 看起来像赋值整数
+}
+}
+\tab[加上 explicit]{
+\code[cpp]{
+class Damage {
+    int value;
+public:
+    explicit Damage(int v) : value(v) {}
+};
+void applyDamage(Damage dmg) {}
+// applyDamage(42);      // 编译错误！
+applyDamage(Damage{42}); // OK
+Damage d{100};            // OK
+}
+}
+}
+
+\tip{**单参数构造函数几乎总应该 `explicit`。** C++ Core Guidelines C.46 强烈建议。}
+
+// = default 与 = delete（C++11）
+
+**`= default`** 让编译器生成默认实现，**`= delete`** 禁止使用该函数。
+
+\code[cpp]{
+class RenderTarget {
+public:
+    RenderTarget() = default;
+    ~RenderTarget() = default;
+    RenderTarget(const RenderTarget&) = delete;             // 禁拷贝
+    RenderTarget& operator=(const RenderTarget&) = delete;
+    RenderTarget(RenderTarget&&) = default;                 // 允许移动
+    RenderTarget& operator=(RenderTarget&&) = default;
+};
+}
+
+\note{`= default` 的价值：(1) 明确表达意图；(2) 在某些情况下恢复编译器不再自动生成的特殊函数（如声明了析构后移动操作消失）。}
+
+// 构造/析构的调用顺序
+
+\diagram[flow]{
+构造: 基类构造 -> 成员构造(按声明顺序) -> 自身函数体
+析构: 自身函数体 -> 成员析构(声明逆序) -> 基类析构
+}
+
+记忆口诀：**盖楼从地基往上，拆楼从屋顶往下。**
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Component {
+    std::string name;
+public:
+    Component(std::string n) : name(std::move(n)) {
+        std::cout << "  [构造] " << name << "\n";
+    }
+    ~Component() { std::cout << "  [析构] " << name << "\n"; }
+};
+
+class GameObject {
+public:
+    GameObject()  { std::cout << "  [构造] GameObject(基类)\n"; }
+    ~GameObject() { std::cout << "  [析构] GameObject(基类)\n"; }
+};
+
+class Player : public GameObject {
+    Component sprite;
+    Component physics;
+public:
+    Player() : sprite("Sprite"), physics("Physics") {
+        std::cout << "  [构造] Player(自身)\n";
+    }
+    ~Player() { std::cout << "  [析构] Player(自身)\n"; }
+};
+
+int main() {
+    std::cout << "=== 创建 ===\n";
+    { Player p; std::cout << "=== 存活 ===\n"; }
+    std::cout << "=== 销毁 ===\n";
+    return 0;
+}
+}
+
+// Most Vexing Parse
+
+C++ 著名歧义：你以为在创建对象，编译器理解为函数声明。
+
+\code[cpp]{
+Timer t();   // 不是对象！声明了返回 Timer 的函数
+Timer t1;    // 默认构造
+Timer t2{};  // C++11 推荐写法
+}
+
+/// 新版特性（C++17/20/23）
+
+// 聚合初始化的演进
+
+**聚合类型（Aggregate）**：无用户构造函数、无私有成员、无虚函数。
+
+\tabs{
+\tab[C++11/14]{
+\code[cpp]{
+struct Vec3 { float x, y, z; };
+Vec3 pos = {1.0f, 2.0f, 3.0f};
+}
+}
+\tab[C++17: 支持基类]{
+\code[cpp]{
+struct Vec3 { float x, y, z; };
+struct ColoredPoint : Vec3 { int color; };
+ColoredPoint cp = {{1.0f, 2.0f, 3.0f}, 0xFF0000};
+}
+}
+\tab[C++20: 指定初始化]{
+\code[cpp]{
+struct Particle {
+    float x = 0, y = 0, z = 0;
+    float speed = 1.0f;
+    int lifetime = 60;
+};
+Particle p = {.x = 10, .y = 20, .speed = 5.0f};
+}
+}
+}
+
+\collapse[C++20 explicit(bool)]{
+根据编译期条件决定是否 `explicit`：
+\code[cpp]{
+template<typename T>
+class GameValue {
+public:
+    explicit(!std::is_convertible_v<T, double>) GameValue(T val);
+};
+GameValue<int> v1 = 42;         // OK: int -> double 自然
+GameValue<std::string> v3{"hi"}; // 需显式
+}
+}
+
+\compare{
+old: C++98/03 无委托构造、`= default`/`= delete`、移动语义。禁拷贝靠 private 声明不实现。无类内默认值。
+
+new: C++11 引入委托构造、`= default`/`= delete`、移动、类内默认初始化器。C++17 带基类聚合初始化。C++20 指定初始化器 + `explicit(bool)`。
+}
+
+/// 工程实践
+
+\list{
+- **Rule of Five / Zero**：自定义了析构/拷贝/赋值之一？大概率需要全部五个（Rule of Five）。更好：用智能指针让编译器默认版本足够（Rule of Zero）。
+- **构造中的异常**：构造抛异常时析构不调用——对象未完成构造。每个资源应独立 RAII 包装。
+- **析构默认 `noexcept`**：栈展开时再抛异常 → `std::terminate`。析构中可能失败的操作必须 `try-catch`。
+- **虚析构函数**：通过基类指针 `delete` 派生对象时必须 `virtual ~Base()`，否则派生类资源泄漏。
+- **`explicit` 一切单参数构造**：除非刻意允许隐式转换。
+}
+
+/// 难点易错点分析
+
+\danger{**析构中不要抛异常！** 栈展开期间第二个异常 → `std::terminate()` 终止程序。}
+
+\danger{**初始化顺序 ≠ 书写顺序。** 编译器按成员**声明顺序**初始化。养成习惯：列表书写顺序与声明一致。}
+
+\warning{**多资源构造的异常隐患：** 先 new 内存 A，再打开文件 B 失败——析构不调用，A 泄漏。解法：每个资源独立 RAII 包装。}
+
+\quiz[choice]{
+Q: 哪行代码触发 Most Vexing Parse（被解析为函数声明）？
+A: `Widget w{10};`
+B: `Widget w(10);`
+C: `Widget w();`
+D: `Widget w;`
+ANS: C
+EXP: `Widget w();` 被解析为函数声明。用 `Widget w{};` 可避免。
+}
+
+\quiz[tf]{
+Q: 编译器生成的默认构造函数会把 `int` 成员初始化为 0。
+ANS: F
+EXP: 对内置类型执行默认初始化——不初始化，值不确定。只有类类型会调用自身默认构造。
+}
+
+\quiz[choice]{
+Q: `Derived d;` 销毁时的析构顺序？（`Derived : Base { MemberA a; MemberB b; }`）
+A: Base -> MemberA -> MemberB -> Derived
+B: Derived -> MemberB -> MemberA -> Base
+C: Derived -> MemberA -> MemberB -> Base
+D: Base -> MemberB -> MemberA -> Derived
+ANS: B
+EXP: 析构与构造完全相反。构造: Base->MemberA->MemberB->Derived，故析构: Derived->MemberB->MemberA->Base。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：RAII 游戏日志
+
+补全 `GameLogger`：`explicit` 构造打印打开日志，析构打印关闭日志。验证正常和异常路径。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <stdexcept>
+
+class GameLogger {
+    std::string filename;
+    bool isOpen;
+public:
+    /* TODO: explicit构造，打印"[LOG] 已打开: <filename>"，isOpen=true */
+    /* TODO: 析构，若isOpen打印"[LOG] 已关闭: <filename>" */
+    void log(const std::string& msg) {
+        if (isOpen) std::cout << "[LOG] " << msg << "\n";
+    }
+};
+
+void normalSession() {
+    GameLogger logger("game.log");
+    logger.log("进入关卡");
+    logger.log("击败Boss");
+}
+void crashSession() {
+    GameLogger logger("crash.log");
+    logger.log("危险操作...");
+    throw std::runtime_error("崩溃!");
+}
+
+int main() {
+    std::cout << "=== 正常 ===\n";
+    normalSession();
+    std::cout << "\n=== 异常 ===\n";
+    try { crashSession(); }
+    catch (const std::exception& e) { std::cout << "[捕获] " << e.what() << "\n"; }
+    std::cout << "\n=== 全部自动关闭 ===\n";
+    return 0;
+}
+}
+
+// 🟢 基础题 2：构造/析构顺序追踪
+
+运行代码观察输出。思考：对调 `audio` 和 `renderer` 声明顺序后输出如何变化？
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Tracked {
+    std::string label;
+public:
+    Tracked(std::string l) : label(std::move(l)) { std::cout << "  [+] " << label << "\n"; }
+    ~Tracked() { std::cout << "  [-] " << label << "\n"; }
+};
+
+class Engine {
+    Tracked renderer, physics, audio;
+public:
+    Engine() : renderer("Renderer"), physics("Physics"), audio("Audio") {
+        std::cout << "  [+] Engine\n";
+    }
+    ~Engine() { std::cout << "  [-] Engine\n"; }
+};
+
+int main() {
+    std::cout << "=== 启动 ===\n";
+    { Engine e; std::cout << "=== 运行 ===\n"; }
+    std::cout << "=== 关闭 ===\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：不可拷贝的 GPU 缓冲区
+
+实现 `GPUBuffer`：`explicit` 构造、禁拷贝、支持移动、RAII 释放。
+
+\run[cpp]{
+#include <iostream>
+#include <utility>
+
+class GPUBuffer {
+    size_t size;
+    int bufferID;
+    static int nextID;
+public:
+    /* TODO: explicit构造，bufferID=nextID++，打印分配日志 */
+    /* TODO: 析构，bufferID>0时打印释放日志并置0 */
+    /* TODO: 拷贝 = delete */
+    /* TODO: 移动构造，转移所有权，源bufferID置0 */
+    /* TODO: 移动赋值 */
+    int getID() const { return bufferID; }
+};
+int GPUBuffer::nextID = 1;
+
+int main() {
+    GPUBuffer vbo{1024};
+    GPUBuffer ibo{256};
+    GPUBuffer moved = std::move(vbo);
+    std::cout << "moved:" << moved.getID() << " vbo:" << vbo.getID() << "\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：委托构造怪物工厂
+
+用委托构造实现多种创建方式，补全 TODO。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Monster {
+    std::string name;
+    int hp, attack;
+    float speed;
+public:
+    Monster(std::string n, int h, int atk, float spd)
+        : name(std::move(n)), hp(h), attack(atk), speed(spd) {
+        std::cout << "创建: " << name << " HP:" << hp << " ATK:" << attack << "\n";
+    }
+    /* TODO: Monster(string,int) 委托 -> attack=10, speed=1.0 */
+    /* TODO: Monster() 委托 -> 史莱姆 HP:50,ATK:5,SPD:0.5 */
+    /* TODO: static createBoss(name) -> HP:1000,ATK:50,SPD:2.0 */
+    void info() const {
+        std::cout << "[" << name << "] HP=" << hp << " ATK=" << attack << "\n";
+    }
+};
+
+int main() {
+    Monster m1("哥布林", 80, 15, 1.2f);
+    Monster m2("骷髅兵", 60);
+    Monster m3;
+    Monster boss = Monster::createBoss("龙王");
+    m1.info(); m2.info(); m3.info(); boss.info();
+    return 0;
+}
+}
+
+// 🔴 挑战题：迷你 RAII 资源管理系统
+
+设计：(1) `Resource` 基类（RAII、虚析构、可移动不可拷贝）(2) `TextureResource`/`SoundResource` 派生类 (3) `ResourceManager` 持有 `vector<unique_ptr<Resource>>` (4) 模拟加载失败验证异常安全。运用本节全部知识点。
+
+\collapse[参考思路]{
+1. `Resource` 持有 `int handle`，构造递增 ID，析构释放
+2. 移动构造转移 handle，源置 0 防双重释放
+3. `SoundResource` 名字含 "corrupt" 时抛异常
+4. `ResourceManager::load<T>()` 用 `make_unique` 创建
+5. try-catch 观察已加载资源的自动释放
+
+\code[cpp]{
+class Resource {
+protected:
+    int handle;
+    static int nextHandle;
+public:
+    explicit Resource(const std::string& name);
+    virtual ~Resource();
+    Resource(Resource&&) noexcept;
+    Resource(const Resource&) = delete;
+    Resource& operator=(const Resource&) = delete;
+};
+}
+}

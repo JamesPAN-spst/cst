@@ -1,0 +1,509 @@
+﻿/// 简介
+
+上一节我们认识了 STL 的整体架构，这一节来聊最基础也最重要的一类容器——**顺序容器（Sequential Containers）**。
+
+想象你在管理游戏背包系统：快速查找第 N 格物品需要随机访问，头部插入新拾取的道具需要头部插入，固定 20 格背包需要编译期固定大小。不同需求对应不同底层数据结构，C++ 标准库为你准备了六种顺序容器。选对容器，性能差异可达**几十倍**。这一节让你清楚每种容器“长什么样”、“擅长什么”、“坑在哪”。
+
+/// 知识点列表
+
+\list{
+- std::vector — 动态数组，最常用的默认选择
+- std::array — 编译期固定大小的静态数组
+- std::deque — 双端队列，两头都能快速插删
+- std::list — 双向链表，任意位置插删不移动元素
+- std::forward_list — 单向链表，极致省内存
+- 容器选择指南 — 何时用哪个
+- 迭代器失效问题 — 最常见的"玄学 Bug"根源
+- emplace_back vs push_back — 原地构造 vs 拷贝构造
+}
+
+/// 知识点详解
+
+// std::vector — 动态数组
+
+**动机：** 游戏中敌人数量动态变化，C 数组大小固定，手动 `malloc/realloc` 容易泄漏。`std::vector`（动态数组）自动管理内存、按需扩容，同时保持**连续内存布局（Contiguous Memory Layout）**。连续内存意味着 CPU 读第 1 个元素时顺便把旁边几个也载入缓存，所以遍历非常快，**缓存命中率（Cache Hit Rate）** 远优于链表。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+
+int main() {
+    std::vector<int> enemy_hp = {100, 80, 120, 60};
+
+    enemy_hp.push_back(90);          // 尾部追加
+    enemy_hp.emplace_back(110);      // 原地构造（后面详细比较）
+
+    std::cout << "数量: " << enemy_hp.size() << "\n";      // 6
+    std::cout << "容量: " << enemy_hp.capacity() << "\n"; // >= 6
+    std::cout << "下标访问: " << enemy_hp[2] << "\n";   // 120, O(1)
+    std::cout << "安全访问: " << enemy_hp.at(2) << "\n"; // 越界抛异常
+
+    std::vector<int> scores;
+    scores.reserve(1000);  // 预留空间，size 仍为 0
+    std::cout << "reserve后 size=" << scores.size()
+              << " capacity=" << scores.capacity() << "\n";
+    return 0;
+}
+}
+
+**size vs capacity 的区别：** `size()` 是当前存了几个元素，`capacity()` 是底层已经分配了多少个位置。就像一辆公交车，`size` 是车上坐了几个人，`capacity` 是这辆车总共有几个座位。
+
+\diagram[memory]{
+stack:
+  [vector对象] size=4, capacity=8
+heap:
+  [0x1000] 100 | 80 | 120 | 60 | ??? | ??? | ??? | ???
+  标注: ←——— size=4 ———→←—— 空闲 capacity ——→
+}
+
+**扩容策略（Growth Strategy）：** 当 `size == capacity` 时，vector 分配更大内存（通常 **1.5~2 倍**），移动所有旧元素。单次 O(n)，但均摊每次 `push_back` 仍是 O(1)。
+
+\warning{扩容时所有元素搬家到新地址！之前保存的**指针、引用、迭代器全部失效**。后面“迭代器失效”一节专门展开。}
+
+\tip{**vector 性能三板斧：** 1）知道大概数量时先 `reserve()`。2）用 `emplace_back()` 替代 `push_back()`。3）删除中间元素时，如果不要求顺序，把它和末尾元素 `std::swap` 后 `pop_back()`——O(1) 删除。}
+
+// std::array — 编译期固定大小
+
+**动机：** 游戏中 RGBA 颜色永远 4 个分量，3D 坐标永远 3 个浮点数。`vector` 存这些太浪费（堆分配 + 额外字段），C 数组又缺边界检查。`std::array`（静态数组）两全其美：**栈上分配、零开销、拥有 STL 接口**。
+
+\code[cpp]{
+#include <array>
+#include <algorithm>
+
+std::array<float, 3> position = {1.0f, 2.5f, -3.0f};  // 模板参数必须是常量
+position[0] = 4.0f;             // 随机访问 O(1)
+position.at(5);                 // 越界抛 std::out_of_range
+auto sz = position.size();      // 3，编译期已知
+std::sort(position.begin(), position.end()); // 可用 STL 算法
+float* raw = position.data();   // 与 C 数组互操作
+}
+
+\note{`std::array` 不能改变大小——没有 `push_back`/`resize`。动态大小还是用 `vector`。}
+
+// std::deque — 双端队列
+
+**动机：** 消息队列需要尾部追加、头部取出。`vector` 头部插删是 O(n)，而 **`std::deque`（Double-Ended Queue，双端队列）** 两端都是 O(1)。deque 内部由**多个固定大小的内存块（chunks）** 组成——像活页本，头尾可以各加一页而不用重写整本书。
+
+\code[cpp]{
+#include <deque>
+
+std::deque<int> dq = {10, 20, 30};
+dq.push_front(5);    // 头部插入 O(1) —— vector 做不到这么快
+dq.push_back(40);    // 尾部插入 O(1)
+dq.pop_front();
+dq[2];               // 随机访问 O(1)（但比 vector 慢一点，多一次间接寻址）
+}
+
+\diagram[memory]{
+heap:
+  [map表] → chunk0 | chunk1 | chunk2
+  [chunk0] 5 | 10
+  [chunk1] 20 | 30
+  [chunk2] 40 | ???
+}
+
+\warning{deque 支持随机访问 `operator[]`，但因为是分段存储，**内存不连续**。这意味着：1）缓存性能不如 `vector`。2）不能直接传给需要连续内存的 C API。3）没有 `data()` 方法获取底层指针。}
+
+// std::list — 双向链表
+
+**动机：** 当你需要在**已知位置**频繁插删且对象很大不便移动时，**`std::list`（双向链表，Doubly Linked List）** 是合适选择。每个元素是独立堆上节点，通过指针串联。
+
+\code[cpp]{
+#include <list>
+#include <algorithm>
+
+std::list<std::string> inventory = {"剑", "盾", "药水"};
+inventory.push_front("头盔");       // O(1)
+inventory.push_back("靴子");        // O(1)
+
+// 在"盾"后面插入"弓"
+auto it = std::find(inventory.begin(), inventory.end(), "盾");
+inventory.insert(std::next(it), "弓");  // O(1) 插入
+
+// 特有的 splice —— O(1) 把另一个 list 的元素"剪切"过来
+std::list<std::string> loot = {"金币", "宝石"};
+inventory.splice(inventory.end(), loot);  // loot 变空
+}
+
+\danger{**在现代硬件上，`std::list` 几乎从不是最优选择。** 原因很简单：链表节点分散在堆上各处，遍历时每次 `next` 都可能触发缓存未命中（Cache Miss）。实测中，即使是"中间频繁插删"场景，`vector`（移动元素）往往也比 `list`（指针跳转）更快——除非元素体积特别大（几 KB 以上）、移动成本极高。}
+
+// std::forward_list — 单向链表
+
+**动机：** `std::forward_list`（单向链表，Singly Linked List）比 `list` 更轻量——每个节点少一个 `prev` 指针，且没有 `size()` 方法（省一个字段的开销）。使用场景非常少见，只有需要极致省内存且只需单向遍历时才考虑。
+
+\code[cpp]{
+std::forward_list<int> fl = {3, 1, 4, 1, 5};
+fl.push_front(0);               // 只能从头部插入
+fl.insert_after(fl.begin(), 99);
+fl.remove(1);                   // 删除所有值为1的元素
+fl.sort();                      // 链表专用归并排序
+}
+
+// 容器选择指南
+
+拿不准用哪个容器？
+\diagram[flow]{
+需要固定大小？ --是--> std::array
+需要固定大小？ --否--> 需要两端快速插删？
+需要两端快速插删？ --是--> std::deque
+需要两端快速插删？ --否--> 频繁在中间插删 + 大对象？
+频繁在中间插删 + 大对象？ --是--> std::list
+频繁在中间插删 + 大对象？ --否--> std::vector（默认选择）
+}
+
+\table{
+特性 | vector | array | deque | list
+---
+随机访问 | O(1) ✅ | O(1) ✅ | O(1) | 不支持 ❌
+尾部插删 | O(1)均摊 | 不支持 | O(1) | O(1)
+头部插删 | O(n) ❌ | 不支持 | O(1) ✅ | O(1)
+中间插删 | O(n) | 不支持 | O(n) | O(1)*
+内存连续 | 是 ✅ | 是 ✅ | 分段 | 否 ❌
+}
+
+\tip{*list 中间插删 O(1) 是指已有迭代器的情况。先查找再插删总体仍是 O(n)。}
+
+// 迭代器失效问题
+
+**迭代器失效（Iterator Invalidation）** 是顺序容器最常见的"玄学 Bug"来源。容器内存变化时，之前的迭代器/指针/引用可能指向已释放内存——继续使用就是**未定义行为（UB）**。
+
+\table{
+容器 | 插入失效范围 | 删除失效范围
+---
+vector | 扩容：全部；未扩容：插入点及之后 | 被删元素及之后全部
+deque | 头尾：迭代器全失效（引用不受影响）；中间：全部 | 头尾：仅被删元素；中间：全部
+list | 不影响任何已有迭代器 ✅ | 仅被删元素的迭代器失效 ✅
+}
+
+\note{list 的核心优势就是**迭代器稳定性（Iterator Stability）**——插入和删除不会影响其他节点的迭代器。}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+
+int main() {
+    // 示例1：扩容导致引用失效
+    std::vector<int> v = {10, 20, 30};
+    int& ref = v[0];
+    v.reserve(1000);  // 重新分配内存，ref 现在是悬空引用！
+    // std::cout << ref;  // UB! 千万别这么做
+    int& safe_ref = v[0]; // 扩容后重新获取
+    std::cout << "safe_ref = " << safe_ref << "\n";
+
+    // 示例2：边遍历边删除的正确写法
+    std::vector<int> nums = {1, 2, 3, 4, 5, 6};
+    for (auto it = nums.begin(); it != nums.end(); ) {
+        if (*it % 2 == 0)
+            it = nums.erase(it);  // 接住返回值！
+        else
+            ++it;
+    }
+    for (int n : nums) std::cout << n << " ";  // 1 3 5
+    return 0;
+}
+}
+
+// emplace_back vs push_back
+
+**动机：** `push_back` 先构造临时对象再拷贝/移动进容器。**`emplace_back`（原位构造，Emplace Construction）** 直接在容器内存上调用构造函数——跳过临时对象。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+
+struct Enemy {
+    std::string name;
+    int hp;
+    Enemy(std::string n, int h) : name(std::move(n)), hp(h) {
+        std::cout << "  构造: " << name << "\n";
+    }
+    Enemy(Enemy&& o) noexcept : name(std::move(o.name)), hp(o.hp) {
+        std::cout << "  移动: " << name << "\n";
+    }
+};
+
+int main() {
+    std::vector<Enemy> enemies;
+    enemies.reserve(4);  // 预分配，避免扩容干扰观察
+
+    std::cout << "--- push_back（临时对象）---\n";
+    enemies.push_back(Enemy("哥布林", 50));
+    // 先构造临时对象，再移动进 vector
+
+    std::cout << "\n--- emplace_back（原位构造）---\n";
+    enemies.emplace_back("骷髅兵", 80);
+    // 直接在 vector 内存上构造，无临时对象！
+
+    return 0;
+}
+}
+
+\collapse[🤔 永远用 emplace_back 就好了？]{
+不完全是。`emplace_back` 可以绕过 `explicit` 检查（可能调用不该用的构造函数），且可读性略差。简单类型两者差异不大；有昂贵拷贝的自定义类型优先 `emplace_back`。
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17
+
+\code[cpp]{
+// 类模板参数推导（CTAD）—— 不用写模板参数了
+std::vector v = {1, 2, 3, 4, 5};  // 自动推导为 vector<int>
+std::array a = {1.0, 2.0, 3.0};   // 自动推导为 array<double, 3>
+
+// std::size / std::data / std::empty —— 泛型访问
+#include <iterator>
+auto sz = std::size(v);    // 对容器和 C 数组都有效
+auto ptr = std::data(v);   // 等同于 v.data()
+}
+
+// C++20
+
+\compare{old:
+// C++17 之前的"erase-remove"惯用法（又丑又容易写错）
+v.erase(
+    std::remove_if(v.begin(), v.end(),
+        [](int x) { return x < 0; }),
+    v.end()
+);
+new:
+// C++20 一行搞定
+std::erase_if(v, [](int x) { return x < 0; });
+}
+
+\code[cpp]{
+// std::erase / std::erase_if —— 终于不用写笨拙的 erase-remove 惯用法了
+#include <vector>
+
+std::vector<int> scores = {85, 42, 90, 33, 78, 55, 91};
+std::erase_if(scores, [](int s) { return s < 60; });
+// scores 现在是 {85, 90, 78, 91}
+}
+
+// C++23
+
+\code[cpp]{
+// append_range / insert_range —— 批量添加元素
+std::vector<int> base = {1, 2, 3};
+std::vector<int> extra = {4, 5, 6};
+base.append_range(extra);  // base = {1,2,3,4,5,6}
+
+// insert_range —— 在指定位置批量插入
+base.insert_range(base.begin() + 2, extra);
+}
+
+/// 工程实践
+
+// 游戏实体管理的容器选择
+
+\code[cpp]{
+// 实体池用 vector + swap-and-pop 删除（O(1) 而非 O(n)）
+struct Entity { int id; float x, y; bool alive; };
+
+std::vector<Entity> entities;
+entities.reserve(1024);  // 预分配，减少扩容
+
+void remove_entity(std::vector<Entity>& pool, size_t index) {
+    std::swap(pool[index], pool.back()); // 把要删的换到末尾
+    pool.pop_back();                     // O(1) 删除末尾
+}
+// 关卡切换后释放多余内存：entities.shrink_to_fit();
+}
+
+\tip{**避免常见性能陷阱：** 1）不要边遍历边 `push_back`（扩容失效），先收集到临时 vector 再批量插入。2）传容器用 `const&`；存大对象用 `emplace_back`；只读场景考虑 `std::span`。}
+
+/// 难点易错点分析
+
+\danger{**陷阱1：`operator[]` 不做越界检查。** 访问越界元素是 UB。调试时用 `at()`，它会抛 `std::out_of_range`。}
+
+\danger{**陷阱2：`reserve()` 不改变 `size()`！** `reserve(100)` 后访问 `v[50]` 是 UB。要创建元素用 `resize(100)`。}
+
+\danger{**陷阱3：边删边遍历。** `erase` 让当前迭代器失效，必须接住 `erase` 返回值。C++20 的 `std::erase_if` 彻底解决了这个问题。}
+
+\danger{**陷阱4：以为 `std::list` 比 `vector` 快。** 现代 CPU 上 vector 的缓存优势通常碾压 list 的 O(1) 插删。**量测再决定。**}
+
+\danger{**陷阱5：`vector<bool>` 是特化陷隱。** 位压缩存储，`operator[]` 返回代理对象而非 `bool&`。替代：`vector<char>` 或 `std::bitset`。}
+
+\quiz[choice|单选]{
+Q: 以下代码执行后，`v` 的 `size()` 和 `capacity()` 分别是多少？
+```cpp
+std::vector<int> v;
+v.reserve(10);
+v.push_back(1);
+v.push_back(2);
+```
+A: size=10, capacity=10
+B: size=2, capacity=2
+C: size=2, capacity=10
+D: size=0, capacity=10
+ANS: C
+EXP: `reserve(10)` 只分配容量不创建元素，所以 size 仍为 0。之后 `push_back` 两次，size 变为 2，而 capacity 保持 10（未触发扩容）。
+}
+
+\quiz[tf|判断]{
+Q: `std::deque` 的元素在内存中是连续存储的，因此可以用 `data()` 获取底层指针。
+ANS: F
+EXP: deque 采用分段存储（多个 chunk），元素**不**连续。它没有 `data()` 方法。只有 `vector` 和 `array` 保证连续内存。
+}
+
+\quiz[choice|单选]{
+Q: 以下哪个容器在任意位置插入元素后，**不会导致**其他已有迭代器失效？
+A: std::vector
+B: std::deque
+C: std::list
+D: std::array
+ANS: C
+EXP: `std::list` 是链表结构，插入新节点只修改相邻节点的指针，不移动任何已有元素，因此所有已有迭代器保持有效。vector 和 deque 都可能导致迭代器失效。array 不支持插入。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：实体血量管理
+
+用 `vector` 实现一个简单的游戏实体血量管理系统：添加实体、受到伤害、移除死亡实体。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+
+struct Entity { std::string name; int hp; };
+
+int main() {
+    std::vector<Entity> entities;
+    // TODO 1: emplace_back 添加 "战士"(100), "法师"(60), "弓箭手"(80)
+    // TODO 2: "法师"受到70点伤害
+    // TODO 3: 移除 hp<=0 的实体（std::erase_if 或 erase-remove）
+
+    std::cout << "存活实体：\n";
+    for (const auto& e : entities)
+        std::cout << "  " << e.name << " HP=" << e.hp << "\n";
+    // 预期：战士 HP=100, 弓箭手 HP=80
+    return 0;
+}
+}
+
+// 🟢 基础题 2：容器特性匹配
+
+\quiz[choice|单选]{
+Q: 你正在开发一个游戏聊天系统，需要一个消息队列：新消息追加到尾部，显示时从头部取出最旧的消息。应该用哪个容器？
+A: std::vector
+B: std::deque
+C: std::list
+D: std::forward_list
+ANS: B
+EXP: 这是一个典型的 FIFO（先进先出）场景：尾部追加 + 头部取出。`deque` 两端操作都是 O(1) 且支持随机访问（方便按索引显示某条消息）。`vector` 的头部移除等效操作是 O(n)，不适合。
+}
+
+// 🟡 进阶题 1：高效背包系统
+
+实现一个游戏背包系统，支持：添加物品、按 ID 快速删除（无需保持顺序）、显示所有物品。要求使用 swap-and-pop 技巧实现 O(1) 删除。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+struct Item {
+    int id;
+    std::string name;
+    int weight;
+};
+
+class Inventory {
+    std::vector<Item> items_;
+
+public:
+    void add_item(int id, const std::string& name, int weight) {
+        // TODO: 用 emplace_back 添加物品
+    }
+
+    bool remove_by_id(int id) {
+        // TODO: 找到 id 对应的物品，用 swap-and-pop 删除
+        // 提示：找到后 std::swap(items_[found_index], items_.back());
+        //       然后 items_.pop_back();
+        // 返回是否找到并删除
+        return false;
+    }
+
+    void display() const {
+        for (const auto& item : items_)
+            std::cout << "  [" << item.id << "] " << item.name << "\n";
+    }
+};
+
+int main() {
+    Inventory inv;
+    inv.add_item(1, "铁剑", 5);
+    inv.add_item(2, "生命药水", 1);
+    inv.add_item(3, "钢甲", 15);
+    inv.add_item(4, "魔法卷轴", 2);
+    inv.display();
+
+    std::cout << "删除 [2]...\n";
+    inv.remove_by_id(2);
+    inv.display();  // 顺序可能变，这是 swap-and-pop 的代价
+
+    std::cout << "删除 [99]: " << (inv.remove_by_id(99) ? "已删除" : "未找到") << "\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：容器性能对比实验
+
+编写程序对比 `vector` 和 `list` 在"中间插入 10000 个元素"场景下的实际耗时。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <list>
+#include <chrono>
+using Clock = std::chrono::high_resolution_clock;
+using us = std::chrono::microseconds;
+
+int main() {
+    const int N = 10000;
+
+    // vector 中间插入
+    std::vector<int> vec;
+    auto t1 = Clock::now();
+    for (int i = 0; i < N; ++i)
+        vec.insert(vec.begin() + static_cast<long long>(vec.size() / 2), i);
+    auto vec_us = std::chrono::duration_cast<us>(Clock::now() - t1);
+
+    // list 中间插入
+    std::list<int> lst;
+    auto t2 = Clock::now();
+    for (int i = 0; i < N; ++i) {
+        auto mid = lst.begin();
+        std::advance(mid, lst.size() / 2); // O(n) 查找中间
+        lst.insert(mid, i);
+    }
+    auto lst_us = std::chrono::duration_cast<us>(Clock::now() - t2);
+
+    std::cout << "vector: " << vec_us.count() << " us\n";
+    std::cout << "list:   " << lst_us.count() << " us\n";
+    std::cout << "思考：list 为什么可能更慢？（advance O(n) + 缓存不友好）\n";
+    return 0;
+}
+}
+
+// 🔴 挑战题：游戏实体池（Entity Pool）
+
+设计并实现一个高性能的**实体池（Entity Pool）**，用于游戏场景管理：
+
+\list{
+- `std::vector<Entity>` 底层存储，预分配最大容量
+- 维护空闲槽位索引列表，实现 O(1) 创建/销毁
+- `active` 标志位，遍历时只处理活跃实体
+- 编写 benchmark 对比你的实体池 vs 朴素 vector
+}
+
+\collapse[💡 参考思路]{
+1. **vector + 空闲列表：** 预分配 pool(MAX_ENTITIES)，维护 free_indices。创建取索引，销毁放回。
+2. **Generation 计数器：** EntityID = (index, generation)。销毁时 generation++，旧 ID 自动失效。
+3. **组件筛选：** `uint32_t component_mask` 位掩码，位与运算即可筛选。
+这是现代游戏引擎（Unity DOTS、EnTT）实体管理的核心思想。
+}

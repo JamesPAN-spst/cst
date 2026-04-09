@@ -1,0 +1,805 @@
+/// 简介
+
+上一节我们学习了类的构造与析构机制，知道了每个对象都有自己独立的成员变量。但有些数据天然属于"整个类"而非某个对象——比如"当前场景中总共有多少个敌人"这个计数，它不属于任何一个敌人，而是所有敌人共享的信息。如果每个敌人对象各自维护一份计数，数据同步就成了噩梦。
+
+C++ 的**静态成员（Static Member）**正是为此而生：它像是贴在"教室黑板"上的公告——所有同学（对象）都能看到、都能改，但只有一份。而**单例模式（Singleton Pattern）**则是 `static` 最经典的应用场景：确保某个类在整个程序中只有一个实例，比如音频系统、日志管理器、资源缓存。
+
+本节将从静态成员变量和函数入手，一路深入到 Meyers 单例、线程安全、初始化顺序陷阱，以及现代 C++ 中更优雅的替代方案。
+
+/// 知识点列表
+
+\list{
+- 静态成员变量（Static Member Variable）——类级别的共享数据
+- 静态成员函数（Static Member Function）——无需对象即可调用
+- 类内初始化 vs 类外定义——C++17 前后的差异
+- inline static（C++17）——头文件友好的静态成员
+- constexpr static——编译期确定的类级常量
+- 单例模式与 Meyers' Singleton——最简洁的实现
+- 单例的线程安全（C++11 Magic Statics）
+- Static Initialization Order Fiasco——跨翻译单元的致命陷阱
+- 单例的替代方案——依赖注入与服务定位器
+}
+
+/// 知识点详解
+
+// 静态成员变量
+
+**痛点场景：** 你在做一个塔防游戏，需要追踪当前场上有多少个 `Enemy` 对象。如果把计数器放在每个 `Enemy` 对象里，每个敌人都有自己的一份 `count`，根本没法统一；放在全局变量里又会污染命名空间。我们需要一种"属于类本身、所有对象共享"的变量。
+
+**静态成员变量（static member variable）**就是这样的变量——它存储在全局/静态存储区，生命周期跟程序一样长，但它的名字归属于类的作用域，跟普通全局变量相比更有组织性。
+
+\code[cpp]{
+class Enemy {
+    static int count;         // 声明：属于 Enemy 类，不属于某个对象
+public:
+    Enemy()  { ++count; }     // 每创建一个敌人，计数+1
+    ~Enemy() { --count; }     // 每销毁一个敌人，计数-1
+    static int getCount() { return count; }
+};
+
+// C++17 之前：必须在类外（通常在 .cpp 文件）定义并初始化
+int Enemy::count = 0;
+}
+
+\note{**关键认知：** 静态成员变量不占对象内存。`sizeof(Enemy)` 的结果中不包含 `count`——因为它存在于所有对象之外的独立区域。你可以把它想象成"贴在 Enemy 类教室门口的公告板"，所有 Enemy 对象都能读写，但它不在任何一张课桌里。}
+
+\run[cpp]{
+#include <iostream>
+
+class Enemy {
+    static inline int count = 0;  // C++17: inline 允许类内直接初始化
+public:
+    Enemy()  { ++count; }
+    ~Enemy() { --count; }
+    static int getCount() { return count; }
+};
+
+int main() {
+    std::cout << "起始: " << Enemy::getCount() << " 个敌人\n";
+    
+    Enemy a, b, c;
+    std::cout << "创建3个: " << Enemy::getCount() << " 个敌人\n";
+    
+    {
+        Enemy d, e;
+        std::cout << "再加2个: " << Enemy::getCount() << " 个敌人\n";
+    } // d, e 在此析构
+    
+    std::cout << "离开作用域后: " << Enemy::getCount() << " 个敌人\n";
+    return 0;
+}
+}
+
+// 静态成员函数
+
+静态成员函数跟静态成员变量类似——它属于类本身，不属于某个对象。这意味着：
+- **它没有 `this` 指针**，因此无法访问非静态成员变量和非静态成员函数
+- **调用时无需创建对象**，通过 `ClassName::functionName()` 直接调用
+- 它只能直接操作静态成员
+
+\code[cpp]{
+class GameConfig {
+    static int screenWidth;
+    static int screenHeight;
+public:
+    // 静态成员函数：可以通过 GameConfig::init(1920, 1080) 调用
+    static void init(int w, int h) {
+        screenWidth = w;    // ✅ 访问静态成员——OK
+        screenHeight = h;
+        // this->xxx;       // ❌ 编译错误！静态函数没有 this 指针
+    }
+    static int getWidth()  { return screenWidth; }
+    static int getHeight() { return screenHeight; }
+};
+
+int GameConfig::screenWidth = 1920;   // 类外定义
+int GameConfig::screenHeight = 1080;
+}
+
+\tip{**什么时候用静态成员函数？** 当一个操作逻辑上属于这个类，但不需要访问特定对象的状态时。比如 `Enemy::getCount()`、`Math::clamp()`、`Config::load()` 这类"工具性"或"管理性"功能。}
+
+\quiz[tf]{
+Q: 静态成员函数可以访问同一个类的非静态成员变量（假设没有传入对象引用）。
+ANS: F
+EXP: 静态成员函数没有 `this` 指针，因此无法直接访问非静态成员。如果需要访问，必须通过参数传入具体的对象引用或指针。
+}
+
+// 类内初始化 vs 类外定义
+
+在 C++17 之前，非 `const` 的静态成员变量**必须**在类外定义——通常写在 `.cpp` 文件中。这是因为静态成员需要一块真实的存储空间，而类的声明本身只是在描述"蓝图"，不分配内存。
+
+\compare{
+old: C++17 之前——类外定义
+// Enemy.h
+class Enemy {
+    static int count;          // 仅声明
+public:
+    static int getCount();
+};
+
+// Enemy.cpp
+int Enemy::count = 0;          // 必须在 .cpp 中定义
+int Enemy::getCount() { return count; }
+
+new: C++17 起——inline static 类内初始化
+// Enemy.h（只需这一个文件）
+class Enemy {
+    static inline int count = 0;   // 声明 + 定义一步完成
+public:
+    static int getCount() { return count; }
+};
+}
+
+\warning{**C++17 之前忘记类外定义会怎样？** 编译不报错，但链接阶段会得到 `undefined reference to Enemy::count` 这样的错误。这是初学者非常容易踩的坑——声明了静态成员却忘了给它"安家"。}
+
+// inline static（C++17）
+
+`inline static` 是 C++17 带来的大便利。加上 `inline` 关键字后，多个翻译单元（Translation Unit）包含同一个头文件也不会产生**重复定义（ODR violation）**错误——链接器会自动合并为一份。
+
+\code[cpp]{
+// GameSettings.h —— 可以被多个 .cpp 文件 #include，不会链接冲突
+class GameSettings {
+public:
+    static inline int maxEnemies = 100;         // 运行期初始化
+    static inline float gravity = 9.81f;
+    static inline std::string title = "My Game"; // 非平凡类型也可以
+};
+}
+
+\note{`inline` 在此处的含义不是"内联展开函数体"，而是告诉链接器"这个定义可能出现在多个翻译单元中，但它们是同一个实体，只保留一份"。}
+
+// constexpr static
+
+如果静态成员的值在**编译期（compile time）**就能确定，用 `constexpr static` 更合适。它不仅保证编译期求值，还能在诸如数组大小、模板参数等需要常量表达式（constant expression）的场合使用。
+
+\code[cpp]{
+class Physics {
+public:
+    static constexpr float gravity = 9.81f;        // 编译期常量
+    static constexpr int maxBodies = 1024;
+    static constexpr double pi = 3.14159265358979;
+    
+    // 编译期计算——可以用 constexpr static 做"配置表"
+    static constexpr float terminalVelocity = gravity * 10.0f;
+};
+
+// 可以直接用作数组大小
+float positions[Physics::maxBodies];
+
+// 可以直接用作模板参数
+std::array<float, Physics::maxBodies> velocities;
+}
+
+\table{
+关键字 | 初始化时机 | 能否用作常量表达式 | 典型用途
+--- 
+`static` | 运行期（程序启动时） | ❌ 不能 | 可变的共享状态（如计数器）
+`static inline` | 运行期，头文件友好 | ❌ 不能 | C++17 中替代类外定义
+`static constexpr` | 编译期 | ✅ 能 | 配置常量、数组大小、模板参数
+}
+
+\quiz[choice]{
+Q: 下面哪个声明可以合法地用于 `std::array<int, ???>` 的模板参数？
+A: `static int size = 10;`
+B: `static inline int size = 10;`
+C: `static constexpr int size = 10;`
+D: `const int size = 10;`（非静态成员）
+ANS: C
+EXP: 模板参数要求**常量表达式**，只有 `static constexpr` 保证值在编译期确定。`static int` 和 `static inline int` 都是运行期初始化的。非静态 `const int` 不是类级常量，且不一定是常量表达式。
+}
+
+// 单例模式（Meyers' Singleton）
+
+**动机：** 游戏中有些系统全局只需要一个实例——音频引擎、渲染器、输入管理器。如果允许创建多个，不同实例之间可能争抢硬件资源，产生冲突。**单例模式（Singleton Pattern）**保证一个类只有一个实例，并提供全局访问点。
+
+最简洁、最安全的 C++ 单例实现叫 **Meyers' Singleton**（以 Scott Meyers 命名），利用**函数内部的局部静态变量（local static variable）**来实现：
+
+\steps{
+\step[禁止外部构造]{
+将构造函数设为 `private`，同时删除拷贝和赋值，防止任何人在外部创建或复制实例。
+
+\code[cpp]{
+class AudioSystem {
+private:
+    AudioSystem() { /* 初始化音频设备 */ }
+    ~AudioSystem() { /* 释放音频设备 */ }
+public:
+    AudioSystem(const AudioSystem&) = delete;
+    AudioSystem& operator=(const AudioSystem&) = delete;
+};
+}
+}
+\step[提供静态访问接口]{
+写一个 `static` 成员函数 `instance()`，内部用**局部 `static` 变量**保存唯一实例，并返回引用。
+
+\code[cpp]{
+class AudioSystem {
+    // ...（构造函数 private，拷贝/赋值 deleted）
+public:
+    static AudioSystem& instance() {
+        static AudioSystem inst;  // 第一次调用时构造，此后复用
+        return inst;
+    }
+    void playSound(const std::string& name) {
+        std::cout << "Playing: " << name << "\n";
+    }
+};
+}
+}
+\step[使用单例]{
+任何地方通过 `AudioSystem::instance()` 获取唯一实例。
+
+\code[cpp]{
+AudioSystem::instance().playSound("explosion");
+AudioSystem::instance().playSound("bgm_level1");
+}
+}
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class AudioSystem {
+private:
+    AudioSystem() {
+        std::cout << "[AudioSystem] 初始化音频设备\n";
+    }
+    ~AudioSystem() {
+        std::cout << "[AudioSystem] 释放音频设备\n";
+    }
+public:
+    AudioSystem(const AudioSystem&) = delete;
+    AudioSystem& operator=(const AudioSystem&) = delete;
+
+    static AudioSystem& instance() {
+        static AudioSystem inst;  // Meyers' Singleton
+        return inst;
+    }
+
+    void playSound(const std::string& name) {
+        std::cout << "  Playing: " << name << "\n";
+    }
+};
+
+int main() {
+    std::cout << "=== 第一次调用 instance() ===\n";
+    AudioSystem::instance().playSound("explosion");
+
+    std::cout << "=== 第二次调用 instance() ===\n";
+    AudioSystem::instance().playSound("bgm");
+
+    // 验证是同一个对象
+    AudioSystem& a = AudioSystem::instance();
+    AudioSystem& b = AudioSystem::instance();
+    std::cout << "同一个实例？ " << (&a == &b ? "是" : "否") << "\n";
+
+    return 0;
+}
+}
+
+\note{注意观察输出——`[AudioSystem] 初始化音频设备` 只打印了一次，证明构造函数只执行了一次。析构函数会在程序退出时自动调用。}
+
+// 单例的线程安全（C++11 Magic Statics）
+
+你可能担心：多个线程同时首次调用 `instance()` 怎么办？会不会构造两次？
+
+不用怕——C++11 标准明确规定：**函数内局部静态变量的初始化是线程安全的（thread-safe）**。编译器会在底层插入同步代码，确保只有一个线程完成初始化，其他线程等待。这个特性被亲切地称为 **Magic Statics**。
+
+\code[cpp]{
+static AudioSystem& instance() {
+    // C++11 起，这一行是线程安全的——
+    // 如果两个线程同时到达这里，只有一个线程会执行构造，
+    // 另一个线程会阻塞等待，直到构造完成
+    static AudioSystem inst;
+    return inst;
+}
+}
+
+\warning{**注意：** Magic Statics 只保证**初始化**过程的线程安全。初始化完成后，如果 `AudioSystem` 的成员函数本身不是线程安全的（比如修改共享数据没加锁），你仍需自己处理并发问题。}
+
+\collapse[🤔 想一想：能不能用指针+new 实现单例？]{
+可以，但不推荐。下面这种写法在 C++11 之前很常见：
+
+\code[cpp]{
+// 老式写法——不推荐
+class AudioSystem {
+    static AudioSystem* pInst;
+public:
+    static AudioSystem& instance() {
+        if (!pInst) pInst = new AudioSystem();  // 非线程安全!
+        return *pInst;
+    }
+};
+AudioSystem* AudioSystem::pInst = nullptr;
+}
+
+问题有两个：(1) 多线程下可能构造两次（**数据竞争/data race**）；(2) `new` 出来的对象永远不会被 `delete`，除非你手动管理或用 `atexit()`。Meyers' Singleton 完美避免了这两个问题。
+}
+
+// Static Initialization Order Fiasco
+
+**这是 C++ 中最隐蔽的陷阱之一。** 当你在不同的 `.cpp` 文件中定义了多个全局/静态对象，它们的**构造顺序是未定义的（unspecified）**——标准没有规定哪个先构造。如果 A 的构造函数依赖 B，但 B 还没构造完，就是**未定义行为（Undefined Behavior）**。
+
+\diagram[flow]{
+FileA.cpp: Logger logger -> FileB.cpp: Database db(logger) -> 💥 logger 可能还未构造!
+}
+
+\code[cpp]{
+// === Logger.cpp ===
+Logger globalLogger;              // 全局静态对象
+
+// === Database.cpp ===
+extern Logger globalLogger;
+Database globalDB(globalLogger);  // 💥 globalLogger 可能还没构造！
+}
+
+**解决方案：** 用 Meyers' Singleton 代替全局对象——函数内的局部 `static` 变量在**首次调用时**才初始化，从而建立了确定的构造顺序。
+
+\code[cpp]{
+// 安全的做法：用函数包裹全局对象
+Logger& getLogger() {
+    static Logger instance;  // 首次调用时构造
+    return instance;
+}
+
+Database& getDatabase() {
+    static Database instance(getLogger());  // getLogger() 保证先初始化
+    return instance;
+}
+}
+
+\danger{**记住这个原则：** 永远不要让一个全局/命名空间级别的静态对象依赖另一个翻译单元中的静态对象。如果有依赖关系，用"函数返回局部 static 引用"的方式包裹，确保初始化顺序可控。}
+
+// 单例的替代方案
+
+单例模式虽然方便，但在大型项目中有明显的缺点：
+
+\list{
+- **隐藏依赖：** 代码中到处调用 `AudioSystem::instance()`，类之间的依赖关系变得不透明
+- **难以测试：** 单元测试中很难替换单例为 Mock 对象
+- **析构顺序不确定：** 多个单例之间的析构顺序可能出问题
+- **全局状态：** 本质上是全局变量的"豪华包装"，带来所有全局变量的弊端
+}
+
+现代游戏引擎（如 Unreal、自研引擎）更推荐以下替代方案：
+
+\tabs{
+\tab[依赖注入]{
+**依赖注入（Dependency Injection）**——把系统作为参数传入，而非全局访问。
+
+\code[cpp]{
+class Game {
+    AudioSystem& audio;     // 通过引用持有，不拥有所有权
+    InputSystem& input;
+public:
+    // 构造时注入依赖——谁需要什么，一目了然
+    Game(AudioSystem& audio, InputSystem& input)
+        : audio(audio), input(input) {}
+
+    void update() {
+        if (input.isKeyPressed(Key::Space))
+            audio.playSound("jump");
+    }
+};
+
+int main() {
+    AudioSystem audio;
+    InputSystem input;
+    Game game(audio, input);   // 明确的依赖关系
+    game.update();
+}
+}
+
+**优势：** 依赖关系对调用者透明，测试时可轻松传入 Mock 对象。
+}
+\tab[服务定位器]{
+**服务定位器（Service Locator）**——一个中央注册表，各子系统向其注册，需要时从中获取。
+
+\code[cpp]{
+class ServiceLocator {
+    static inline AudioSystem* audioService = nullptr;
+public:
+    static void provide(AudioSystem* service) {
+        audioService = service;
+    }
+    static AudioSystem& getAudio() {
+        // 可以加 assert 或返回空实现（Null Object 模式）
+        return *audioService;
+    }
+};
+
+int main() {
+    AudioSystem realAudio;
+    ServiceLocator::provide(&realAudio);
+    // 游戏代码中：
+    ServiceLocator::getAudio().playSound("hit");
+}
+}
+
+**优势：** 比纯单例灵活——可以在运行时替换实现（如用静音版替换真实音频用于测试）。
+}
+}
+
+\tip{**决策指南：** 小型原型/Game Jam → 单例完全够用；中型项目 → 服务定位器是好平衡点；大型引擎/需要单元测试 → 优先考虑依赖注入。}
+
+/// 新版特性（C++17/20/23）
+
+// C++17: inline static 变量
+
+C++17 之前，头文件中定义静态成员变量几乎不可能（会导致链接冲突），这迫使开发者把定义放在 `.cpp` 文件中，增加了管理成本。`inline static` 彻底解决了这个问题。
+
+\compare{
+old: C++17 之前
+// Widget.h
+class Widget {
+    static int count;   // 只能在头文件中声明
+};
+// Widget.cpp
+int Widget::count = 0;  // 必须额外写一行定义
+
+new: C++17 起
+// Widget.h（一个文件搞定）
+class Widget {
+    static inline int count = 0;  // 声明+定义
+};
+}
+
+// C++20: constinit
+
+C++20 引入了 `constinit` 关键字，确保变量在**编译期/链接期初始化**（即**静态初始化/static initialization**），避免动态初始化带来的顺序问题——但与 `constexpr` 不同，`constinit` 变量在运行期**可以修改**。
+
+\code[cpp]{
+// C++20
+class GameConfig {
+public:
+    static constinit int maxPlayers;  // 编译期初始化，但之后可修改
+};
+
+constinit int GameConfig::maxPlayers = 4;
+
+void setMaxPlayers(int n) {
+    GameConfig::maxPlayers = n;  // ✅ 运行期修改是合法的
+}
+}
+
+\note{`constinit` 主要用于缓解 Static Initialization Order Fiasco——它保证变量以常量方式初始化，排除了"动态初始化顺序不确定"的问题根源。}
+
+/// 工程实践
+
+// 实际项目中的静态成员最佳实践
+
+\list{
+- **优先用 `inline static`（C++17+）**——避免头文件/源文件分离的维护负担
+- **编译期常量用 `constexpr static`**——而非 `#define` 宏或"魔数"
+- **避免非平凡类型的全局静态对象**——它们的构造/析构顺序不可控
+- **单例只用于真正的"全局唯一"资源**——音频设备、GPU 上下文等硬件绑定的系统
+- **如果发现自己写了超过 3 个单例——退后一步考虑架构**
+}
+
+// 游戏引擎中常见的 static 用法
+
+\code[cpp]{
+class EntityID {
+    static inline uint32_t nextID = 0;   // 自增 ID 生成器
+public:
+    static uint32_t generate() { return nextID++; }
+};
+
+class Physics {
+    static constexpr float gravity = 9.81f;
+    static constexpr float maxSpeed = 50.0f;
+    static constexpr int solverIterations = 8;
+};
+
+class Debug {
+    static inline bool showColliders = false;   // 运行时可切换的调试开关
+    static inline bool showFPS = true;
+public:
+    static void toggle(bool& flag) { flag = !flag; }
+};
+}
+
+/// 难点易错点分析
+
+\danger{**易错点 1：C++17 之前忘记类外定义静态成员**
+编译顺利通过，但链接时报 `undefined reference`。这是因为类体内的 `static int count;` 只是**声明**，不分配内存。修复方法：在恰好一个 `.cpp` 文件中写 `int MyClass::count = 0;`。}
+
+\danger{**易错点 2：在静态成员函数中访问 this 或非静态成员**
+静态函数属于类而非对象，没有 `this` 指针。以下代码编译失败：
+\code[cpp]{
+class Foo {
+    int value = 0;
+    static void reset() {
+        value = 0;    // ❌ 编译错误：静态函数无法访问非静态成员
+        this->value;  // ❌ 编译错误：静态函数没有 this
+    }
+};
+}
+}
+
+\danger{**易错点 3：Static Initialization Order Fiasco**
+不同翻译单元中全局 `static` 对象的构造顺序是未定义的。如果对象 A 的构造依赖对象 B，而 B 在另一个 `.cpp` 文件中——可能 A 构造时 B 还不存在。**解决方案：** 用返回局部 `static` 引用的函数包裹（Meyers' Singleton 手法）。}
+
+\danger{**易错点 4：单例的析构顺序问题**
+如果单例 A 的析构函数需要调用单例 B，但 B 可能已经先析构了——又是未定义行为。这被称为"僵尸单例"问题。游戏引擎通常通过**显式的 init/shutdown 顺序**来规避：
+\code[cpp]{
+void engineShutdown() {
+    AudioSystem::shutdown();    // 先关音频（它可能用到日志）
+    Logger::shutdown();         // 再关日志
+}
+}
+}
+
+\quiz[choice]{
+Q: 以下哪种情况会触发 Static Initialization Order Fiasco？
+A: 同一个 `.cpp` 文件中定义两个全局静态对象，A 依赖 B
+B: 不同 `.cpp` 文件中各定义一个全局静态对象，A 的构造函数使用了 B
+C: 函数内的 `static` 局部变量互相依赖
+D: 同一个类中的两个 `static constexpr` 成员互相引用
+ANS: B
+EXP: Static Initialization Order Fiasco 只发生在**不同翻译单元**的全局/命名空间级别静态对象之间。同一文件内的全局对象按定义顺序初始化（A）；函数内 static 在首次调用时初始化，天然有序（C）；`constexpr` 在编译期求值，不存在运行期顺序问题（D）。
+}
+
+\quiz[tf]{
+Q: Meyers' Singleton 中的局部 `static` 变量，在 C++11 及之后是线程安全的（指初始化过程）。
+ANS: T
+EXP: C++11 标准（§6.7）保证了函数内局部静态变量的初始化是线程安全的。编译器会插入同步机制（通常是双重检查锁定），确保只有一个线程完成初始化。这被称为 Magic Statics。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：静态计数器
+
+**任务：** 实现一个 `GameObject` 类，利用静态成员追踪当前存活的对象总数和历史创建总数。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class GameObject {
+    // TODO: 声明两个 static 变量
+    //   aliveCount —— 当前存活数量
+    //   totalCreated —— 历史创建总数（只增不减）
+    std::string name;
+public:
+    GameObject(const std::string& n) : name(n) {
+        // TODO: 更新两个计数器
+        std::cout << "  + 创建: " << name << "\n";
+    }
+    ~GameObject() {
+        // TODO: 更新计数器（哪个该减？哪个不该减？）
+        std::cout << "  - 销毁: " << name << "\n";
+    }
+    static void printStats() {
+        // TODO: 输出当前存活数和历史总数
+    }
+};
+// TODO: 如果你用的是 C++17 之前标准，需要在这里类外定义静态成员
+
+int main() {
+    GameObject::printStats();        // 应输出: 存活 0, 总创建 0
+    
+    GameObject a("Player");
+    GameObject b("Enemy1");
+    GameObject::printStats();        // 应输出: 存活 2, 总创建 2
+    
+    {
+        GameObject c("Enemy2");
+        GameObject d("Bullet");
+        GameObject::printStats();    // 应输出: 存活 4, 总创建 4
+    }
+    
+    GameObject::printStats();        // 应输出: 存活 2, 总创建 4
+    return 0;
+}
+}
+
+// 🟢 基础题 2：编译期配置表
+
+**任务：** 用 `constexpr static` 为一个 2D 游戏设定编译期配置，并在 `main()` 中使用。
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+
+class GameConfig {
+public:
+    // TODO: 用 constexpr static 定义以下配置
+    //   screenWidth = 1280
+    //   screenHeight = 720
+    //   maxEntities = 256
+    //   fps = 60
+    //   frameDuration = 1.0 / fps（注意类型）
+    
+    static void print() {
+        // TODO: 输出所有配置值
+    }
+};
+
+int main() {
+    GameConfig::print();
+    
+    // TODO: 用 GameConfig::maxEntities 作为 std::array 的模板参数
+    //       创建一个 float 数组，代表每个实体的 x 坐标
+    // std::array<float, ???> xPositions{};
+    
+    std::cout << "数组大小: " << /* ??? */ 0 << "\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：Meyers' Singleton 日志系统
+
+**任务：** 实现一个线程安全的 `Logger` 单例，支持不同日志级别。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+
+enum class LogLevel { Info, Warning, Error };
+
+class Logger {
+    std::vector<std::string> logs;
+    
+    // TODO: 私有构造函数、删除拷贝/赋值
+    
+public:
+    // TODO: 实现 Meyers' Singleton 的 instance() 方法
+
+    void log(LogLevel level, const std::string& msg) {
+        std::string prefix;
+        switch (level) {
+            case LogLevel::Info:    prefix = "[INFO] ";    break;
+            case LogLevel::Warning: prefix = "[WARN] ";    break;
+            case LogLevel::Error:   prefix = "[ERROR] ";   break;
+        }
+        std::string entry = prefix + msg;
+        logs.push_back(entry);
+        std::cout << entry << "\n";
+    }
+
+    void printSummary() {
+        std::cout << "\n=== 日志摘要: 共 " << logs.size() << " 条 ===\n";
+        for (const auto& entry : logs) {
+            std::cout << "  " << entry << "\n";
+        }
+    }
+};
+
+int main() {
+    // TODO: 通过 Logger 单例记录以下日志
+    // Info:    "游戏启动"
+    // Info:    "加载关卡 1"
+    // Warning: "纹理缺失, 使用默认贴图"
+    // Error:   "音频设备初始化失败"
+    
+    // TODO: 调用 printSummary()
+    
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：从单例重构为依赖注入
+
+**任务：** 下面是一段使用单例的游戏代码。将其重构为**依赖注入**风格，使 `Game` 类不再直接调用任何单例。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// ---- 音频系统（当前是单例） ----
+class AudioSystem {
+    AudioSystem() = default;
+public:
+    AudioSystem(const AudioSystem&) = delete;
+    AudioSystem& operator=(const AudioSystem&) = delete;
+    static AudioSystem& instance() {
+        static AudioSystem inst;
+        return inst;
+    }
+    void play(const std::string& sound) {
+        std::cout << "[Audio] " << sound << "\n";
+    }
+};
+
+// ---- 输入系统（当前是单例） ----
+class InputSystem {
+    InputSystem() = default;
+    bool spacePressed = true;  // 模拟按下空格
+public:
+    InputSystem(const InputSystem&) = delete;
+    InputSystem& operator=(const InputSystem&) = delete;
+    static InputSystem& instance() {
+        static InputSystem inst;
+        return inst;
+    }
+    bool isSpacePressed() { return spacePressed; }
+};
+
+// ---- 游戏类（当前耦合单例） ----
+class Game {
+public:
+    void update() {
+        // TODO: 现在直接调用了单例——请重构为依赖注入
+        if (InputSystem::instance().isSpacePressed()) {
+            AudioSystem::instance().play("jump");
+        }
+    }
+};
+
+int main() {
+    // TODO: 重构后，在 main 中创建各系统实例，注入给 Game
+    Game game;
+    game.update();
+    return 0;
+}
+}
+
+// 🔴 挑战题：带显式生命周期管理的系统注册表
+
+**任务：** 实现一个 `SystemRegistry`（系统注册表），满足以下需求：
+
+\list{
+- 游戏引擎中有多个子系统（Audio, Physics, Renderer...），它们需要按**指定顺序**初始化和关闭
+- `SystemRegistry` 管理所有子系统的生命周期：`init()` 按注册顺序初始化，`shutdown()` 按**逆序**关闭
+- 各子系统通过基类 `ISystem` 的接口注册
+- 任何地方可以通过类型获取已注册的子系统（类似服务定位器）
+- 避免使用单例——`SystemRegistry` 本身通过依赖注入传递
+}
+
+提示：你需要用到 `std::vector`、`std::unique_ptr`、`dynamic_cast` 或模板。
+
+\collapse[参考思路]{
+\code[cpp]{
+#include <vector>
+#include <memory>
+#include <typeindex>
+#include <unordered_map>
+#include <iostream>
+
+class ISystem {
+public:
+    virtual ~ISystem() = default;
+    virtual void init() = 0;
+    virtual void shutdown() = 0;
+    virtual const char* name() const = 0;
+};
+
+class SystemRegistry {
+    std::vector<std::unique_ptr<ISystem>> systems;
+    std::unordered_map<std::type_index, ISystem*> lookup;
+public:
+    template<typename T, typename... Args>
+    T& add(Args&&... args) {
+        auto ptr = std::make_unique<T>(std::forward<Args>(args)...);
+        T& ref = *ptr;
+        lookup[std::type_index(typeid(T))] = &ref;
+        systems.push_back(std::move(ptr));
+        return ref;
+    }
+
+    template<typename T>
+    T& get() {
+        return *static_cast<T*>(lookup.at(std::type_index(typeid(T))));
+    }
+
+    void initAll() {
+        for (auto& sys : systems) {
+            std::cout << "Init: " << sys->name() << "\n";
+            sys->init();
+        }
+    }
+
+    void shutdownAll() {
+        for (auto it = systems.rbegin(); it != systems.rend(); ++it) {
+            std::cout << "Shutdown: " << (*it)->name() << "\n";
+            (*it)->shutdown();
+        }
+        systems.clear();
+    }
+};
+}
+验收标准：实现至少 2 个具体子系统（继承 `ISystem`），演示注册→初始化→使用→逆序关闭的完整流程。
+}

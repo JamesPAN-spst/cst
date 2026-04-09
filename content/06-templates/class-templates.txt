@@ -1,0 +1,501 @@
+/// 简介
+
+上一节我们学了函数模板——让一个函数适配多种类型。但如果你想让**整个类**都是泛型的呢？`std::vector<T>`、`std::optional<T>`、`std::unique_ptr<T>` 都是**类模板（Class Template）**。
+
+类模板把泛型从单个函数扩展到完整数据结构。掌握特化（Specialization）、偏特化（Partial Specialization）、CTAD 和模板模板参数，是读懂STL源码和写出高质量泛型库的关键。
+
+/// 知识点列表
+
+\list{
+- 类模板基本语法
+- 成员函数定义（类内 vs 类外）
+- 类模板特化（全特化、偏特化）
+- 类模板默认参数
+- CTAD（Class Template Argument Deduction, C++17）
+- 模板模板参数（Template Template Parameters）
+- 友元与类模板
+- 带模板的静态成员
+}
+
+/// 知识点详解
+
+// 类模板基本语法
+
+想象你要写一个"栈"数据结构。没有模板，你只能写 `IntStack`、`DoubleStack`……有了类模板，一份代码就够了：
+
+\code[cpp]{
+template<typename T>
+class Stack {
+    std::vector<T> data_;  // T 是类型占位符
+public:
+    void push(const T& val) { data_.push_back(val); }
+
+    T pop() {
+        T top = std::move(data_.back());
+        data_.pop_back();
+        return top;
+    }
+
+    bool empty() const { return data_.empty(); }
+    std::size_t size() const { return data_.size(); }
+};
+
+// 使用时指定具体类型
+Stack<int> intStack;
+Stack<std::string> strStack;
+}
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+
+template<typename T>
+class Stack {
+    std::vector<T> data_;
+public:
+    void push(const T& val) { data_.push_back(val); }
+    T pop() {
+        T top = std::move(data_.back());
+        data_.pop_back();
+        return top;
+    }
+    bool empty() const { return data_.empty(); }
+    std::size_t size() const { return data_.size(); }
+};
+
+int main() {
+    Stack<int> s;
+    s.push(10);
+    s.push(20);
+    s.push(30);
+    std::cout << "size: " << s.size() << '\n';  // 3
+    std::cout << "pop: " << s.pop() << '\n';     // 30
+    std::cout << "pop: " << s.pop() << '\n';     // 20
+
+    Stack<std::string> ss;
+    ss.push("hello");
+    ss.push("world");
+    std::cout << "pop: " << ss.pop() << '\n';    // world
+}
+}
+
+// 成员函数定义：类内 vs 类外
+
+类模板的成员函数可以在类内直接定义（隐式 `inline`），也可以在类外定义——但类外定义需要**重复模板头**：
+
+\code[cpp]{
+template<typename T>
+class Container {
+    T value_;
+public:
+    Container(T val);         // 声明
+    T get() const;            // 声明
+    void set(const T& val);  // 声明
+};
+
+// 类外定义——每个函数都需要 template<typename T>
+template<typename T>
+Container<T>::Container(T val) : value_(std::move(val)) {}
+
+template<typename T>
+T Container<T>::get() const { return value_; }
+
+template<typename T>
+void Container<T>::set(const T& val) { value_ = val; }
+}
+
+\tip{**别把所有成员函数都写在类外。** 模板类实现本来就在头文件中，类内定义更紧凑好读。只在函数体较长时才考虑类外定义。}
+
+// 类模板全特化
+
+有时特定类型需要完全不同的实现（比如 `std::vector<bool>` 用位压缩）。**全特化（Full Specialization）**——为一个具体类型提供专门版本：
+
+\code[cpp]{
+// 通用版本
+template<typename T>
+class Serializer {
+public:
+    static std::string serialize(const T& val) { return val.toString(); }
+};
+
+// 对 int 的全特化——template<> 表示"没有模板参数了"
+template<>
+class Serializer<int> {
+public:
+    static std::string serialize(int val) { return std::to_string(val); }
+};
+
+// 对 std::string 的全特化
+template<>
+class Serializer<std::string> {
+public:
+    static std::string serialize(const std::string& val) { return "\"" + val + "\""; }
+};
+}
+
+// 类模板偏特化
+
+偏特化（Partial Specialization）不是为一个具体类型，而是为**一类类型**提供专门实现——比如"所有指针类型"或"所有数组类型"。偏特化仍有模板参数：
+
+\code[cpp]{
+// 通用版本
+template<typename T>
+class Storage {
+    T value_;
+public:
+    Storage(T v) : value_(std::move(v)) {}
+    const T& get() const { return value_; }
+};
+
+// 对所有指针类型的偏特化
+template<typename T>
+class Storage<T*> {
+    std::unique_ptr<T> ptr_;
+public:
+    Storage(T* p) : ptr_(p) {}
+    const T& get() const { return *ptr_; }
+};
+
+Storage<int> s1(42);            // 通用版本
+Storage<int*> s2(new int(42));  // 指针偏特化
+}
+
+\warning{**函数模板不能偏特化！** 只有类模板和变量模板支持偏特化。对函数模板，用重载来实现类似效果。}
+
+\diagram[tree]{
+root: Storage<T> 通用版本
+  L: Storage<T*> 偏特化（所有指针）
+    L: Storage<int*> 也匹配偏特化
+  R: Storage<int> 匹配通用版本
+}
+
+// 类模板默认参数
+
+模板参数也可以有默认值——`std::vector<T>` 的完整签名其实是 `vector<T, Allocator = allocator<T>>`：
+
+\code[cpp]{
+template<typename T, typename Alloc = std::allocator<T>>
+class DynArray {
+    T* data_ = nullptr;
+    std::size_t sz_ = 0;
+    [[no_unique_address]] Alloc alloc_;
+public:
+    explicit DynArray(std::size_t n);
+    ~DynArray();
+};
+
+DynArray<int> arr(10);            // Alloc 用默认值
+DynArray<int, MyAlloc<int>> a2(10); // 自定义 allocator
+}
+
+// CTAD — 类模板参数推导（C++17）
+
+C++17 之前，使用类模板必须显式写出模板参数：`std::pair<int, double> p(1, 2.5);`。C++17 引入了**CTAD（Class Template Argument Deduction）**，让编译器从构造函数实参推导模板参数：
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <tuple>
+#include <mutex>
+
+int main() {
+    // C++17 CTAD — 不用写 <int, double>
+    std::pair p(1, 2.5);         // pair<int, double>
+    std::tuple t(1, 2.5, "hi"); // tuple<int, double, const char*>
+    std::vector v = {1, 2, 3};   // vector<int>
+
+    std::cout << p.first << ", " << p.second << '\n';
+    std::cout << std::get<2>(t) << '\n';
+
+    // lock_guard 也支持 CTAD
+    std::mutex mtx;
+    std::lock_guard lock(mtx);  // lock_guard<mutex>
+}
+}
+
+\tabs{
+\tab[C++14 写法]{
+\code[cpp]{
+std::pair<int, double> p(1, 2.5);
+std::vector<int> v = {1, 2, 3};
+auto t = std::make_tuple(1, 2.5, "hi");
+std::lock_guard<std::mutex> lock(mtx);
+}
+}
+\tab[C++17 CTAD]{
+\code[cpp]{
+std::pair p(1, 2.5);            // 自动推导
+std::vector v = {1, 2, 3};     // 自动推导
+std::tuple t(1, 2.5, "hi");    // 自动推导
+std::lock_guard lock(mtx);     // 自动推导
+}
+}
+}
+
+你也可以为自己的类模板提供**推导指引（Deduction Guide）**：
+
+\code[cpp]{
+template<typename T>
+class MyVec {
+    std::vector<T> data_;
+public:
+    MyVec(std::initializer_list<T> init) : data_(init) {}
+};
+
+// 推导指引：从 initializer_list<T> 推导出 MyVec<T>
+template<typename T>
+MyVec(std::initializer_list<T>) -> MyVec<T>;
+
+MyVec v = {1, 2, 3};  // MyVec<int>
+}
+
+// 模板模板参数
+
+有时你想让模板的参数本身也是一个模板——这就是**模板模板参数（Template Template Parameter）**：
+
+\code[cpp]{
+template<typename T, template<typename> class Container = std::vector>
+class DataStore {
+    Container<T> data_;
+public:
+    void add(const T& val) { data_.push_back(val); }
+};
+
+DataStore<int> store1;              // 用 vector<int>
+DataStore<int, std::deque> store2;  // 用 deque<int>
+}
+
+\note{C++17 前模板模板参数只能用 `class` 不能用 `typename`。C++17 放宽了这个限制。注意 `std::vector` 实际有两个参数（T 和 Allocator），严格匹配需写 `template<typename, typename> class`。}
+
+// 友元与类模板
+
+在类模板中声明友元需要特别注意——你可以让特定实例化或整个模板成为友元：
+
+\code[cpp]{
+template<typename T> class Box;
+template<typename T>
+std::ostream& operator<<(std::ostream& os, const Box<T>& b);
+
+template<typename T>
+class Box {
+    T value_;
+public:
+    explicit Box(T val) : value_(std::move(val)) {}
+    // 只让 Box<T> 对应的 operator<< 成为友元
+    friend std::ostream& operator<< <T>(std::ostream&, const Box<T>&);
+    // 让所有 Box<U> 互相访问私有成员
+    template<typename U> friend class Box;
+};
+
+template<typename T>
+std::ostream& operator<<(std::ostream& os, const Box<T>& b) {
+    return os << "Box(" << b.value_ << ")";
+}
+}
+
+// 带模板的静态成员
+
+类模板的静态成员是**每个实例化各有一份**——`Stack<int>` 和 `Stack<double>` 的静态成员是完全独立的：
+
+\run[cpp]{
+#include <iostream>
+
+template<typename T>
+class Counter {
+    static inline int count_ = 0;  // C++17 inline 静态成员
+public:
+    Counter() { ++count_; }
+    ~Counter() { --count_; }
+    static int getCount() { return count_; }
+};
+
+int main() {
+    Counter<int> a, b, c;
+    Counter<double> x, y;
+
+    std::cout << "int count: " << Counter<int>::getCount() << '\n';     // 3
+    std::cout << "double count: " << Counter<double>::getCount() << '\n'; // 2
+    // 每个实例化有独立的 count_
+}
+}
+
+/// 新版特性（C++17/20/23）
+
+\list{
+- **C++17**: CTAD、`inline` 静态成员、模板模板参数可用 `typename`
+- **C++20**: Concepts 约束类模板参数、`requires` 条件启用成员函数
+- **C++23**: 推导 this（deducing this）简化 CRTP
+}
+
+/// 工程实践
+
+\list{
+- 类模板定义放在 `.hpp` 头文件中（和函数模板一样的原因）
+- 用 `using` 别名模板简化常用特化：`template<typename T> using Vec = std::vector<T>;`
+- 优先用 CTAD 减少冗余类型标注，但在类型不明确时显式标注
+- 静态成员用 C++17 `inline` 关键字，避免单独定义
+- 用 Concepts 约束模板参数，而非让用户看到难懂的实例化错误
+}
+
+/// 难点易错点分析
+
+\danger{**二阶段名字查找（Two-Phase Lookup）：** 在继承类模板的派生类中，访问基类成员必须用 `this->` 或 `Base<T>::`，否则第一阶段查找找不到：}
+
+\code[cpp]{
+template<typename T>
+struct Base { void foo() {} };
+
+template<typename T>
+struct Derived : Base<T> {
+    void bar() {
+        // foo();          // ❌ 错误！第一阶段查找找不到
+        this->foo();       // ✅ 推迟到第二阶段
+        Base<T>::foo();    // ✅ 也可以
+    }
+};
+}
+
+\danger{**偏特化匹配歧义：** 当两个偏特化对同一个类型都能匹配时，编译器无法选择→编译错误。需要添加更具体的特化来消除歧义。}
+
+\warning{**类模板的成员函数是惰性实例化的：** 只有被调用的成员函数才会实例化。这意味着即使某个成员对特定 T 编译不过，只要你不调用它，其他成员照常工作。这是"鸭子类型"在编译期的体现。}
+
+\quiz[choice]{
+Q: 以下哪个是**偏特化**而不是全特化？
+A: `template<> class Foo<int> {};`
+B: `template<typename T> class Foo<T*> {};`
+C: `template<> class Foo<double> {};`
+D: `template<> class Foo<int*> {};`
+ANS: B
+EXP: 偏特化仍然有模板参数（`template<typename T>`），匹配一类类型（所有指针 `T*`）。全特化没有模板参数（`template<>`），匹配一个具体类型。
+}
+
+\quiz[tf]{
+Q: C++17 CTAD 让你可以写 `std::vector v = {1, 2, 3};` 而不必写 `std::vector<int> v = {1, 2, 3};`。
+ANS: T
+EXP: CTAD 从构造函数参数（`initializer_list<int>`）推导出模板参数 `T = int`。
+}
+
+\quiz[choice]{
+Q: `Counter<int>` 和 `Counter<double>` 的静态成员 `count_` 是什么关系？
+A: 共享同一个变量
+B: 编译错误，不允许模板类有静态成员
+C: 各自独立的变量
+D: 取决于编译器实现
+ANS: C
+EXP: 类模板的每个实例化都是独立的类。`Counter<int>` 和 `Counter<double>` 是两个不同的类，各有自己的 `count_`。
+}
+
+/// 实战作业
+
+// 🟢 基础题：泛型 Pair
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// TODO: 实现类模板 Pair<T1, T2>
+// 成员: first (T1), second (T2)
+// 方法: print() 输出 "(first, second)"
+
+/* TODO: 你的代码 */
+
+int main() {
+    Pair<int, std::string> p(42, "hello");
+    p.print();  // 期望: (42, hello)
+
+    Pair<double, double> point(3.14, 2.71);
+    point.print();  // 期望: (3.14, 2.71)
+}
+}
+
+// 🟢 基础题：偏特化 Storage
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+
+// 通用版本（已实现）
+template<typename T>
+class Storage {
+    T value_;
+public:
+    Storage(T v) : value_(v) {}
+    T get() const { return value_; }
+};
+
+// TODO: 为指针类型 T* 写偏特化
+// 用 unique_ptr 管理所有权
+// get() 返回解引用后的值
+
+/* TODO: 你的偏特化 */
+
+int main() {
+    Storage<int> s1(42);
+    std::cout << "value: " << s1.get() << '\n';    // 42
+
+    Storage<int*> s2(new int(100));
+    std::cout << "pointed: " << s2.get() << '\n';  // 100
+    // s2 析构时自动释放内存
+}
+}
+
+// 🟡 进阶题：CTAD 推导指引
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <cstring>
+
+template<typename T>
+class Wrapper {
+    T value_;
+public:
+    Wrapper(T val) : value_(std::move(val)) {}
+    const T& get() const { return value_; }
+};
+
+// TODO: 添加推导指引，让 Wrapper("hello") 推导为 Wrapper<std::string>
+// 而不是 Wrapper<const char*>
+
+/* TODO: 推导指引 */
+
+int main() {
+    Wrapper w1(42);        // Wrapper<int>
+    Wrapper w2("hello");   // 应该是 Wrapper<std::string>
+    std::cout << w1.get() << '\n';
+    std::cout << w2.get() << '\n';
+    // 验证: w2 应能调用 string 方法
+    std::cout << "length: " << w2.get().size() << '\n'; // 5
+}
+}
+
+// 🟡 进阶题：模板别名
+
+实现模板别名 `StringMap<V>` (= `unordered_map<string, V>`)、`UniqueVec<T>` (= `vector<unique_ptr<T>>`)。测试：`StringMap<int> ages; ages["Alice"] = 25;`
+
+\collapse[参考思路]{
+\code[cpp]{
+template<typename V>
+using StringMap = std::unordered_map<std::string, V>;
+template<typename T>
+using UniqueVec = std::vector<std::unique_ptr<T>>;
+}
+}
+
+// 🔴 挑战题：类型安全的属性系统
+
+设计 `Property<T>` 类模板：①封装值+onChange回调；②偏特化 `Property<T*>` 加空指针检查；③全特化 `Property<bool>` 加 `toggle()`；④别名模板 `IntProp`/`StringProp`；⑤成员模板支持跨类型赋值。
+
+\collapse[参考思路]{
+\code[cpp]{
+template<typename T>
+class Property {
+    T value_;
+    std::function<void(const T&, const T&)> onChange_;
+public:
+    void set(const T& v) { auto old=value_; value_=v; if(onChange_) onChange_(old,v); }
+    template<typename U> void assign(const Property<U>& o) { set(static_cast<T>(o.get())); }
+};
+}
+}

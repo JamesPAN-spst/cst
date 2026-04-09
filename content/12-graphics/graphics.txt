@@ -1,0 +1,315 @@
+/// 简介
+
+图形渲染是游戏引擎最直观的子系统——玩家看到的每一帧画面都经过了 **渲染管线（Rendering Pipeline）** 的处理。理解 GPU 如何把三角形变成像素，对性能调优、着色器编写和渲染架构选型至关重要。
+
+本章从渲染管线的概念模型讲起，覆盖图形 API 选型、着色器基础、纹理映射、光照模型、帧缓冲与深度测试，最后比较 2D/3D 渲染差异与现代渲染架构趋势。目标不是写 OpenGL 教程，而是建立足够的心智模型来做出正确的渲染架构决策。
+
+/// 知识点列表
+
+\list{
+- 渲染管线概述（顶点→光栅化→片段→输出）
+- 图形 API 选型（OpenGL / Vulkan / DirectX / Metal）
+- 着色器基础（Vertex Shader, Fragment Shader）
+- 纹理映射（UV、采样、过滤）
+- 光照模型（Phong, Blinn-Phong, PBR 简介）
+- 帧缓冲、深度测试、混合
+- 2D 渲染 vs 3D 渲染基础
+- 现代渲染架构趋势
+}
+
+/// 知识点详解
+
+// 渲染管线概述
+
+GPU 渲染管线是一条固定顺序的流水线。开发者编写的 **着色器（Shader）** 插入到可编程阶段，其余由硬件自动完成。
+
+\diagram[flow]{
+顶点数据(VBO) -> 顶点着色器(可编程) -> 图元装配 -> 光栅化(固定) -> 片段着色器(可编程) -> 深度/模板测试 -> 混合 -> 帧缓冲(Framebuffer)
+}
+
+\table{
+阶段 | 类型 | 职责
+---
+顶点着色器 | 可编程 | 坐标变换（Model→World→View→Clip）
+图元装配 | 固定 | 将顶点组装为三角形并裁剪
+光栅化 | 固定 | 三角形 → 片段（确定哪些像素被覆盖）
+片段着色器 | 可编程 | 计算每个片段的颜色（光照、纹理采样）
+深度测试 | 固定/可配置 | 用 Z-Buffer 处理遮挡关系
+混合 | 固定/可配置 | Alpha Blending 处理半透明
+}
+
+\note{**片段（Fragment）≠ 像素（Pixel）。** 一个像素位置可能有多个片段（半透明叠加、MSAA 多采样）。片段着色器的输出经过深度测试和混合后才成为最终像素值。}
+
+// 图形 API 选型
+
+\table{
+API | 平台 | 抽象层级 | 学习曲线 | 适用场景
+---
+OpenGL 4.6 | 跨平台（非 iOS） | 高 | 中 | 教学、原型、独立游戏
+Vulkan | 跨平台 | 极低 | 陡峭 | 高性能、精细控制
+DirectX 12 | Windows/Xbox | 极低 | 陡峭 | Windows 主机游戏
+DirectX 11 | Windows/Xbox | 中 | 中等 | 仍被广泛使用
+Metal | Apple 平台 | 低 | 中等 | iOS/macOS 独占
+WebGPU | 浏览器 + 原生 | 中 | 中等 | Web 游戏、跨平台未来
+}
+
+\tip{**引擎开发者的务实选择：** 抽象出 **渲染硬件接口（RHI, Rendering Hardware Interface）**，底层分别实现 Vulkan/DX12/Metal。学习阶段推荐从 OpenGL 入手理解概念，再迁移到现代 API。或直接使用 bgfx / sokol_gfx / wgpu 等轻量 RHI 库。}
+
+// 着色器基础
+
+着色器是运行在 GPU 上的小程序。最核心的两个阶段：**顶点着色器（Vertex Shader）** 变换坐标，**片段着色器（Fragment Shader）** 计算颜色。
+
+\tabs{
+\tab[GLSL 顶点着色器]{
+\code[text]{
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aTexCoord;
+
+uniform mat4 model;
+uniform mat4 view;
+uniform mat4 projection;
+
+out vec3 FragPos;
+out vec3 Normal;
+out vec2 TexCoord;
+
+void main() {
+    FragPos = vec3(model * vec4(aPos, 1.0));
+    Normal = mat3(transpose(inverse(model))) * aNormal;
+    TexCoord = aTexCoord;
+    gl_Position = projection * view * vec4(FragPos, 1.0);
+}
+}
+}
+\tab[GLSL 片段着色器]{
+\code[text]{
+#version 330 core
+in vec3 FragPos;
+in vec3 Normal;
+in vec2 TexCoord;
+
+uniform sampler2D diffuseMap;
+uniform vec3 lightPos;
+uniform vec3 viewPos;
+uniform vec3 lightColor;
+
+out vec4 FragColor;
+
+void main() {
+    vec3 texColor = texture(diffuseMap, TexCoord).rgb;
+    // Blinn-Phong 光照
+    vec3 norm = normalize(Normal);
+    vec3 lightDir = normalize(lightPos - FragPos);
+    float diff = max(dot(norm, lightDir), 0.0);
+    vec3 viewDir = normalize(viewPos - FragPos);
+    vec3 halfDir = normalize(lightDir + viewDir);
+    float spec = pow(max(dot(norm, halfDir), 0.0), 32.0);
+
+    vec3 ambient = 0.1 * texColor;
+    vec3 diffuse = diff * texColor * lightColor;
+    vec3 specular = spec * lightColor * 0.5;
+    FragColor = vec4(ambient + diffuse + specular, 1.0);
+}
+}
+}
+}
+
+// 纹理映射
+
+**纹理映射（Texture Mapping）** 把 2D 图像"贴"到 3D 表面。每个顶点携带 **UV 坐标**（0~1 范围），光栅化在三角形内插值 UV，片段着色器用插值后的 UV 从纹理采样颜色。
+
+\code[cpp]{
+// C++ 端创建纹理（OpenGL 示例）
+GLuint texture;
+glGenTextures(1, &texture);
+glBindTexture(GL_TEXTURE_2D, texture);
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+             width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+glGenerateMipmap(GL_TEXTURE_2D);
+}
+
+\table{
+过滤模式 | 效果 | 开销
+---
+最近邻（Nearest） | 像素化风格，清晰但有锯齿 | 最低
+双线性（Bilinear） | 平滑，近看轻微模糊 | 低
+三线性（Trilinear） | 双线性 + Mipmap 间插值，消除切换接缝 | 中
+各向异性（Anisotropic） | 斜视角下仍保持清晰 | 较高
+}
+
+// 光照模型
+
+\steps{
+\step[Phong 光照模型]{
+光照 = **环境光（Ambient）** + **漫反射（Diffuse, Lambert 余弦定律）** + **镜面反射（Specular）**。简单直觉但非物理正确。镜面高光用反射向量：$R = 2(N \cdot L)N - L$。
+}
+\step[Blinn-Phong]{
+用 **半角向量（Half Vector）** $H = \frac{L+V}{|L+V|}$ 替代反射向量。计算更快，高光形状更自然，是 OpenGL 固定管线时代的默认模型。
+}
+\step[PBR（基于物理的渲染 Physically Based Rendering）]{
+使用 **微表面理论（Microfacet Theory）**。材质参数：金属度（Metallic）、粗糙度（Roughness）。引入法线分布函数 D、菲涅尔方程 F、几何遮蔽函数 G。能量守恒、材质在任何光照下都"正确"。现代引擎标配。
+}
+}
+
+\collapse[PBR Cook-Torrance BRDF 概览]{
+$$f_r = k_d \frac{c}{\pi} + k_s \frac{DFG}{4(\omega_o \cdot n)(\omega_i \cdot n)}$$
+
+D = GGX 法线分布，F = Schlick 菲涅尔近似，G = Smith 遮蔽-遮挡函数。游戏引擎用 **IBL（Image-Based Lighting）** + 预滤波环境贴图 + BRDF LUT 处理环境光。这里仅做展望，完整推导超出本课程范围。
+}
+
+// 帧缓冲、深度测试、混合
+
+\code[cpp]{
+// 深度测试伪代码
+void depthTest(int x, int y, float fragDepth, Color fragColor,
+               float* depthBuf, uint32_t* colorBuf, int width) {
+    int idx = y * width + x;
+    if (fragDepth < depthBuf[idx]) {   // 更近的片段才写入
+        depthBuf[idx] = fragDepth;
+        colorBuf[idx] = fragColor.pack();
+    }
+}
+// Alpha 混合公式：
+// finalColor = srcColor * srcAlpha + dstColor * (1 - srcAlpha)
+}
+
+\warning{**不透明物体不需要排序（Z-Buffer 自动处理遮挡），但半透明物体必须从远到近排序渲染。** Alpha Blending 依赖帧缓冲中当前的颜色——如果近处先画，远处半透明物体会混合到错误的背景上。OIT（Order-Independent Transparency）是进阶解决方案但开销较高。}
+
+// 2D 渲染 vs 3D 渲染
+
+\table{
+方面 | 2D 渲染 | 3D 渲染
+---
+变换 | 正交投影 + 2D 平移/旋转/缩放 | MVP + 透视投影
+排序 | Z-order（图层顺序） | 深度缓冲
+核心操作 | 精灵批处理（Sprite Batching） | 网格渲染 + 材质管理
+着色器 | 简单（纹理 + 着色） | 复杂（光照、阴影、后处理）
+瓶颈 | draw call 数量（批处理解决） | 片段着色（overdraw）
+}
+
+\tip{**2D 游戏的渲染优化核心是批处理（Batching）。** 把使用相同纹理图集（Texture Atlas）的精灵合并为一次 draw call。一个典型的 2D 引擎能在单帧内用 10~50 个 draw call 渲染上千个精灵。}
+
+// 现代渲染架构趋势
+
+\table{
+架构 | 原理 | 优势 | 典型引擎
+---
+前向渲染（Forward） | 每个物体每个光源一次着色 | 实现简单，MSAA 友好 | 移动端、简单场景
+延迟渲染（Deferred） | 先输出 G-Buffer，后统一光照 | 大量光源高效 | Unreal, Unity HDRP
+Forward+ | 前向 + 光源裁剪（Light Culling） | 兼顾前向和多光源 | 部分 AAA 引擎
+Visibility Buffer | 只存三角形 ID，延迟着色 | 减少带宽，GPU 驱动管线 | Nanite (UE5)
+}
+
+\diagram[flow]{
+G-Buffer Pass -> 位置+法线+Albedo+PBR参数 -> Light Pass(逐光源计算) -> 后处理(Bloom+Tonemap+FXAA) -> 最终帧
+}
+
+/// 工程实践
+
+\list{
+- 先做 RHI 抽象层再写渲染代码，即便初期只支持 OpenGL
+- 精灵批处理：相同纹理+相同着色器的 draw call 合并
+- Mipmap 对远距离纹理至关重要——消除摩尔纹 + 提升缓存命中率
+- 着色器热重载：监视 .glsl 文件变更，运行时重新编译替换
+- 帧调试工具：RenderDoc（开源）、NSight（NVIDIA）——逐 draw call 分析
+}
+
+/// 难点易错点分析
+
+\danger{**透视矫正插值：** 屏幕空间线性插值 UV 在透视投影下产生失真。正确做法是在裁剪空间用 $1/w$ 加权插值，光栅化后除以插值后的 $1/w$。GPU 硬件自动处理，但写软件光栅化器时这是最常犯的错误。}
+
+\danger{**Gamma 校正（Gamma Correction）：** 显示器输出非线性（$\gamma \approx 2.2$）。纹理通常存储在 sRGB 空间。光照计算必须在线性空间进行，最终输出时做 Gamma 编码。忽略此步导致画面过暗或光照计算不正确。}
+
+\quiz[choice]{
+Q: 延迟渲染（Deferred Rendering）相比前向渲染的核心优势是？
+A: 实现更简单
+B: MSAA 抗锯齿更容易
+C: 大量动态光源时性能更好
+D: 不需要深度缓冲
+ANS: C
+EXP: 延迟渲染将几何信息写入 G-Buffer（一次 pass），每个光源只处理其影响范围内的像素。光照计算量与物体数量解耦，与光源数×屏幕分辨率相关。前向渲染每个物体×每个光源 = 一次着色调用，光源多时开销爆炸。
+}
+
+\quiz[tf]{
+Q: Z-Buffer 可以正确处理半透明物体的渲染顺序。
+ANS: F
+EXP: Z-Buffer 只记录最近深度值。半透明物体需将自身颜色与帧缓冲已有颜色混合（Alpha Blending），这要求从远到近的渲染顺序。Z-Buffer 会直接丢弃"更远"的片段，因此半透明物体必须单独排序、在不透明物体之后渲染。
+}
+
+\quiz[choice]{
+Q: 以下哪种纹理过滤模式最适合像素艺术风格的 2D 游戏？
+A: 双线性过滤（Bilinear）
+B: 三线性过滤（Trilinear）
+C: 各向异性过滤（Anisotropic）
+D: 最近邻过滤（Nearest Neighbor）
+ANS: D
+EXP: 像素艺术要求保留清晰的像素边缘。双线性/三线性过滤在像素间插值导致模糊。最近邻过滤直接取最近的纹素，保持像素风格的锐利效果。
+}
+
+/// 实战作业
+
+// 🟢 基础：软件光栅化——颜色插值三角形
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <cmath>
+
+struct Color { float r, g, b; };
+
+// TODO: 用重心坐标实现三角形光栅化
+void rasterizeTriangle(std::vector<Color>& fb, int w, int h,
+    float x0, float y0, Color c0,
+    float x1, float y1, Color c1,
+    float x2, float y2, Color c2)
+{
+    /* TODO: 你的代码
+       1. 计算三角形包围盒（clamp 到屏幕边界）
+       2. 遍历包围盒内每个像素
+       3. 计算重心坐标 (u, v, w)
+       4. 如果 u>=0 && v>=0 && w>=0 → 在三角形内
+       5. 用重心坐标插值颜色
+    */
+}
+
+int main() {
+    const int W = 80, H = 60;
+    std::vector<Color> fb(W * H, {0.1f, 0.1f, 0.1f});
+
+    rasterizeTriangle(fb, W, H,
+        40, 5,  {1,0,0},   // 红色顶点
+        10, 55, {0,1,0},   // 绿色顶点
+        70, 50, {0,0,1});  // 蓝色顶点
+
+    std::cout << "P3\n" << W << " " << H << "\n255\n";
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            auto& c = fb[y * W + x];
+            std::cout << int(c.r*255) << " " << int(c.g*255) << " " << int(c.b*255) << "\n";
+        }
+}
+}
+
+// 🟡 进阶：Blinn-Phong 光照计算
+
+实现完整的 Blinn-Phong 光照函数，输入表面法线、光源位置、视点位置、材质参数（ambient/diffuse/specular/shininess），输出最终颜色。在多个场景（正面光、侧面光、背光）下验证正确性并输出对比。
+
+// 🔴 挑战：带深度缓冲的 3D 软件光栅化器
+
+\collapse[参考思路]{
+1. 实现 4×4 矩阵和 MVP 变换（Model × View × Projection）
+2. 透视除法（clip → NDC → screen）
+3. 带深度测试的三角形光栅化（重心坐标 + Z-Buffer）
+4. Blinn-Phong 逐像素光照
+5. 纹理映射（最近邻 + 双线性过滤）
+6. 渲染一个有纹理和光照的旋转立方体，输出为 PPM 序列帧
+}
+
+// 🔴 挑战：2D 精灵批处理渲染器
+
+设计一个 `SpriteBatcher` 类：按纹理 ID 自动排序合批、单次 draw call 绘制数百精灵、正交投影、Z-order 图层管理。用 OpenGL 或 sokol_gfx 实现。

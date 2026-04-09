@@ -1,0 +1,348 @@
+﻿/// 简介
+
+前面几节我们逐一学了 STL 的容器、迭代器、算法、Ranges、字符串处理、函数式工具和工具类型。每个都像单独的乐高零件——好用，但真正的力量在于**把它们组装成完整系统**。
+
+本项目的目标：构建一个**游戏数据处理管线（Game Data Pipeline）**。想象你是一款多人在线游戏的后端开发者：每局结束要处理上千条战绩记录，实时更新排行榜、筛选异常数据、统计伤害分布、生成赛后报告。这些操作环环相扣，天然适合用**管线模式（Pipeline Pattern）**——像工厂流水线一样，数据从一端进入，经过层层加工，从另一端输出结果。
+
+\note{这是 STL 板块的综合实战项目，覆盖第 03 章的所有知识点。完成它意味着你已经能在实际项目中自如运用 STL。}
+
+/// 项目需求
+
+\project{BattlePipe — 游戏战绩数据管线}{
+
+**概述：** 实现一个内存中的战绩数据处理引擎。从文本数据中加载玩家战绩记录，通过链式管线进行筛选、变换、排序、分组、聚合，最后输出排行榜和统计报告。
+
+**数据模型**
+
+\code[cpp]{
+struct BattleRecord {
+    std::string player_name;
+    std::string character_class;  // "Warrior", "Mage", "Archer", "Healer"
+    int kills;
+    int deaths;
+    int assists;
+    double damage_dealt;
+    double healing_done;
+    int match_duration_sec;       // 单局时长（秒）
+    std::string region;           // "Asia", "Europe", "Americas"
+};
+using Dataset = std::vector<BattleRecord>;
+}
+
+**核心功能：**
+
+1. **数据加载** — 从 CSV 解析为 `Dataset`，用 `std::string_view` 做高效分割，`std::optional` 表示解析失败
+
+2. **过滤（Filter）** — 按任意字段筛选，支持等于/大于/小于/自定义谓词，底层用 `std::ranges::views::filter` 或 `std::copy_if`
+
+3. **变换（Transform）** — 计算 KDA、添加评级列，使用 `std::ranges::views::transform`
+
+4. **排序（Sort）** — 按指定字段升序/降序排列，支持多级排序，使用 `std::ranges::sort` + 投影
+
+5. **分组与聚合** — `groupBy` 用 `std::unordered_map` 分组，支持 sum/avg/max/min/count
+
+6. **输出** — 格式化表格打印，`take(N)` 生成 Top N 排行榜
+
+**链式调用接口**
+
+\code[cpp]{
+// 示例：亚服法师 Top 5 伤害排行榜
+auto result = BattlePipe::from(records)
+    .filter([](const BattleRecord& r) { return r.region == "Asia"; })
+    .filter([](const BattleRecord& r) { return r.character_class == "Mage"; })
+    .sort_by(&BattleRecord::damage_dealt, Order::Desc)
+    .take(5)
+    .collect();
+
+BattlePipe::print_table(result, {"player_name", "damage_dealt", "kills", "deaths"});
+}
+}
+
+\diagram[flow]{
+CSV 文本 -> 解析(parse) -> Dataset -> filter -> transform -> sort -> take(N) -> 输出表格
+}
+
+/// 技术要求
+
+// 必须使用的 STL 特性
+
+\list{
+- **容器：** `vector` 存储记录集，`unordered_map` 实现分组
+- **算法：** `ranges::sort`、`ranges::copy_if`、`accumulate` / `reduce`
+- **Ranges：** 至少使用 `views::filter` 和 `views::transform`
+- **字符串：** `string_view` 做 CSV 字段分割
+- **函数式：** `std::function` 或模板 + Lambda 存储谓词和变换函数
+- **工具类型：** `optional` 处理解析失败，`pair`/`tuple` 存储聚合结果
+- **迭代器：** 理解 `begin()`/`end()` 与 Ranges 的关系
+}
+
+// 项目结构
+
+\code[bash]{
+battle-pipe/
+├── CMakeLists.txt
+├── include/
+│   ├── record.h          # BattleRecord 定义
+│   ├── parser.h          # CSV 解析
+│   ├── pipeline.h        # BattlePipe 管线类
+│   └── aggregator.h      # 分组聚合工具
+├── src/
+│   ├── main.cpp          # 入口 + 演示
+│   ├── parser.cpp         # 解析实现
+│   ├── pipeline.cpp       # 管线实现
+│   └── aggregator.cpp     # 聚合实现
+└── data/
+    └── battles.csv        # 测试数据
+}
+
+// CMakeLists.txt
+
+\code[cmake]{
+cmake_minimum_required(VERSION 3.20)
+project(battle-pipe LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(battle-pipe
+    src/main.cpp
+    src/parser.cpp
+    src/pipeline.cpp
+    src/aggregator.cpp
+)
+
+target_include_directories(battle-pipe PRIVATE include)
+target_compile_options(battle-pipe PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+)
+}
+
+// 测试数据
+
+\code[text]{
+player_name,character_class,kills,deaths,assists,damage_dealt,healing_done,match_duration_sec,region
+ShadowBlade,Warrior,15,3,7,28500.0,0.0,1200,Asia
+FrostQueen,Mage,22,5,4,45200.5,1200.0,1350,Europe
+IronHeart,Warrior,8,2,12,18900.0,0.0,980,Asia
+LifeStream,Healer,2,4,25,5600.0,38700.5,1400,Americas
+DarkMage,Mage,25,8,3,51000.0,800.0,1500,Asia
+StormRanger,Archer,16,4,11,29800.0,0.0,1050,Asia
+}
+
+/// 实现提示
+
+用四个阶段逐步搭建系统，每一步可独立测试。
+
+\steps{
+\step[阶段一：数据解析]{
+先让数据能"进来"。实现 CSV 解析器，把每一行文本变成一个 `BattleRecord`。
+
+关键思路：用 `std::string_view` + `find(',')` 逐字段分割，避免大量字符串拷贝。解析失败时返回 `std::nullopt` 而不是崩溃。
+
+\code[cpp]{
+// parser.h
+#pragma once
+#include "record.h"
+#include <string_view>
+#include <optional>
+#include <vector>
+#include <string>
+
+// 分割单行为字段
+std::vector<std::string_view> split_line(std::string_view line, char delim = ',');
+
+// 解析单条记录，失败返回 nullopt
+std::optional<BattleRecord> parse_record(std::string_view line);
+
+// 解析整个 CSV（跳过表头）
+Dataset load_csv(const std::string& content);
+}
+
+\tip{`split_line` 是整个项目的基石——后续所有功能都依赖数据正确解析。务必先写几条单元测试确认分割正确。}
+}
+\step[阶段二：管线核心 — filter / sort / take]{
+实现 `BattlePipe` 类，内部持有一份 `Dataset`，每次操作返回新的 `BattlePipe`（或 `*this` 的引用，取决于你选值语义还是引用语义）。
+
+\code[cpp]{
+// pipeline.h 核心骨架
+#pragma once
+#include "record.h"
+#include <functional>
+#include <algorithm>
+#include <ranges>
+
+enum class Order { Asc, Desc };
+
+class BattlePipe {
+    Dataset data_;
+    explicit BattlePipe(Dataset d) : data_(std::move(d)) {}
+public:
+    static BattlePipe from(const Dataset& src) { return BattlePipe{src}; }
+
+    BattlePipe filter(std::function<bool(const BattleRecord&)> pred) const {
+        Dataset res;
+        std::ranges::copy_if(data_, std::back_inserter(res), pred);
+        return BattlePipe{std::move(res)};
+    }
+
+    template<typename Proj>
+    BattlePipe sort_by(Proj proj, Order order = Order::Asc) const {
+        Dataset s = data_;
+        order == Order::Asc
+            ? std::ranges::sort(s, std::less{}, proj)
+            : std::ranges::sort(s, std::greater{}, proj);
+        return BattlePipe{std::move(s)};
+    }
+
+    BattlePipe take(size_t n) const {
+        auto cnt = std::min(n, data_.size());
+        return BattlePipe{Dataset(data_.begin(), data_.begin() + cnt)};
+    }
+
+    Dataset collect() const { return data_; }
+};
+}
+
+\warning{`sort_by` 用成员指针做投影（如 `&BattleRecord::kills`）非常优雅，但注意 `std::greater{}` 配合投影的参数顺序——如果搞反了排序方向会对调。写完先拿小数据集验证！}
+}
+\step[阶段三：分组与聚合]{
+实现 `groupBy` 和聚合函数。分组的核心是 `std::unordered_map<string, Dataset>`。
+
+\code[cpp]{
+// aggregator.h
+#pragma once
+#include "record.h"
+#include <unordered_map>
+#include <numeric>
+
+using GroupedData = std::unordered_map<std::string, Dataset>;
+
+// 按字段分组
+template<typename KeyFn>
+GroupedData group_by(const Dataset& data, KeyFn key_fn) {
+    GroupedData groups;
+    for (const auto& r : data) groups[key_fn(r)].push_back(r);
+    return groups;
+}
+
+// 聚合：求平均值
+template<typename ValFn>
+double avg(const Dataset& group, ValFn vf) {
+    if (group.empty()) return 0.0;
+    double sum = std::accumulate(group.begin(), group.end(), 0.0,
+        [&](double a, const BattleRecord& r) { return a + vf(r); });
+    return sum / static_cast<double>(group.size());
+}
+}
+}
+\step[阶段四：输出与整合]{
+把所有部件串起来。实现 `print_table` 做格式化输出，然后在 `main.cpp` 中用链式调用演示完整管线。
+
+\code[cpp]{
+// main.cpp 演示片段
+#include "pipeline.h"
+#include "parser.h"
+#include "aggregator.h"
+#include <iostream>
+#include <iomanip>
+
+void demo_leaderboard(const Dataset& records) {
+    auto top5 = BattlePipe::from(records)
+        .filter([](const BattleRecord& r) { return r.region == "Asia"; })
+        .sort_by(&BattleRecord::kills, Order::Desc)
+        .take(5)
+        .collect();
+
+    std::cout << "=== 亚服 Top 5 击杀排行 ===\n";
+    for (const auto& r : top5) {
+        std::cout << std::left << std::setw(14) << r.player_name
+                  << "K:" << r.kills << " D:" << r.deaths
+                  << " DMG:" << std::fixed << std::setprecision(0)
+                  << r.damage_dealt << "\n";
+    }
+}
+}
+
+\tip{四个阶段各自独立，建议每完成一个阶段就编译运行一次。别等全写完才测试——管线越长，bug 越难定位。}
+}
+}
+
+\collapse[CSV 解析实现参考]{
+如果你被 `split_line` 卡住了，这里给一个参考思路：
+
+\code[cpp]{
+std::vector<std::string_view> split_line(std::string_view line, char delim) {
+    std::vector<std::string_view> fields;
+    size_t start = 0;
+    while (start < line.size()) {
+        size_t end = line.find(delim, start);
+        if (end == std::string_view::npos) {
+            fields.push_back(line.substr(start));
+            break;
+        }
+        fields.push_back(line.substr(start, end - start));
+        start = end + 1;
+    }
+    return fields;
+}
+}
+
+`parse_record` 的关键：调用 `split_line` 后检查字段数 `< 9` 返回 `std::nullopt`，然后用 `std::stoi`/`std::stod` 逐字段转换，整个转换包在 `try-catch` 中——任何异常都返回 `nullopt` 而不是崩溃。
+}
+
+\collapse[用 Ranges 实现惰性管线]{
+进阶做法：用 `std::ranges::views` 构建惰性视图链，只在 `collect()` 时才触发求值：
+
+\code[cpp]{
+auto lazy_result = records
+    | std::views::filter([](const BattleRecord& r) {
+          return r.region == "Asia";
+      })
+    | std::views::transform([](const BattleRecord& r) {
+          double kda = (r.kills + r.assists) / std::max(r.deaths, 1);
+          return std::pair{r.player_name, kda};
+      });
+
+// 此时什么都没执行！只有遍历时才求值
+for (auto [name, kda] : lazy_result)
+    std::cout << name << ": " << kda << "\n";
+}
+
+\note{**惰性求值（Lazy Evaluation）**的好处：如果后面跟 `take(5)`，只处理前 5 条满足条件的记录，不会过滤整个数据集。}
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+管线接口设计 | 20分 | 链式调用流畅、API 命名清晰、支持复合操作
+容器选择 | 15分 | vector/unordered_map 等选择合理，理解性能特征
+算法运用 | 20分 | sort/copy_if/accumulate 等正确使用，善用投影
+Ranges 与 Lambda | 15分 | 至少使用 views::filter 和 views::transform，Lambda 简洁
+工具类型 | 10分 | optional 处理解析错误、pair/tuple 存储聚合结果
+字符串处理 | 10分 | string_view 分割 CSV、避免无谓拷贝
+代码质量 | 10分 | 命名规范、函数分解合理、无编译警告
+}
+
+/// 扩展挑战
+
+\list{
+- **Ranges 全管线：** 将整个 BattlePipe 底层改为 `std::ranges::views` 惰性求值链，只在 `collect()` 时触发计算
+- **多级排序：** 实现 `sort_by({&BattleRecord::kills, &BattleRecord::deaths}, {Desc, Asc})` 支持多字段排序
+- **自定义聚合器：** 实现 `reduce(init, binary_op)` 支持任意自定义归约操作
+- **伤害报告生成：** 输出每个职业的伤害分布直方图（用 `*` 字符绘制柱状图）
+- **性能对比：** 对比 `std::copy_if` + `std::sort` 与 `views::filter | views::take` 在十万条数据下的耗时差异
+- **序列化：** 将管线结果导出为 CSV，实现 `to_csv(filename)` 方法
+}
+
+/// 参考资源
+
+\list{
+- C++ Reference — Ranges 库：cppreference.com/ranges
+- C++ Reference — Algorithm 库：cppreference.com/algorithm
+- C++ Reference — std::accumulate / std::reduce
+- C++ Reference — std::optional / std::pair / std::tuple
+- Ranges 管线设计模式：Eric Niebler 的 range-v3 文档
+}

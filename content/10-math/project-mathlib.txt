@@ -1,0 +1,211 @@
+/// 简介
+
+本项目综合 10-math 全章知识，构建一个轻量、正确、可测试的**游戏数学库（GameMath Library）**。这个库将包含 `Vec2`/`Vec3`/`Mat4`/`Quat` 核心类型及碰撞检测工具，作为后续所有游戏项目的数学基础设施。
+
+/// 项目需求
+
+\project{GameMath — 游戏数学库}{
+
+**目标：** 实现 header-only 的游戏数学库，提供向量、矩阵、四元数、基本碰撞检测，并用 `static_assert` + 运行时测试验证正确性。
+
+**核心类型与 API：**
+
+\table{
+模块 | 类型 / 函数
+---
+向量 | Vec2, Vec3：加减乘除、length/normalize/dot/cross/lerp/reflect/project/distance
+矩阵 | Mat4：identity/multiply/transpose/translate/scale/rotateX/Y/Z/rotateAxis/lookAt/perspective
+四元数 | Quat：fromAxisAngle/fromEuler/toMatrix/slerp/nlerp/rotate/conjugate/normalized
+碰撞 | circleVsCircle, aabbVsAabb, circleVsAABB, rayVsAABB（含碰撞信息）
+工具 | degToRad, radToDeg, clamp, approxEqual, lerp(float), smoothstep
+}
+}
+
+/// 技术要求
+
+\list{
+- 使用 C++20 标准
+- Header-only 库（所有实现在 .h 文件中）
+- 所有纯计算函数标记 `[[nodiscard]]`
+- 向量/矩阵运算尽量 `constexpr`
+- 运算符重载：+, -, *, /, ==, 一元 -
+- 零警告编译（-Wall -Wextra -Wpedantic）
+}
+
+**项目目录结构：**
+
+\code[text]{
+gamemath/
+├── CMakeLists.txt
+├── include/
+│   └── gamemath/
+│       ├── vec2.h
+│       ├── vec3.h
+│       ├── mat4.h
+│       ├── quat.h
+│       ├── collision.h
+│       └── utils.h
+└── tests/
+    ├── test_vec.cpp
+    ├── test_mat.cpp
+    ├── test_quat.cpp
+    └── test_collision.cpp
+}
+
+**CMakeLists.txt 参考：**
+
+\code[cmake]{
+cmake_minimum_required(VERSION 3.20)
+project(GameMath LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+
+# Header-only 库
+add_library(gamemath INTERFACE)
+target_include_directories(gamemath INTERFACE include/)
+
+# 测试
+enable_testing()
+add_executable(test_vec tests/test_vec.cpp)
+target_link_libraries(test_vec gamemath)
+add_test(NAME VecTests COMMAND test_vec)
+
+add_executable(test_mat tests/test_mat.cpp)
+target_link_libraries(test_mat gamemath)
+add_test(NAME MatTests COMMAND test_mat)
+
+add_executable(test_quat tests/test_quat.cpp)
+target_link_libraries(test_quat gamemath)
+add_test(NAME QuatTests COMMAND test_quat)
+
+add_executable(test_collision tests/test_collision.cpp)
+target_link_libraries(test_collision gamemath)
+add_test(NAME CollisionTests COMMAND test_collision)
+}
+
+/// 实现提示
+
+// 编译期测试
+
+\code[cpp]{
+// 用 static_assert 验证 constexpr 运算正确性
+constexpr Vec3 a{1, 2, 3};
+constexpr Vec3 b{4, 5, 6};
+constexpr auto c = a + b;
+static_assert(c.x == 5 && c.y == 7 && c.z == 9);
+
+constexpr auto d = dot(a, b);
+static_assert(d == 32);  // 1*4 + 2*5 + 3*6
+}
+
+// 运行时测试框架
+
+不强制使用 GoogleTest，可用简易测试宏：
+
+\code[cpp]{
+#include <cmath>
+#include <iostream>
+
+int g_pass = 0, g_fail = 0;
+
+#define EXPECT_TRUE(expr) do { \
+    if (expr) { ++g_pass; } \
+    else { ++g_fail; std::cout << "FAIL: " #expr " at line " << __LINE__ << "\n"; } \
+} while(0)
+
+#define EXPECT_NEAR(a, b, eps) EXPECT_TRUE(std::abs((a)-(b)) < (eps))
+
+#define TEST_SUMMARY() do { \
+    std::cout << "\n=== " << g_pass << " passed, " << g_fail << " failed ===\n"; \
+    return g_fail > 0 ? 1 : 0; \
+} while(0)
+}
+
+// 测试用例参考
+
+\code[cpp]{
+// test_vec.cpp
+#include "gamemath/vec3.h"
+
+int main() {
+    // 长度
+    Vec3 v{3, 0, 4};
+    EXPECT_NEAR(length(v), 5.0f, 1e-6f);
+
+    // 归一化
+    auto n = normalize(v);
+    EXPECT_NEAR(length(n), 1.0f, 1e-6f);
+    EXPECT_NEAR(n.x, 0.6f, 1e-6f);
+
+    // 点积
+    EXPECT_NEAR(dot(Vec3{1,0,0}, Vec3{0,1,0}), 0.0f, 1e-6f);
+
+    // 叉积
+    auto c = cross(Vec3{1,0,0}, Vec3{0,1,0});
+    EXPECT_NEAR(c.z, 1.0f, 1e-6f);
+
+    // 零向量归一化安全
+    auto z = normalize(Vec3{0,0,0});
+    EXPECT_TRUE(z.x == 0 && z.y == 0 && z.z == 0);
+
+    TEST_SUMMARY();
+}
+}
+
+\code[cpp]{
+// test_quat.cpp
+#include "gamemath/quat.h"
+#include "gamemath/utils.h"
+
+int main() {
+    // 绕 Y 轴旋转 90°
+    auto q = Quat::fromAxisAngle({0,1,0}, degToRad(90.0f));
+    Vec3 v{1, 0, 0};
+    auto r = rotate(q, v);
+    EXPECT_NEAR(r.x, 0.0f, 1e-5f);
+    EXPECT_NEAR(r.z, -1.0f, 1e-5f);
+
+    // 单位四元数不改变向量
+    auto id = Quat::identity();
+    auto r2 = rotate(id, Vec3{3, 4, 5});
+    EXPECT_NEAR(r2.x, 3.0f, 1e-5f);
+
+    // Slerp 端点
+    auto s0 = slerp(q, id, 0.0f);
+    EXPECT_NEAR(s0.w, q.w, 1e-5f);
+
+    TEST_SUMMARY();
+}
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+类型完整性 | 20 分 | Vec2/Vec3/Mat4/Quat 全部实现，API 覆盖要求列表
+运算正确性 | 30 分 | 所有测试通过（static_assert 编译期 + 运行时浮点验证）
+API 设计 | 20 分 | constexpr 使用、[[nodiscard]]、运算符重载完整
+碰撞检测 | 15 分 | 至少 4 种碰撞测试正确实现（含碰撞信息）
+代码质量 | 15 分 | Header-only、零警告编译、测试覆盖率高、代码整洁
+}
+
+/// 扩展挑战
+
+\list{
+- 用模板实现 `float` / `double` 两种精度版本
+- 用 C++20 Concepts 约束运算（同维度向量才能相加、标量类型必须为浮点）
+- 实现 Mat4 的通用求逆（伴随矩阵法/LU分解）
+- 添加 OBB 碰撞和 SAT 凸多边形检测
+- 用 SIMD（SSE/AVX）手动优化 Vec4 点积和 Mat4 乘法
+- 与 GLM 库进行性能基准测试对比
+}
+
+/// 参考资源
+
+\list{
+- 《Game Programming Patterns》— Robert Nystrom（变换层次和组件设计）
+- 《Real-Time Collision Detection》— Christer Ericson（碰撞检测经典教材）
+- 《3D Math Primer for Graphics and Game Development》— Fletcher Dunn
+- GLM 库源码：https://github.com/g-truc/glm（参考 API 设计）
+- Handmade Math：https://github.com/HandmadeMath/HandmadeMath（轻量游戏数学库参考）
+}

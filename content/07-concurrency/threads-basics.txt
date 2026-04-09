@@ -1,0 +1,372 @@
+/// 简介
+
+现代 CPU 早已不靠提升主频来变快——多核才是性能增长的主要方向。要利用这些核心，程序必须引入**并发（Concurrency）**。C++11 将线程纳入标准，C++20 用 `std::jthread` 进一步消除了资源泄漏的风险。本节建立线程编程的基础模型：创建、管理、参数传递、局部存储，以及如何安全地停止线程。
+
+掌握本节后，你将具备在多核平台上拆分工作的能力。后续章节（互斥锁、条件变量、原子操作）都以本节为前提。
+
+/// 知识点列表
+
+\list{
+- 并发 vs 并行 vs 异步——厘清三个术语
+- std::thread 创建与管理
+- join / detach 的语义与代价
+- 线程参数传递（值、引用 std::ref、移动语义）
+- std::jthread（C++20，自动 join + stop_token）
+- thread_local 线程局部存储
+- hardware_concurrency 与线程数决策
+- 线程中的异常处理
+}
+
+/// 知识点详解
+
+// 并发、并行与异步
+
+为什么要区分这三个词？因为它们影响你选择的工具——线程、协程还是异步 I/O。
+
+\table{
+概念 | 含义 | 典型工具
+---
+并发（Concurrency） | 多个任务在逻辑上交替推进，可运行在单核 | std::thread, coroutine
+并行（Parallelism） | 多个任务在物理上同时执行，需要多核 | 多线程 + 多核 CPU
+异步（Asynchronous） | 发起操作后不阻塞等待，完成后回调/通知 | std::async, io_uring
+}
+
+C++ 的 `std::thread` 采用 **1:1 线程模型**——每个 `std::thread` 对应一个操作系统线程。线程共享进程地址空间（堆、全局变量），但每个线程有独立的**栈（Stack）**。
+
+// std::thread 创建与管理
+
+创建线程的核心思路：把一个**可调用对象（Callable）**交给 `std::thread`，线程立即开始执行。支持的可调用对象包括普通函数、Lambda、成员函数指针和函数对象。
+
+\code[cpp]{
+#include <thread>
+#include <print>
+
+// 1. 普通函数
+void work(int id) { std::println("Thread {} running", id); }
+
+// 2. Lambda
+auto task = [](std::string msg) { std::println("Task: {}", msg); };
+
+// 3. 成员函数——需要额外传入对象指针
+struct Worker {
+    void process(int data) { std::println("Process {}", data); }
+};
+
+Worker w;
+std::thread t1(work, 1);
+std::thread t2(task, "hello");
+std::thread t3(&Worker::process, &w, 42); // &对象 作为隐式 this
+t1.join(); t2.join(); t3.join();
+}
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+
+void greet(int id) {
+    std::cout << "Hello from thread " << id << "\n";
+}
+
+int main() {
+    std::thread t1(greet, 1);
+    std::thread t2(greet, 2);
+    std::thread t3([]{ std::cout << "Hello from lambda\n"; });
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    std::cout << "All threads finished\n";
+    return 0;
+}
+}
+
+// join 与 detach
+
+线程创建后必须在其析构前选择 **join**（等待完成）或 **detach**（放手后台运行）。遗漏则触发 `std::terminate`。
+
+\table{
+操作 | 效果 | 风险 | 适用场景
+---
+join() | 阻塞当前线程直到目标完成 | 主线程可能被长时间阻塞 | 需要结果或保证执行顺序
+detach() | 目标变为守护线程 | 无法控制生命周期，退出时 UB | 极少使用
+}
+
+\danger{**析构 joinable 的 `std::thread` 会调用 `std::terminate`。** 这是标准刻意的设计——使"忘了处理线程"变成立即可见的崩溃而非静默泄漏。}
+
+\diagram[flow]{
+thread 构造 -> 运行中 -> [join?]
+[join?] --yes--> 等待完成 -> 析构(安全)
+[join?] --no--> [detach?]
+[detach?] --yes--> 后台运行 -> 析构(安全)
+[detach?] --no--> 析构(terminate!)
+}
+
+\warning{**detach 几乎总是错误的选择。** 被 detach 的线程在 `main()` 返回后可能仍在运行，此时全局/静态对象已开始析构——访问它们是未定义行为。只有在你能保证线程不依赖任何共享资源时，detach 才安全。}
+
+// 参数传递的陷阱
+
+`std::thread` 构造函数**默认按值拷贝所有参数**。这意味着：引用语义需要 `std::ref`，隐式转换可能在错误的线程中发生。
+
+\code[cpp]{
+#include <thread>
+#include <string>
+#include <functional> // std::ref
+
+void process(const std::string& s) { /* ... */ }
+void increment(int& x) { x++; }
+void consume(std::unique_ptr<int> p) { /* ... */ }
+
+void demo() {
+    // 陷阱1: const char* → string 转换发生在新线程——buf 可能先被销毁
+    char buf[] = "hello";
+    // std::thread t(process, buf);              // 危险!
+    std::thread t1(process, std::string(buf));   // 正确: 立即构造 string
+    t1.join();
+
+    // 陷阱2: 想传引用却传了拷贝
+    int val = 0;
+    // std::thread t(increment, val);            // 编译错误
+    std::thread t2(increment, std::ref(val));    // 正确: std::ref 包装
+    t2.join(); // val == 1
+
+    // 移动语义: 不可拷贝的对象用 std::move 转移所有权
+    auto ptr = std::make_unique<int>(42);
+    std::thread t3(consume, std::move(ptr));
+    t3.join();
+}
+}
+
+\quiz[choice|单选]{
+Q: 以下代码中 `val` 的最终值是多少？
+```cpp
+int val = 10;
+std::thread t([](int x){ x += 5; }, val);
+t.join();
+```
+A: 10
+B: 15
+C: 未定义行为
+D: 编译错误
+ANS: A
+EXP: Lambda 接收的是 `val` 的拷贝（按值传参），修改的是拷贝而非原件。原始 `val` 始终为 10。若要修改原件，需使用 `std::ref(val)` 并将参数改为引用。
+}
+
+// std::jthread（C++20）
+
+`std::thread` 有两个核心痛点：忘记 join 导致 terminate，以及缺乏标准化的取消机制。C++20 的 `std::jthread` 一次解决了两者。
+
+\tabs{
+\tab[std::thread (C++11)]{
+\code[cpp]{
+void worker_old() {
+    std::thread t([]{ /* 工作 */ });
+    try {
+        mightThrow();
+        t.join();
+    } catch (...) {
+        t.join(); // 异常路径也必须 join，否则 terminate
+        throw;
+    }
+}
+}
+}
+\tab[std::jthread (C++20)]{
+\code[cpp]{
+void worker_new() {
+    std::jthread t([]{ /* 工作 */ });
+    mightThrow(); // 即使抛异常，t 析构时自动 join
+}
+}
+}
+}
+
+`std::jthread` 的第二个杀手功能——内置**协作式取消（Cooperative Cancellation）**：
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <chrono>
+
+int main() {
+    std::jthread worker([](std::stop_token st) {
+        int count = 0;
+        while (!st.stop_requested()) {
+            ++count;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        std::cout << "Stopped after " << count << " iterations\n";
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    worker.request_stop();
+    std::cout << "Main done\n";
+    return 0;
+}
+}
+
+\note{**`stop_callback`** 允许你在 `request_stop()` 调用时自动执行清理逻辑。回调可能在调用 `request_stop()` 的线程上运行，也可能在注册 callback 的线程上运行，取决于注册时停止是否已被请求。}
+
+\tip{**决策：C++20 及以后，始终使用 `std::jthread` 替代 `std::thread`。** 唯一例外是你需要一个不自动 join 的线程（极罕见）。}
+
+// thread_local 线程局部存储
+
+有些数据天然属于单个线程——缓存、随机数生成器、错误状态。`thread_local` 让每个线程拥有独立副本，不需要锁。
+
+\code[cpp]{
+thread_local int tls_id = 0;
+thread_local std::vector<int> tls_cache; // 每个线程有独立的 cache
+
+void setup(int id) {
+    tls_id = id;
+    tls_cache.reserve(1024); // 仅影响当前线程
+}
+}
+
+\collapse[thread_local 的初始化与析构时机]{
+- **初始化**：该线程第一次访问该变量时触发（lazy），不是线程创建时
+- **析构**：线程退出时按构造逆序调用析构函数
+- 如果 `thread_local` 带有非平凡析构函数，在大量短暂线程的场景下会有额外开销
+- 在 DLL/共享库动态加载时，某些平台的 `thread_local` 行为可能不一致——测试目标平台
+}
+
+// 硬件并发度与线程数决策
+
+\code[cpp]{
+unsigned n = std::thread::hardware_concurrency();
+// 返回逻辑核心数（含超线程），可能返回 0（无法检测时）
+}
+
+\table{
+工作类型 | 推荐线程数 | 原因
+---
+CPU 密集型 | 物理核心数 | 超过核心数→上下文切换浪费
+I/O 密集型 | 核心数 × 2~4 | 线程常阻塞在 I/O，需更多线程填满 CPU
+游戏引擎 | 固定角色线程 + 工作线程池 | 主/渲染/音频各一，其余用池
+}
+
+\warning{**线程不是免费的。** 创建线程：10~100 μs；栈空间：1~8 MB。短命任务（< 100 μs）应提交到线程池，而非反复创建/销毁。}
+
+// 线程中的异常处理
+
+线程函数内**未捕获的异常直接 `std::terminate`**——不会传播到创建者线程。
+
+\code[cpp]{
+// 方案1: 线程内 try-catch + promise 传递错误
+std::promise<int> prom;
+std::jthread t([&prom]() {
+    try {
+        prom.set_value(riskyWork());
+    } catch (...) {
+        prom.set_exception(std::current_exception());
+    }
+});
+auto fut = prom.get_future();
+int result = fut.get(); // 异常在此重新抛出
+
+// 方案2: std::async 自动处理
+auto f = std::async(std::launch::async, riskyWork);
+f.get(); // 线程内的异常在 get() 处重新抛出
+}
+
+\quiz[tf|判断]{
+Q: `std::jthread` 析构时会自动捕获线程内的异常并传递给主线程。
+ANS: F
+EXP: `jthread` 的"自动 join"只是在析构时调用 `request_stop()` + `join()`，不涉及异常传播。线程内未捕获的异常仍触发 `std::terminate`。传递异常需手动使用 `promise`/`future` 或 `std::async`。
+}
+
+/// 工程实践
+
+\list{
+- 始终使用 `std::jthread` —— 消除忘 join 导致 terminate 的风险
+- 参数生命周期不确定时，按值或 `std::move`，不传指针/引用
+- 不要 detach —— 改用 jthread + stop_token 实现"可停止的后台任务"
+- 线程函数内 try-catch 所有异常
+- 用 `thread_local` 代替"加锁的共享缓存"，减少不必要的锁竞争
+- 线程数量通过 `hardware_concurrency()` 动态决定，不要硬编码
+}
+
+/// 常用方法速查
+
+\table{
+API | 用途 | 标准
+---
+`std::thread(f, args...)` | 创建线程 | C++11
+`std::jthread(f, args...)` | 可自动 join 的线程 | C++20
+`t.join()` | 阻塞等待完成 | C++11
+`t.detach()` | 分离线程 | C++11
+`t.get_id()` | 获取线程 ID | C++11
+`std::this_thread::get_id()` | 当前线程 ID | C++11
+`std::this_thread::sleep_for(d)` | 休眠 | C++11
+`std::this_thread::yield()` | 让出时间片 | C++11
+`hardware_concurrency()` | 逻辑核心数 | C++11
+`t.request_stop()` | 请求停止 | C++20
+`std::stop_token` | 取消令牌 | C++20
+`std::stop_callback` | 停止时回调 | C++20
+`thread_local` | 线程局部变量 | C++11
+}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11 提供了 `std::thread`，但析构 joinable 线程导致 terminate；缺乏标准取消机制；异常传播需手动 promise。`thread_local` 在某些 DLL 场景下行为不一致。
+
+new: C++20 引入 `std::jthread`——析构自动 join；`stop_token`/`stop_source`/`stop_callback` 提供标准化协作取消。`condition_variable_any` 新增接受 `stop_token` 的 wait 重载，等待操作可被外部取消。
+}
+
+/// 难点易错点分析
+
+\danger{**传递局部变量的引用给 detach 的线程**——线程仍在运行时局部变量已销毁，产生悬空引用。修复：按值拷贝，或用 `shared_ptr` 共享所有权。}
+
+\danger{**在持有锁的情况下 join 另一个需要同一锁的线程**——经典死锁。线程 A 等 B 完成，B 等 A 释放锁。修复：join 前释放锁。}
+
+\danger{**std::thread 的赋值陷阱**：`std::thread` 不可拷贝但可移动。如果目标线程仍然 joinable，对其赋值（move）会触发 `std::terminate`。必须先 join 或 detach 再赋值。}
+
+/// 实战作业
+
+🟢 **基础：线程 ID 收集器**
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <vector>
+#include <mutex>
+
+std::mutex mtx;
+std::vector<std::thread::id> ids;
+
+void collectId() {
+    std::lock_guard<std::mutex> lock(mtx);
+    ids.push_back(std::this_thread::get_id());
+}
+
+int main() {
+    /* TODO: 创建 4 个 jthread，每个调用 collectId()
+       全部完成后打印收集到的 ID 数量 */
+
+    return 0;
+}
+}
+
+🟡 **进阶：可取消的计数器**
+
+编写一个 `std::jthread`，每 100ms 将 `std::atomic<int> counter` 自增。主线程在 1 秒后 `request_stop()`。线程停止后打印最终计数值。要求：使用 `stop_token` 检查取消，禁止全局布尔变量。
+
+🔴 **挑战：parallel_for**
+
+实现 `parallelFor(int begin, int end, std::function<void(int)> func)`：
+- 将 `[begin, end)` 均分到 `hardware_concurrency()` 个 `jthread` 上
+- 支持 `stop_token` 提前取消所有工作线程
+- 测试：对 1000 万元素数组求和，对比单线程性能
+- 用 TSan 验证无数据竞争
+
+\collapse[parallel_for 参考思路]{
+1. 计算每个线程负责的区间 `[lo, hi)`
+2. 每个 jthread 接受 `stop_token`，循环中周期性检查 `stop_requested()`
+3. 每个线程将局部结果存入 `results[i]`（用 `alignas(64)` 避免 false sharing）
+4. 所有 jthread 析构（自动 join）后，主线程汇总 `results` 数组
+}
+
+🔴 **挑战：线程安全的日志系统**
+
+设计一个 `Logger` 类：后台线程从消息队列中取出日志并写入文件。`log(msg)` 只需将消息入队（非阻塞）。关闭时 `request_stop()` → 线程处理完剩余消息后退出。要点：无锁队列或 mutex+CV 均可，需保证消息顺序。

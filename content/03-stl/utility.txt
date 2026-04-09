@@ -1,0 +1,509 @@
+/// 简介
+
+上一节我们学习了 STL 的算法库，这一节来聊一组"不属于容器也不属于算法、但天天都在用"的**实用工具类型（Utility Types）**。
+
+想象一个场景：游戏角色拾取宝箱，可能拿到武器、药水或空气（开空了）。你怎么表达"可能没拿到东西"？返回 `nullptr`？返回 `-1`？用一个 `bool` 标志位？这些方案都能工作，但它们把"有没有值"和"值本身"混在一起，读代码的人必须靠文档或注释才能理解语义。C++17/23 引入的 `std::optional`、`std::variant`、`std::expected` 等类型，让你用**类型系统本身**来表达这些语义——编译器帮你检查，而不是靠人眼。
+
+这一节覆盖八个核心工具，从最基础的 `pair/tuple` 到现代的 `expected`，每个都回答同一个问题：**在没有它之前你是怎么凑合的，有了它之后代码为什么更安全、更清晰。**
+
+/// 知识点列表
+
+\list{
+- std::pair 与 std::tuple — 把几个值打包成一个返回值
+- 结构化绑定（Structured Bindings, C++17）— 优雅拆包
+- std::optional（C++17）— 表达"可能没有值"
+- std::variant（C++17）— 类型安全的联合体（union）
+- std::any（C++17）— 任意类型容器
+- std::expected（C++23）— 值或错误，二选一
+- std::swap 与 std::exchange — 交换与替换的基础设施
+- std::chrono — 时间工具基础
+}
+
+/// 知识点详解
+
+// std::pair 与 std::tuple
+
+**动机：** 函数只能返回一个值，但你经常需要同时返回两到三个相关数据。`std::pair`（对组）把两个值打成一包，`std::tuple`（元组）可以打包任意多个。
+
+\run[cpp]{
+#include <iostream>
+#include <tuple>
+#include <string>
+#include <utility>
+
+std::pair<int, float> findNearest() {
+    return {42, 15.5f};  // C++17 自动推导，无需 make_pair
+}
+std::tuple<std::string, int, bool> getPlayerInfo() {
+    return {"Alice", 95, true};
+}
+
+int main() {
+    auto nearest = findNearest();
+    std::cout << "ID: " << nearest.first << " 距离: " << nearest.second << "\n";
+
+    auto info = getPlayerInfo();
+    std::cout << std::get<0>(info) << " 血量: " << std::get<1>(info) << "\n";
+    std::cout << std::get<std::string>(info) << "\n"; // 按类型获取（类型须唯一）
+    return 0;
+}
+}
+
+\warning{`pair` 的 `.first`/`.second` 和 `tuple` 的 `std::get<0>` 完全不表达语义——读代码时你不知道 `first` 到底是什么意思。如果返回值在多处使用，应当定义一个**具名结构体（Named Struct）**替代。`pair/tuple` 只适合局部、临时的短命组合。}
+
+// 结构化绑定（Structured Bindings, C++17）
+
+**动机：** 上面用 `std::get<0>(info)` 拆 tuple 实在太丑了。C++17 引入**结构化绑定（Structured Bindings）**，让你一行就给每个成员起个名字。
+
+\code[cpp]{
+auto [enemyId, distance] = findNearest();       // 拆 pair
+auto [name, hp, alive] = getPlayerInfo();        // 拆 tuple
+
+std::map<std::string, int> scores;
+auto [iter, inserted] = scores.try_emplace("Alice", 100); // 拆 map 插入结果
+
+struct Vec2 { float x, y; };
+auto [px, py] = Vec2{3.0f, 4.0f};               // 拆聚合体（所有成员须 public）
+}
+
+结构化绑定能拆三类东西：**数组**、**tuple-like 类型**（pair/tuple/array）、以及**所有成员为 public 的聚合体（Aggregate）**。
+
+\tip{在 `for` 循环中结构化绑定特别好用：`for (auto& [key, value] : myMap)` 比 `it->first` / `it->second` 清晰得多。}
+
+// std::optional — 表达"可能没有值"
+
+**动机：** 游戏中查找背包里的物品，没找到怎么办？返回 `-1`？返回 `nullptr`？这些"魔法值（Magic Value）"有两个问题：①调用者可能忘记检查；②`-1` 可能是合法值。`std::optional<T>`（可选值）用类型系统明确告诉你：这个函数**可能不返回值**。
+
+\run[cpp]{
+#include <iostream>
+#include <optional>
+#include <vector>
+#include <string>
+
+struct Item { std::string name; int damage; };
+
+std::optional<Item> findWeapon(
+    const std::vector<Item>& inv, const std::string& name) {
+    for (const auto& item : inv)
+        if (item.name == name) return item;
+    return std::nullopt;
+}
+
+int main() {
+    std::vector<Item> inventory = {{"Sword", 50}, {"Shield", 10}, {"Bow", 35}};
+
+    if (auto weapon = findWeapon(inventory, "Sword"))
+        std::cout << weapon->name << " 伤害: " << weapon->damage << "\n";
+    else
+        std::cout << "没找到\n";
+
+    Item w = findWeapon(inventory, "Axe").value_or(Item{"Fist", 5});
+    std::cout << "使用: " << w.name << "\n";
+    return 0;
+}
+}
+
+\danger{`*opt` 和 `opt->member` 在 optional 为空时是**未定义行为（Undefined Behavior）**！不会抛异常，直接产生随机结果甚至崩溃。安全做法是先 `if (opt)` 检查，或用 `.value()` 它会抛 `std::bad_optional_access`。}
+
+\collapse[optional 内部原理]{
+`std::optional<T>` 大致等价于一个 `bool has_value` 加一块对齐的原始存储（`aligned_storage`），并用 placement new 构造 T。它**不做堆分配**，大小约为 `sizeof(T) + 对齐填充 + 1字节标志`。所以 `optional<int>` 通常占 8 字节（4 字节 int + 4 字节填充/标志）。
+}
+
+// std::variant — 类型安全的联合体
+
+**动机：** 游戏中一个"事件"可能是伤害、治疗或拾取——类型不同、数据不同。C 语言的 `union` 没有运行时类型检查，读错类型就是 UB。`std::variant<Types...>`（变体）加了**类型标记（Type Tag）**，保证你只能访问当前实际存储的类型。
+
+\run[cpp]{
+#include <iostream>
+#include <variant>
+#include <string>
+
+struct DamageEvent  { int amount; };
+struct HealEvent    { int amount; };
+struct PickupEvent  { std::string item; };
+using GameEvent = std::variant<DamageEvent, HealEvent, PickupEvent>;
+
+// overloaded 模式：C++17 经典写法
+template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
+int main() {
+    GameEvent e1 = DamageEvent{30};
+    GameEvent e2 = PickupEvent{"Gold Sword"};
+
+    // std::visit + overloaded 是最推荐的访问方式
+    auto visitor = overloaded{
+        [](const DamageEvent& e)  { std::cout << "受到 " << e.amount << " 点伤害\n"; },
+        [](const HealEvent& e)    { std::cout << "恢复 " << e.amount << " 点生命\n"; },
+        [](const PickupEvent& e)  { std::cout << "拾取了 " << e.item << "\n"; }
+    };
+    std::visit(visitor, e1);
+    std::visit(visitor, e2);
+
+    // holds_alternative + get 也可以，但不如 visit 安全
+    if (std::holds_alternative<DamageEvent>(e1))
+        std::cout << "伤害值: " << std::get<DamageEvent>(e1).amount << "\n";
+    return 0;
+}
+}
+
+`std::visit` 配合 `overloaded` 惯用法是最推荐的访问方式。编译器会在你**遗漏某个类型的处理分支**时报错——这就是"类型安全"的含义。
+
+\note{`variant` 的大小等于最大备选类型的大小加上一个类型索引（通常 1~4 字节）。它绝不做堆分配，比虚函数多态的 `new Base*` 方案更轻量，局部性更好。}
+
+// std::any — 任意类型容器
+
+**动机：** 在插件系统或脚本绑定中，你无法在编译期知道"用户会传什么类型进来"。`std::any`（任意类型容器）可以持有**任意可拷贝类型**的值，类似于动态类型语言中的"万能变量"。
+
+\code[cpp]{
+#include <any>
+#include <iostream>
+#include <string>
+
+std::any value = 42;
+value = std::string("hello");
+value = 3.14;
+
+double d = std::any_cast<double>(value);       // OK：类型匹配
+// std::any_cast<int>(value);                  // 抛 std::bad_any_cast
+
+if (auto p = std::any_cast<double>(&value)) {  // 指针版本：不匹配返回 nullptr
+    std::cout << "值: " << *p << "\n";
+}
+value.has_value();   // true
+value.reset();       // 清空
+}
+
+\warning{`std::any` 使用**类型擦除（Type Erasure）**技术，小对象可能存栈上（小缓冲优化），大对象会堆分配。运行时开销远大于 `variant`。**能用 `variant` 就不用 `any`**——`variant` 是"我知道可能是哪几种"，`any` 是"我完全不知道会是什么"。}
+
+\diagram[flow]{
+需要处理多种类型 -> 类型集合已知? -是-> std::variant
+类型集合已知? -否-> 需要持有值? -是-> std::any
+需要持有值? -否-> 虚基类 + 继承
+需要表达可能没有 -> std::optional
+需要值或错误 -> std::expected
+}
+
+// std::expected（C++23）— 值或错误
+
+**动机：** 解析配置文件，可能成功（得到值），也可能失败（得到错误信息）。用异常太重且不适合高频调用，返回错误码又容易被忽略。`std::expected<T, E>`（预期值）要求你**必须处理两种情况**：拿到值或拿到错误。
+
+\run[cpp23]{
+#include <iostream>
+#include <expected>
+#include <string>
+#include <charconv>
+
+enum class ParseError { Empty, Invalid, Overflow };
+
+std::expected<int, ParseError> parseInt(std::string_view s) {
+    if (s.empty()) return std::unexpected(ParseError::Empty);
+    int result = 0;
+    auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), result);
+    if (ec == std::errc::result_out_of_range)
+        return std::unexpected(ParseError::Overflow);
+    if (ec != std::errc{} || ptr != s.data() + s.size())
+        return std::unexpected(ParseError::Invalid);
+    return result;
+}
+
+int main() {
+    if (auto r = parseInt("42"))
+        std::cout << "解析成功: " << *r << "\n";
+    if (auto r = parseInt("abc"); !r)
+        std::cout << "解析失败, 错误码: " << (int)r.error() << "\n";
+
+    // 链式操作
+    int doubled = parseInt("21")
+        .transform([](int x) { return x * 2; })
+        .value_or(-1);
+    std::cout << "翻倍: " << doubled << "\n";
+    return 0;
+}
+}
+
+\tip{`expected` 是 C++23 中对**错误处理（Error Handling）**最重要的改进。它让"成功路径"和"错误路径"在类型层面被强制区分，同时支持 `.transform()`、`.and_then()`、`.or_else()` 等链式操作，风格接近函数式编程（Functional Programming）。}
+
+// std::swap 与 std::exchange
+
+**动机：** 交换两个变量的值是最基本的操作之一，但手写三步交换容易出错（尤其涉及移动语义时）。`std::swap` 和 `std::exchange` 是标准库提供的微型但重要的基础设施。
+
+\code[cpp]{
+#include <utility>
+
+int a = 10, b = 20;
+std::swap(a, b);                     // a=20, b=10
+int old = std::exchange(a, 99);      // old=20, a=99：设新值，返回旧值
+
+// 经典用法：移动构造中"偷"资源后置空
+struct Buffer {
+    int* data = nullptr;
+    size_t size = 0;
+    Buffer(Buffer&& other) noexcept
+        : data(std::exchange(other.data, nullptr))
+        , size(std::exchange(other.size, 0)) {}
+};
+}
+
+\note{`std::swap` 对标准容器有特化版本，交换两个 `vector` 只交换内部指针，是 O(1) 操作。自定义类如果有廉价交换方式，也应提供 `swap` 重载。}
+
+// std::chrono — 时间工具基础
+
+**动机：** 游戏需要精确计时——帧间隔、技能冷却、性能统计。`time()` 精度只到秒，平台 API 不可移植。`std::chrono`（时间库）提供**类型安全的时间表示**：编译器不允许你把"秒"直接当"毫秒"用。
+
+\run[cpp]{
+#include <iostream>
+#include <chrono>
+
+int main() {
+    using namespace std::chrono;
+
+    // 测量代码执行时间
+    auto start = high_resolution_clock::now();
+
+    // 模拟耗时操作
+    volatile int sum = 0;
+    for (int i = 0; i < 1000000; ++i) sum += i;
+
+    auto end = high_resolution_clock::now();
+    auto elapsed = duration_cast<microseconds>(end - start);
+    std::cout << "耗时: " << elapsed.count() << " 微秒\n";
+
+    // 时间单位之间的安全转换
+    seconds sec(2);
+    milliseconds ms = sec;                   // 隐式：秒->毫秒，无精度损失
+    // seconds s2 = ms;                      // 编译错误！毫秒->秒可能丢失
+    seconds s2 = duration_cast<seconds>(ms); // 显式转换才行
+
+    std::cout << "2秒 = " << ms.count() << " 毫秒\n";
+    return 0;
+}
+}
+
+\warning{`duration_cast` 是**截断（Truncation）**而不是四舍五入。1999 毫秒 `duration_cast<seconds>` 结果是 1 秒而非 2 秒。C++17 提供了 `floor`、`ceil`、`round` 版本用于精确控制取整方式。}
+
+/// 新版特性（C++17/20/23）
+
+\table{
+标准 | 特性 | 说明
+---
+C++17 | std::optional | 替代 magic value / nullptr 判空
+C++17 | std::variant | 替代 union，类型安全
+C++17 | std::any | 替代 void*，类型安全
+C++17 | 结构化绑定 | auto [a, b] = pair;
+C++17 | std::apply | 将 tuple 展开为函数参数
+C++20 | chrono 日历 | year_month_day、时区支持
+C++23 | std::expected | 值/错误二选一，替代异常+错误码
+C++23 | optional 单子操作 | .transform()、.and_then()、.or_else()
+C++23 | expected 单子操作 | 同上，链式错误处理
+}
+
+\tabs{
+\tab[C++14: pair+bool]{
+\code[cpp]{
+std::pair<int, bool> tryParse(const std::string& s) {
+    try { return {std::stoi(s), true}; }
+    catch (...) { return {0, false}; }
+}
+if (tryParse("42").second) { /* ... */ }
+}
+}
+\tab[C++17: optional]{
+\code[cpp]{
+std::optional<int> tryParse(const std::string& s) {
+    try { return std::stoi(s); }
+    catch (...) { return std::nullopt; }
+}
+if (auto val = tryParse("42")) { use(*val); }
+}
+}
+\tab[C++23: expected]{
+\code[cpp]{
+std::expected<int, std::string> tryParse(const std::string& s) {
+    try { return std::stoi(s); }
+    catch (const std::exception& e) { return std::unexpected(e.what()); }
+}
+auto val = tryParse("42").transform([](int x) { return x * 2; }).value_or(0);
+}
+}
+}
+
+/// 工程实践
+
+\list{
+- **优先级：struct > pair/tuple。** 如果返回值在两处以上使用，定义具名结构体。pair 的 .first/.second 是可读性杀手。
+- **optional 替代所有 magic value。** 凡是函数"可能没有结果"，返回 optional 而非 -1、nullptr、INT_MAX。
+- **variant 替代 union 和继承多态。** 对于封闭类型集（Closed Type Set）——所有可能类型在编译期已知——variant + visit 比虚函数更快且无堆分配。
+- **any 极少使用。** 仅在"类型在编译期完全未知"时使用，如脚本引擎绑定层、序列化的中间表示。
+- **expected 替代异常作为常规错误路径。** 异常适合"罕见的、无法局部处理的"故障；expected 适合"高频的、调用者需要立即决策的"错误。
+- **chrono 替代所有裸数字时间。** 不要用 int milliseconds = 500 传参，用 std::chrono::milliseconds{500}，类型系统帮你发现单位混淆。
+}
+
+/// 难点易错点分析
+
+\danger{**optional 解引用空值：** `*opt` 在空状态下是未定义行为，编译器不会警告你。始终用 `if (opt)` 或 `.value()` 保护。}
+
+\danger{**variant 的 valueless_by_exception 状态：** 如果赋值新类型时构造函数抛异常，variant 可能进入一种罕见的"无值（Valueless by Exception）"状态。此时 `variant.valueless_by_exception()` 返回 true，任何 `visit` 或 `get` 都会抛异常。}
+
+\danger{**chrono 单位混淆：** `duration<int>` 默认是秒，但 `duration<int, std::milli>` 才是毫秒。不要把 `count()` 的裸数字到处传——那就失去了类型安全的意义。}
+
+\quiz[choice]{
+Q: 以下哪个类型最适合表示"函数要么返回一个 `int` 值，要么返回一个错误描述字符串"？
+A: std::optional<int>
+B: std::variant<int, std::string>
+C: std::expected<int, std::string>
+D: std::any
+ANS: C
+EXP: optional 只能表达有/无，不能携带错误信息。variant 可以存 int 或 string，但它不区分"哪个是成功值、哪个是错误"。expected<int, string> 在类型层面明确区分了值（T）和错误（E），语义最准确。
+}
+
+\quiz[tf]{
+Q: `std::variant` 可能在堆上分配内存来存储其备选类型。
+ANS: F
+EXP: variant 总是在栈上分配，大小等于最大备选类型 + 类型索引。它不做堆分配。会做堆分配的是 std::any（当对象超过小缓冲优化阈值时）。
+}
+
+\quiz[choice]{
+Q: 以下代码的输出是什么？`auto [a, b] = std::pair{10, 20}; b = 99; std::cout << b;`
+A: 20
+B: 99
+C: 编译错误
+D: 未定义行为
+ANS: B
+EXP: 结构化绑定创建的是 pair 副本的成员别名。修改 b 修改的是副本的 .second，完全合法，输出 99。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：物品查找系统
+
+用 `std::optional` 实现一个背包查找函数，返回找到的物品或空值。
+
+\run[cpp]{
+#include <iostream>
+#include <optional>
+#include <vector>
+#include <string>
+
+struct Item { std::string name; int value; };
+
+// TODO: 实现 findByName，找到返回 Item，没找到返回 std::nullopt
+std::optional<Item> findByName(
+    const std::vector<Item>& inv, const std::string& name) {
+    /* 你的代码 */
+    return std::nullopt;
+}
+
+int main() {
+    std::vector<Item> inv = {{"Sword", 150}, {"Potion", 30}, {"Shield", 100}};
+    if (auto item = findByName(inv, "Potion"))
+        std::cout << "找到: " << item->name << " 价值: " << item->value << "\n";
+    if (!findByName(inv, "Axe"))
+        std::cout << "正确: Axe 不在背包中\n";
+    std::cout << "武器: " << findByName(inv, "X").value_or(Item{"Fist", 0}).name << "\n";
+    return 0;
+}
+}
+
+// 🟢 基础题 2：帧计时器
+
+用 `std::chrono` 实现一个简单的帧计时器，计算帧间隔（delta time）。
+
+\run[cpp]{
+#include <iostream>
+#include <chrono>
+#include <thread>
+
+class FrameTimer {
+    std::chrono::high_resolution_clock::time_point lastFrame
+        = std::chrono::high_resolution_clock::now();
+public:
+    // TODO: 实现 tick()，返回自上次调用以来的秒数（float）
+    float tick() { /* 你的代码 */ return 0.0f; }
+};
+
+int main() {
+    FrameTimer timer;
+    for (int i = 0; i < 3; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+        std::cout << "帧 " << i << " delta: " << timer.tick() * 1000.f << " ms\n";
+    }
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：游戏事件系统
+
+用 `std::variant` + `std::visit` 实现一个事件分发系统。
+
+\run[cpp]{
+#include <iostream>
+#include <variant>
+#include <vector>
+#include <string>
+
+struct DamageEvent { std::string target; int amount; };
+struct HealEvent   { std::string target; int amount; };
+struct SpawnEvent  { std::string entity; float x, y; };
+struct DeathEvent  { std::string entity; };
+using GameEvent = std::variant<DamageEvent, HealEvent, SpawnEvent, DeathEvent>;
+
+template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
+
+// TODO: 用 std::visit + overloaded 实现 logEvent
+void logEvent(const GameEvent& e) { /* 你的代码 */ }
+// TODO: 统计事件列表中的总伤害
+int countDamage(const std::vector<GameEvent>& ev) { /* 你的代码 */ return 0; }
+
+int main() {
+    std::vector<GameEvent> events = {
+        SpawnEvent{"Dragon", 100.f, 200.f}, DamageEvent{"Player", 30},
+        HealEvent{"Player", 15}, DamageEvent{"Player", 45}, DeathEvent{"Dragon"}
+    };
+    for (const auto& e : events) logEvent(e);
+    std::cout << "\n总伤害: " << countDamage(events) << "\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：配置解析器
+
+用 `std::expected` 实现带错误分类的正整数解析，并用 `.transform()` 链式处理。
+
+\run[cpp23]{
+#include <iostream>
+#include <expected>
+#include <string>
+#include <string_view>
+#include <charconv>
+
+enum class ParseError { Empty, NotANumber, OutOfRange, Negative };
+
+// TODO: 实现 parsePositiveInt
+// 空串->Empty, 非数字->NotANumber, 溢出->OutOfRange, 负数->Negative
+std::expected<int, ParseError> parsePositiveInt(std::string_view s) {
+    /* 你的代码 */
+    return std::unexpected(ParseError::Empty);
+}
+
+int main() {
+    for (auto input : {"42", "-5", "abc", "", "99999999999999"}) {
+        auto result = parsePositiveInt(input)
+            .transform([](int x) { return x * 2; });
+        if (result)
+            std::cout << input << " -> 翻倍: " << *result << "\n";
+        else
+            std::cout << input << " -> 错误码: " << (int)result.error() << "\n";
+    }
+    return 0;
+}
+}
+
+// 🔴 挑战题：类型安全的属性系统
+
+设计一个游戏对象的**属性系统（Property System）**：属性名为字符串，属性值用 `std::variant<int, float, bool, std::string>` 存储，查找用 `std::optional` 表达"属性不存在"，提供类型安全的 `get<T>(name)` 方法。
+
+\collapse[参考思路]{
+核心数据结构：`std::unordered_map<std::string, std::variant<int, float, bool, std::string>>`。`get<T>` 先查 map，找不到返回 `nullopt`，找到后用 `std::get_if<T>` 提取，类型不匹配也返回 `nullopt`。`toString` 用 `std::visit` + `overloaded` 模式。扩展：加属性变拰监听回调。
+}

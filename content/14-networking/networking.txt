@@ -1,0 +1,370 @@
+/// 简介
+
+从单人到多人，代码量可能翻 3~5 倍——网络引入了延迟、丢包、作弊、时钟不同步等全新维度。**网络编程（Network Programming）** 是游戏引擎中最具挑战性的子系统之一。
+
+本章从 Socket 基础讲起，覆盖 TCP/UDP 选型、客户端-服务器架构、两种主流同步策略（帧同步 vs 状态同步）、延迟补偿技术、网络序列化、可靠 UDP 方案，以及网络安全基本原则。目标是让你理解多人游戏"为什么会卡"以及"怎样设计才能不那么卡"。
+
+/// 知识点列表
+
+\list{
+- Socket 基础（TCP vs UDP）
+- 客户端-服务器架构 vs P2P
+- 网络游戏同步：帧同步（Lockstep）vs 状态同步（State Sync）
+- 延迟补偿与客户端预测（Client-Side Prediction）
+- 网络序列化（二进制协议设计）
+- 可靠 UDP（ENet、GameNetworkingSockets）
+- 网络安全基础（反作弊原则）
+}
+
+/// 知识点详解
+
+// Socket 基础
+
+**套接字（Socket）** 是操作系统提供的网络通信端点。游戏网络的基础选择：**TCP（传输控制协议 Transmission Control Protocol）** 可靠有序但延迟高，**UDP（用户数据报协议 User Datagram Protocol）** 低延迟但不保证送达。
+
+\table{
+特性 | TCP | UDP
+---
+可靠性 | 保证送达、自动重传 | 不保证
+顺序 | 保证顺序 | 不保证
+延迟 | 较高（队头阻塞） | 最低
+连接 | 面向连接（三次握手） | 无连接
+头开销 | 20 字节 | 8 字节
+游戏用途 | 聊天、登录、商店 | 实时游戏状态同步
+}
+
+\code[cpp]{
+// 跨平台 UDP Socket 封装（简化版）
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #pragma comment(lib, "ws2_32.lib")
+  using SocketHandle = SOCKET;
+#else
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  #include <unistd.h>
+  using SocketHandle = int;
+#endif
+
+class UDPSocket {
+    SocketHandle sock;
+public:
+    bool create() {
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        return sock != static_cast<SocketHandle>(-1);
+    }
+    bool bind(uint16_t port) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        return ::bind(sock, reinterpret_cast<sockaddr*>(&addr),
+                      sizeof(addr)) == 0;
+    }
+    int sendTo(const void* data, size_t size,
+               const char* ip, uint16_t port) {
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        inet_pton(AF_INET, ip, &addr.sin_addr);
+        return sendto(sock, static_cast<const char*>(data),
+                      static_cast<int>(size), 0,
+                      reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
+    int recvFrom(void* buf, size_t maxSize) {
+        sockaddr_in from{};
+        socklen_t fromLen = sizeof(from);
+        return recvfrom(sock, static_cast<char*>(buf),
+                        static_cast<int>(maxSize), 0,
+                        reinterpret_cast<sockaddr*>(&from), &fromLen);
+    }
+    void close() {
+        #ifdef _WIN32
+        closesocket(sock);
+        #else
+        ::close(sock);
+        #endif
+    }
+};
+}
+
+\warning{**字节序（Endianness）是跨网络通信的第一个坑。** 网络协议统一使用大端序（Big-Endian），x86/ARM 是小端序。多字节数据发送前用 `htons`/`htonl` 转换，接收后用 `ntohs`/`ntohl` 转回。或在自定义序列化中统一写大端。}
+
+// 客户端-服务器 vs P2P
+
+\diagram[tree]{
+root: 网络架构
+  L: 客户端-服务器(C/S)
+    L: 专用服务器(Dedicated Server)
+    R: 玩家托管(Listen Server)
+  R: 对等网络(P2P)
+    L: 全连接(Full Mesh)
+    R: 中继(Relay)
+}
+
+\table{
+架构 | 优点 | 缺点 | 适用
+---
+专用服务器 | 权威仲裁、可防作弊 | 需要服务器成本 | FPS、竞技游戏
+玩家托管 | 零服务器成本 | host 优势、host 断线全局断 | 休闲合作
+全连接 P2P | 无服务器依赖 | 每人需发给所有人、作弊难防 | 格斗、RTS（帧同步）
+}
+
+// 帧同步 vs 状态同步
+
+\compare{
+old: **帧同步（Lockstep / Deterministic Lockstep）**
+所有客户端运行完全相同的模拟，只同步输入。每帧等待所有人输入到齐后才推进。
+要求：**确定性（Deterministic）**——相同输入必须产出完全相同的结果（禁用浮点不确定性）。
+优点：带宽极低（只传输入），回放/录像天然支持。
+缺点：最慢的人拖慢所有人；联机人数受限。
+适用：RTS（星际争霸）、格斗游戏。
+
+new: **状态同步（State Synchronization）**
+服务器运行权威模拟，定期向客户端广播世界状态快照。客户端做预测和插值。
+优点：容忍丢包和延迟差异；玩家数量可扩展。
+缺点：带宽较高（持续发状态）；需要客户端预测+和解。
+适用：FPS（CS2）、MMO、大多数现代多人游戏。
+}
+
+// 延迟补偿与客户端预测
+
+\steps{
+\step[客户端预测（Client-Side Prediction）]{
+不等服务器确认，客户端立即根据本地输入更新角色位置。同时发送输入给服务器，并保存每帧的输入快照和预测状态。
+}
+\step[服务器权威模拟]{
+服务器收到输入后执行模拟，广播权威状态快照。每个快照附带它确认到了哪个输入序号 `ackSequence`。
+}
+\step[客户端和解（Server Reconciliation）]{
+客户端收到服务器状态后，丢弃已确认的输入快照。从服务器位置出发，重放剩余未确认的输入。如果结果与预测一致——无事发生；不一致——平滑修正。
+}
+\step[实体插值（Entity Interpolation）]{
+其他玩家的位置不做预测，而是在两个服务器快照之间做 **线性插值（Lerp）**。展示的是"过去"的状态（延后约 2 个快照间隔），但看起来平滑。
+}
+}
+
+\code[cpp]{
+class ClientPrediction {
+    struct InputSnapshot {
+        uint32_t sequence;
+        PlayerInput input;
+        Vec2 predictedPos;
+    };
+    std::deque<InputSnapshot> pendingInputs;
+    Vec2 displayPos;
+
+public:
+    void onLocalInput(uint32_t seq, PlayerInput input, Vec2 currentPos) {
+        Vec2 predicted = simulateMovement(currentPos, input);
+        pendingInputs.push_back({seq, input, predicted});
+        displayPos = predicted;
+        sendToServer(seq, input);
+    }
+
+    void onServerUpdate(uint32_t ackSeq, Vec2 serverPos) {
+        // 丢弃已确认的输入
+        while (!pendingInputs.empty()
+               && pendingInputs.front().sequence <= ackSeq)
+            pendingInputs.pop_front();
+
+        // 从服务器位置重放未确认输入
+        Vec2 reconciled = serverPos;
+        for (auto& snap : pendingInputs)
+            reconciled = simulateMovement(reconciled, snap.input);
+
+        // 平滑修正（避免瞬移）
+        float err = (reconciled - displayPos).length();
+        displayPos = (err > 0.1f)
+            ? lerp(displayPos, reconciled, 0.3f) : reconciled;
+    }
+};
+}
+
+// 网络序列化
+
+\code[cpp]{
+// 紧凑的二进制序列化器——字节级写入
+class PacketWriter {
+    std::vector<uint8_t> buffer;
+public:
+    void writeU8(uint8_t v)   { buffer.push_back(v); }
+    void writeU16(uint16_t v) { buffer.push_back(v>>8); buffer.push_back(v&0xFF); }
+    void writeU32(uint32_t v) {
+        writeU16(static_cast<uint16_t>(v >> 16));
+        writeU16(static_cast<uint16_t>(v & 0xFFFF));
+    }
+    void writeFloat(float v)  {
+        uint32_t bits; std::memcpy(&bits, &v, 4); writeU32(bits);
+    }
+    const uint8_t* data() const { return buffer.data(); }
+    size_t size() const { return buffer.size(); }
+};
+
+class PacketReader {
+    const uint8_t* buf;
+    size_t pos = 0;
+public:
+    explicit PacketReader(const uint8_t* d) : buf(d) {}
+    uint8_t  readU8()  { return buf[pos++]; }
+    uint16_t readU16() { uint16_t v = buf[pos]<<8 | buf[pos+1]; pos+=2; return v; }
+    uint32_t readU32() { return (uint32_t(readU16())<<16) | readU16(); }
+    float readFloat()  { uint32_t b = readU32(); float v; std::memcpy(&v,&b,4); return v; }
+};
+}
+
+\tip{**带宽优化三板斧：** 1) **Delta 压缩**——只发送与上一快照不同的字段；2) **量化**——位置用定点数（16-bit 表示 ±500m，精度 ~1.5cm）；3) **降频**——远处玩家 10Hz，近处 30Hz。一个竞技 FPS 的带宽预算通常为上行 ~5 KB/s、下行 ~15 KB/s per player。}
+
+// 可靠 UDP
+
+游戏需要对关键消息做可靠传输，对高频数据容忍丢失。在原始 UDP 上自建可靠层是标准做法。
+
+\table{
+库 | 语言 | 特点
+---
+ENet | C | 轻量（6 个文件），可靠/不可靠/有序通道
+GameNetworkingSockets | C++ | Valve 开源，加密、NAT 穿透、SteamRelay
+yojimbo | C++ | Glenn Fiedler 出品，专为游戏设计
+KCP | C | 快速可靠 ARQ 协议，国内游戏广泛使用
+}
+
+\note{**通道设计示例：** Channel 0 — 可靠有序（聊天、关键事件）；Channel 1 — 不可靠无序（位置更新）；Channel 2 — 可靠无序（道具拾取——顺序无所谓但必须送达）。}
+
+// 网络安全基础
+
+\danger{**核心原则：永远不要信任客户端。** 所有关键逻辑（伤害计算、胜负判定、资源变更）必须在服务器执行。客户端只发送输入（"按了射击键"），不发送结果（"打了 100 伤害"）。这是反作弊的基石。}
+
+\list{
+- **输入验证：** 服务器检查移动速度、射击频率、操作时序是否合法
+- **速率限制：** 单个客户端每秒最大请求量
+- **包加密：** DTLS 或自建加密层，防止篡改和嗅探
+- **重放攻击防御：** 每个包含序列号 + HMAC
+- **服务器端碰撞检测：** 客户端说"命中了"不算数，服务器回退时间线验证
+}
+
+/// 工程实践
+
+\list{
+- 网络层与游戏逻辑严格分离——用"消息类型 + 序列化/反序列化"做接口
+- 开发时用人工网络模拟器：添加延迟（100~300ms）、丢包率（5~10%）、乱序
+- 用 `std::jthread` 分离网络收发线程和游戏主循环
+- 时钟同步：NTP 简化版——定期 RTT 测量，估算时钟偏移
+- 快照缓冲区：存储最近 N 帧的世界状态，支持服务器回溯验证命中
+}
+
+/// 难点易错点分析
+
+\danger{**TCP 的队头阻塞（Head-of-Line Blocking）：** TCP 保证顺序——如果第 5 个包丢了，第 6~10 个包即使已到达也被阻塞等待重传。实时游戏无法接受这种延迟尖峰。这就是为什么游戏状态同步几乎都用 UDP。}
+
+\warning{**NAT 穿透（NAT Traversal）是实际部署的大坑。** 家用路由器后的玩家互相无法直连。STUN/TURN 服务器辅助打洞，或直接使用 Steam Relay / PlayFab Relay 等中继服务。自研联机时别低估这个问题的复杂度。}
+
+\quiz[choice]{
+Q: 客户端预测 + 服务器和解的目的是？
+A: 减少服务器计算负担
+B: 让本地玩家操作立即响应，同时保持服务器权威
+C: 让所有客户端同步运行相同的物理模拟
+D: 加密网络通信防止抓包作弊
+ANS: B
+EXP: 客户端预测让玩家按键后角色立即移动（无需等 RTT），服务器和解在收到权威状态后修正预测误差。这样玩家体验流畅（预测），同时服务器保持裁判权威。帧同步才是让所有客户端运行相同模拟。
+}
+
+\quiz[tf]{
+Q: 帧同步（Lockstep）比状态同步需要更多网络带宽。
+ANS: F
+EXP: 恰恰相反。帧同步只传输玩家输入（每帧几十字节），带宽极低。状态同步需要定期传输完整世界状态快照，带宽显著更高。帧同步的代价是延迟（等待最慢的人）和对确定性的严格要求（禁止浮点不确定性）。
+}
+
+\quiz[choice]{
+Q: 以下哪种消息应该使用可靠传输通道？
+A: 玩家位置更新（每秒 30 次）
+B: 玩家死亡事件
+C: 鼠标移动输入
+D: 相机旋转角度
+ANS: B
+EXP: 位置和输入是高频覆盖数据，丢一个包下一个马上到——用不可靠通道即可。但"玩家死亡"是关键一次性事件，丢包会导致状态不一致——必须可靠送达。规则：高频数据用不可靠，低频关键事件用可靠。
+}
+
+/// 实战作业
+
+// 🟢 基础：网络序列化/反序列化
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <cstring>
+
+struct Vec2 { float x, y; };
+
+class PacketWriter {
+    std::vector<uint8_t> buf;
+public:
+    void writeU8(uint8_t v) { buf.push_back(v); }
+    void writeU16(uint16_t v) { buf.push_back(v>>8); buf.push_back(v&0xFF); }
+    void writeFloat(float v) {
+        uint32_t bits; std::memcpy(&bits, &v, 4);
+        buf.push_back((bits>>24)&0xFF); buf.push_back((bits>>16)&0xFF);
+        buf.push_back((bits>>8)&0xFF);  buf.push_back(bits&0xFF);
+    }
+    size_t size() const { return buf.size(); }
+    const uint8_t* data() const { return buf.data(); }
+};
+
+class PacketReader {
+    const uint8_t* buf; size_t pos = 0;
+public:
+    PacketReader(const uint8_t* d) : buf(d) {}
+    uint8_t readU8() { return buf[pos++]; }
+    uint16_t readU16() { uint16_t v = buf[pos]<<8|buf[pos+1]; pos+=2; return v; }
+    float readFloat() {
+        uint32_t b = uint32_t(buf[pos])<<24|uint32_t(buf[pos+1])<<16
+                    |uint32_t(buf[pos+2])<<8|buf[pos+3];
+        pos += 4; float v; std::memcpy(&v, &b, 4); return v;
+    }
+};
+
+int main() {
+    // 序列化
+    PacketWriter w;
+    w.writeU8(1);              // 消息类型: PlayerMove
+    w.writeU16(42);            // 玩家 ID
+    w.writeFloat(123.456f);    // x
+    w.writeFloat(-78.9f);      // y
+
+    // 反序列化
+    PacketReader r(w.data());
+    int type = r.readU8();
+    int id = r.readU16();
+    float x = r.readFloat(), y = r.readFloat();
+
+    std::cout << "Type=" << type << " ID=" << id
+              << " Pos=(" << x << ", " << y << ")\n";
+    std::cout << "Packet size: " << w.size() << " bytes\n";
+    std::cout << (std::abs(x - 123.456f) < 0.001f ? "PASS" : "FAIL") << "\n";
+}
+}
+
+// 🟡 进阶：客户端预测模拟器
+
+编写纯逻辑（无需真实 Socket）的客户端预测 + 服务器和解模拟器：
+- 模拟 100ms RTT（服务器处理有延迟）
+- 客户端每帧发送输入并预测位置
+- "服务器"延迟处理输入并返回权威状态
+- 客户端收到后做和解
+- 输出每帧的预测误差（应该在大多数帧趋近于 0）
+
+// 🔴 挑战：基于 ENet 的多人位置同步
+
+\collapse[参考思路]{
+1. 使用 ENet（或 GameNetworkingSockets）实现 C/S 架构
+2. 服务器维护所有玩家位置，20Hz 广播状态快照
+3. 客户端：本地预测 + 服务器和解 + 其他玩家插值
+4. 支持 4 人同时连接
+5. 命令行参数切换 server/client 模式
+6. 可选：人工注入网络延迟/丢包进行弹性测试
+}
+
+// 🔴 挑战：帧同步 RTS 原型
+
+实现两人帧同步简化 RTS：确定性定点数数学库（禁用 float）、每帧交换输入 → 独立模拟 → 定期 CRC 校验一致性、支持录像回放（保存输入序列）。

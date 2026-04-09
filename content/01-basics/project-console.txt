@@ -1,0 +1,619 @@
+/// 简介
+
+恭喜你！走到这里，说明 C++ 基础板块的所有知识点你都已经过了一遍了——数据类型、控制流、函数、数组/字符串、指针/引用、结构体/枚举、文件 I/O、预处理器……每一块你都练过手了。
+
+但学了这么多零散的积木，真正的问题来了：**怎么把它们拼成一个完整的东西？**
+
+这就好比你学了切菜、炒菜、调味、摆盘，现在该上桌做一道完整的菜了。今天我们要做的"菜"是一个叫 **FileKit** 的命令行文件管理工具（Command-Line File Manager）。它虽然不大，但每一个基础知识点都会在里面出场——这就是综合项目的意义：让你体会"知识是怎么配合工作的"。
+
+\note{这是一个综合练习项目，不涉及面向对象或高级特性。重点在于正确、安全地使用 C++ 基础特性，并学会把多个小功能组织成一个完整可用的工具。}
+
+/// 知识点列表
+
+\list{
+- FileKit 项目的功能需求与整体设计
+- 多文件项目结构：头文件、源文件、CMake
+- `enum class` 定义命令类型和错误码
+- `struct` 组织数据（文件统计、列表选项）
+- `int main(int argc, char* argv[])` 解析命令行参数
+- 用函数分解实现每个子命令
+- 核心功能实现思路：info / ls / grep / stats / diff / help
+- CMake 构建从零开始
+- 常见错误：参数越界、文件未关闭、路径问题
+}
+
+/// 知识点详解
+
+// 项目需求：FileKit 要做什么？
+
+先别急着写代码，咱们想清楚这个工具到底要干嘛。想象一下你在终端里敲命令——`ls` 看看目录有啥文件，`grep` 搜个关键词，`wc` 数行数……FileKit 就是把这些常用操作打包到一个工具里。
+
+\project{FileKit — 命令行文件管理工具}{
+
+**概述：**
+实现一个名为 `filekit` 的命令行工具，支持文件的查看、搜索、统计和简单处理功能。
+
+**六大功能：**
+
+1. **文件信息查看** (`filekit info <path>`)
+   - 显示文件大小、修改时间
+   - 使用 `std::filesystem` 获取信息，`std::format` 格式化输出
+
+2. **目录列表** (`filekit ls <dir> [--recursive] [--ext=.cpp]`)
+   - 列出目录下的文件和子目录
+   - 支持递归遍历和按扩展名过滤
+   - 文件大小自动转换为 KB/MB/GB
+
+3. **文本搜索** (`filekit grep <pattern> <file>`)
+   - 搜索包含指定文本的行，输出行号和匹配内容
+   - 用 ANSI 颜色码高亮匹配部分
+
+4. **文件统计** (`filekit stats <file>`)
+   - 统计行数、单词数、字符数
+   - C++ 源文件额外统计：代码行、注释行、空白行
+
+5. **文件比较** (`filekit diff <file1> <file2>`)
+   - 逐行对比两个文件，输出不同的行及行号
+
+6. **帮助信息** (`filekit help`)
+   - 显示所有命令和选项的使用说明
+}
+
+咱们先用一张流程图看看整个工具的"骨架"——用户输入命令后，程序怎么一步步处理：
+
+\diagram[flow]{
+用户输入命令 -> main() 接收 argc/argv -> parseCommand() 识别命令类型 -> switch 分发到对应处理函数
+对应处理函数 -> cmdInfo() | cmdList() | cmdGrep() | cmdStats() | cmdDiff() | showHelp()
+处理函数 -> 执行逻辑 + 错误检测 -> 格式化输出结果到终端
+}
+
+看到没？整体思路很清晰：**接收 → 解析 → 分发 → 执行 → 输出**。这就是绝大多数命令行工具的套路。
+
+// 项目结构：文件怎么摆？
+
+写一个小程序，一个 `main.cpp` 就搞定了。但稍微大一点的项目，如果把所有代码塞进一个文件——那就像把衣服裤子袜子全扔进一个抽屉，找起来要命。
+
+所以我们把项目拆成多个文件，各司其职：
+
+\code[bash]{
+filekit/
+├── CMakeLists.txt          # 构建配置——告诉编译器怎么把这堆文件变成一个程序
+├── include/
+│   ├── commands.h          # 命令函数的声明（"菜单"）
+│   ├── types.h             # struct/enum 定义（"数据模具"）
+│   ├── utils.h             # 工具函数声明（"厨房小帮手"）
+│   └── platform.h          # 平台检测宏（Windows/Linux 的差异处理）
+├── src/
+│   ├── main.cpp            # 程序入口，参数解析，命令分发
+│   ├── commands.cpp        # 六大命令的具体实现
+│   └── utils.cpp           # 工具函数实现（如文件大小格式化）
+└── tests/
+    └── test_data/          # 测试用的文本文件
+}
+
+\tip{一个好习惯是：**声明（.h）和实现（.cpp）分离**。头文件是"说明书"，告诉别的文件"我有哪些函数可以调用"；源文件是"工厂"，里面是具体的制造过程。这样改一个功能的实现不需要重新编译所有文件。}
+
+\quiz[choice]{
+Q: 为什么要把 `types.h`、`commands.h`、`utils.h` 分开，而不是全写在一个 `everything.h` 里？
+A: 编译速度更快——修改一个头文件只影响包含它的源文件
+B: 纯粹为了好看，没有实际意义
+C: C++ 语法规定一个头文件最多只能声明 10 个函数
+D: 因为一个头文件不能被多个 .cpp 包含
+ANS: A
+EXP: 头文件分开的核心好处是**降低编译耦合**。如果你只改了 `utils.h`，那只有 `#include "utils.h"` 的源文件需要重新编译，其他文件不受影响。把所有东西塞一个头文件，改任何声明都会导致全部重新编译——项目大了以后这个时间差非常明显。
+}
+
+// 类型定义：用 struct 和 enum class 搭好"数据骨架"
+
+动手写逻辑之前，先想清楚程序要处理哪些"数据"。这就像开餐厅之前先确定菜单和食材清单。
+
+**第一个问题：用户会输入哪些命令？** 我们用 `enum class`（枚举类）来给每种命令起个名字：
+
+\code[cpp]{
+// types.h
+#pragma once
+#include <cstdint>
+#include <string>
+
+// 命令类型——用户可以执行的操作
+enum class Command : uint8_t {
+    Info,       // filekit info
+    List,       // filekit ls
+    Grep,       // filekit grep
+    Stats,      // filekit stats
+    Diff,       // filekit diff
+    Help,       // filekit help
+    Unknown     // 用户乱输的东西
+};
+
+// 错误码——程序退出时告诉系统"发生了什么"
+enum class ErrorCode : uint8_t {
+    OK = 0,             // 一切正常
+    FileNotFound,       // 文件不存在
+    PermissionDenied,   // 没权限
+    InvalidArgs,        // 参数不对
+    IOError             // 读写出错
+};
+}
+
+为什么用 `enum class` 而不是普通 `enum`？看个对比你就明白了：
+
+\run[cpp]{
+#include <iostream>
+
+// 普通 enum——危险！值会"泄漏"到外层作用域
+enum OldColor { Red, Green, Blue };
+// enum OldSize { Small, Medium, Large }; // 如果取消注释——编译错误！Red 和 Small 冲突
+
+// enum class——安全！每个值都在自己的"命名空间"里
+enum class Color { Red, Green, Blue };
+enum class Size { Small, Medium, Large };  // 完全没问题！
+
+int main() {
+    // OldColor c1 = Red;      // 不需要前缀，容易搞混
+    // int n = Red;             // 普通 enum 可以隐式转 int——意外的 bug 来源
+
+    Color c2 = Color::Red;     // 必须写前缀，意图清晰
+    // int n = c2;              // 编译错误！不能隐式转 int——保护你不犯错
+    int n = static_cast<int>(c2);  // 必须显式转换，说明你是故意的
+
+    std::cout << "Color::Red 的底层值 = " << n << "\n";
+    return 0;
+}
+}
+
+**第二个问题：统计结果长什么样？** 用 `struct` 把相关数据打包在一起：
+
+\code[cpp]{
+struct FileStats {
+    uint64_t totalLines   = 0;   // 总行数
+    uint64_t codeLines    = 0;   // 代码行（非注释非空白）
+    uint64_t commentLines = 0;   // 注释行
+    uint64_t blankLines   = 0;   // 空白行
+    uint64_t words        = 0;   // 单词数
+    uint64_t chars        = 0;   // 字符数
+    uint64_t maxLineLength = 0;  // 最长行的长度
+};
+
+struct ListOptions {
+    bool recursive = false;       // 是否递归进子目录
+    std::string extension;        // 按扩展名过滤，空 = 不过滤
+};
+}
+
+\note{注意每个成员都给了**默认值** `= 0` 或 `= false`。这叫**默认成员初始化器**（Default Member Initializer, C++11 起）。好处是：不管谁创建这个 struct，初始状态都是干净的，不会出现"忘记初始化导致随机值"的 bug。}
+
+// 参数解析：main() 是怎么拿到用户输入的？
+
+你在终端敲 `filekit stats report.txt`，操作系统会把这行命令拆成一个个"单词"，通过 `argc` 和 `argv` 传给你的 `main()` 函数：
+
+- `argc` = 3（一共 3 个单词）
+- `argv[0]` = `"filekit"`（程序自己的名字）
+- `argv[1]` = `"stats"`（第一个参数——命令名）
+- `argv[2]` = `"report.txt"`（第二个参数——文件路径）
+
+咱们先写一个小程序感受一下：
+
+\run[cpp]{
+#include <iostream>
+#include <string_view>
+
+int main(int argc, char* argv[]) {
+    std::cout << "一共收到 " << argc << " 个参数：\n";
+
+    for (int i = 0; i < argc; ++i) {
+        std::cout << "  argv[" << i << "] = \"" << argv[i] << "\"\n";
+    }
+
+    // 实际项目中，我们会这样解析命令：
+    if (argc < 2) {
+        std::cout << "\n用法: filekit <command> [args...]\n";
+        return 1;
+    }
+
+    std::string_view cmd = argv[1];  // 用 string_view 避免拷贝
+    std::cout << "\n你输入的命令是: " << cmd << "\n";
+
+    if (cmd == "help") {
+        std::cout << "你请求了帮助！\n";
+    } else if (cmd == "info") {
+        std::cout << "你想查看文件信息！\n";
+    } else {
+        std::cout << "未知命令: " << cmd << "\n";
+    }
+
+    return 0;
+}
+}
+
+\warning{**新手常见错误：忘记检查 `argc`，直接访问 `argv[1]`。** 如果用户只敲了 `filekit` 没带参数，`argv[1]` 就是越界访问——未定义行为（Undefined Behavior），轻则乱码，重则程序崩溃。永远先检查 `argc >= 2` 再碰 `argv[1]`！}
+
+有了参数，接下来写一个函数把命令字符串转成我们定义的 `enum class`：
+
+\code[cpp]{
+// main.cpp
+Command parseCommand(std::string_view cmd) {
+    if (cmd == "info")  return Command::Info;
+    if (cmd == "ls")    return Command::List;
+    if (cmd == "grep")  return Command::Grep;
+    if (cmd == "stats") return Command::Stats;
+    if (cmd == "diff")  return Command::Diff;
+    if (cmd == "help" || cmd == "--help") return Command::Help;
+    return Command::Unknown;  // 用户乱输的都走这里
+}
+}
+
+\quiz[tf]{
+Q: `std::string_view` 会复制字符串内容，所以比 `std::string` 更安全。
+ANS: F
+EXP: 恰恰相反！`string_view` **不复制**字符串内容，它只是一个"窗口"，指向别人拥有的字符串数据。这让它比 `std::string` 更快（省去拷贝），但也更"危险"——如果原始字符串被销毁了，`string_view` 就变成悬空引用。在我们的 `parseCommand` 里用它是安全的，因为 `argv` 的生命周期覆盖了整个 `main()`。
+}
+
+// 核心功能实现思路
+
+咱们不写完整实现（那是你的作业！），但每个功能的思路得讲透。
+
+**文件大小格式化** —— 这是 `info` 和 `ls` 命令都会用到的工具函数。用户可不想看到 `1048576 B`，他们想看到 `1.0 MB`：
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+#include <cstdint>
+#include <format>
+
+// [[nodiscard]] 提醒调用者：这个函数返回的值你得用，不能扔掉
+[[nodiscard]]
+std::string formatSize(uint64_t bytes) {
+    constexpr std::array units = {"B", "KB", "MB", "GB", "TB"};
+    double size = static_cast<double>(bytes);
+    size_t unit = 0;
+
+    // 每次除以 1024，直到找到合适的单位
+    while (size >= 1024.0 && unit < units.size() - 1) {
+        size /= 1024.0;
+        ++unit;
+    }
+
+    // 如果还是字节级别，不显示小数
+    if (unit == 0) return std::format("{} {}", bytes, units[0]);
+    return std::format("{:.1f} {}", size, units[unit]);
+}
+
+int main() {
+    // 测试各种大小
+    std::cout << formatSize(0) << "\n";           // 0 B
+    std::cout << formatSize(512) << "\n";          // 512 B
+    std::cout << formatSize(1024) << "\n";         // 1.0 KB
+    std::cout << formatSize(1536) << "\n";         // 1.5 KB
+    std::cout << formatSize(1048576) << "\n";      // 1.0 MB
+    std::cout << formatSize(1073741824) << "\n";   // 1.0 GB
+
+    return 0;
+}
+}
+
+\collapse[🤔 思考：为什么用 constexpr std::array 而不是普通字符串数组？]{
+`constexpr` 告诉编译器："这个数组在编译期就能确定内容，不需要运行时再初始化。" 好处有两个：
+1. **性能**：编译器可能直接把值嵌入指令，运行时零开销。
+2. **安全**：`constexpr` 数据不能被修改，杜绝了意外篡改的可能。
+
+相比之下，`const char* units[] = {...}` 也能工作，但它是 C 风格的，没有 `.size()` 方法，也不能用范围 for，不够"现代 C++"。
+}
+
+**文本搜索（grep）思路** —— 一行一行读文件，检查每行里有没有目标文本：
+
+\code[cpp]{
+// commands.cpp 中的 grep 实现思路（伪代码风格）
+void cmdGrep(std::string_view pattern, const std::filesystem::path& filePath) {
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        std::println(stderr, "错误：无法打开文件 {}", filePath.string());
+        return;
+    }
+
+    std::string line;
+    uint64_t lineNum = 0;
+
+    while (std::getline(file, line)) {
+        ++lineNum;
+        if (auto pos = line.find(pattern); pos != std::string::npos) {
+            // C++17 if 带初始化语句——pos 只在这个 if 块内有效
+            std::println("{}:{}: {}", lineNum, pos, line);
+        }
+    }
+}
+}
+
+注意到 `if (auto pos = line.find(pattern); pos != std::string::npos)` 这种写法了吗？这是 **C++17 的 if 初始化语句**（if with initializer）——把变量的声明和条件检查写在一起，`pos` 的作用域被限制在了 `if` 块内，不会污染外面的代码。非常适合这种"找到就用、找不到就算了"的场景。
+
+\collapse[ANSI 颜色码速查]{
+在终端里可以用特殊的转义序列给文本上色。FileKit 的 `grep` 命令高亮匹配文本时会用到：
+
+\code[cpp]{
+// 常用颜色码
+constexpr auto RED    = "\033[31m";  // 红色——错误信息
+constexpr auto GREEN  = "\033[32m";  // 绿色——成功/匹配
+constexpr auto YELLOW = "\033[33m";  // 黄色——警告
+constexpr auto BOLD   = "\033[1m";   // 粗体
+constexpr auto RESET  = "\033[0m";   // 重置所有格式
+
+// 使用示例
+std::cout << RED << "错误!" << RESET << " 文件不存在\n";
+std::cout << GREEN << "匹配: " << RESET << "第42行\n";
+}
+
+注意：Windows 的旧版命令提示符不一定支持 ANSI 颜色码。Windows 10+ 的新终端和 PowerShell 是支持的。这也是为什么建议加 `--no-color` 选项的原因。
+}
+
+// CMake 构建：从零到一
+
+代码写好了，怎么把一堆 `.cpp` 文件变成一个可执行程序？用 **CMake**。你可以把 CMake 想象成一个"建筑图纸"——你告诉它"我要盖什么、材料在哪"，它帮你自动生成具体的建筑（编译）命令。
+
+\code[cmake]{
+cmake_minimum_required(VERSION 3.20)
+project(filekit LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)          # 使用 C++23 标准
+set(CMAKE_CXX_STANDARD_REQUIRED ON) # 如果编译器不支持 C++23，报错而非降级
+
+add_executable(filekit               # 生成名为 filekit 的可执行文件
+    src/main.cpp                     # 主源文件
+    src/commands.cpp                 # 命令实现
+    src/utils.cpp                    # 工具函数
+)
+
+target_include_directories(filekit PRIVATE include)  # 告诉编译器去 include/ 找头文件
+
+# 开启严格警告——让编译器帮你捉 bug
+target_compile_options(filekit PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wshadow -Wpedantic>
+    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+)
+}
+
+\steps{
+\step[创建项目目录]{
+在你的工作区创建 `filekit/` 目录和子目录结构：
+
+\code[bash]{
+mkdir -p filekit/{include,src,tests/test_data}
+}
+
+然后把 `CMakeLists.txt` 放在 `filekit/` 根目录。
+}
+\step[编写头文件]{
+在 `include/` 下创建 `types.h`、`commands.h`、`utils.h`，把 `enum class`、`struct` 和函数声明写进去。别忘了每个头文件开头加 `#pragma once`——防止被重复包含。
+}
+\step[实现源文件]{
+在 `src/` 下创建 `main.cpp`、`commands.cpp`、`utils.cpp`。先实现最简单的 `help` 命令——只打印用法说明。确保这个最小版本能编译运行，再逐步添加其他功能。
+}
+\step[CMake 构建]{
+在 `filekit/` 目录下执行：
+
+\code[bash]{
+cmake -B build        # 生成构建文件到 build/ 目录
+cmake --build build   # 编译！
+./build/filekit help  # 运行试试
+}
+}
+\step[逐步添加功能]{
+按这个顺序逐步实现，每加一个功能就编译测试一次：
+
+`help` → `info` → `stats` → `ls` → `grep` → `diff`
+
+由简入难。每个功能都是独立函数，互不影响。
+}
+}
+
+\collapse[CMake 进阶：生成器表达式是什么鬼？]{
+你可能注意到 `$<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>` 这段看着像天书的东西。这叫**生成器表达式**（Generator Expression），格式是 `$<条件:值>`。
+
+翻译一下：`$<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra>` 的意思是——"如果当前编译器是 GCC 或 Clang，那就加上 `-Wall -Wextra` 这些警告选项；否则啥也不加。"
+
+下一行 `$<$<CXX_COMPILER_ID:MSVC>:/W4>` 就是给 MSVC（Visual Studio 的编译器）用的。
+
+这样一份 CMakeLists.txt 就能同时兼容 Linux/macOS/Windows，不需要写 `if(WIN32)` 之类的判断。
+}
+
+// 技术要求清单
+
+做这个项目，以下 C++ 特性你**必须**用到——它们恰好覆盖了整个基础板块学过的内容：
+
+\table{
+特性 | 用在哪 | 为什么
+---
+`int main(int argc, char* argv[])` | 入口函数 | 接收命令行参数
+`enum class` | 命令类型、错误码 | 类型安全的枚举
+`struct` | FileStats、ListOptions | 打包相关数据
+`std::string` / `std::string_view` | 全局 | 安全的字符串处理
+`std::array` / `std::vector` | 数据存储 | 安全的容器
+`std::ifstream` | grep / stats / diff | 读取文件
+`std::filesystem` | info / ls | 路径操作和目录遍历
+`std::format` / `std::println` | 全局 | 现代格式化输出
+`constexpr` | 常量定义 | 编译期常量
+函数 + `const&` / `string_view` | 全局 | 高效传参
+range-based for | 全局 | 简洁的遍历循环
+`[[nodiscard]]` | 有返回值的函数 | 防止忽略返回值
+if 带初始化（C++17） | grep / 条件检查 | 限制变量作用域
+}
+
+/// 难点易错点分析
+
+// 错误一：argv 越界访问
+
+\danger{这是新手写命令行工具时的**头号杀手**：
+
+\code[cpp]{
+// ❌ 错误示范——没有检查 argc 就访问 argv
+int main(int argc, char* argv[]) {
+    std::string_view cmd = argv[1];  // 如果用户只敲了 "filekit"，这行就是越界！
+    // ...
+}
+
+// ✅ 正确做法——先检查参数数量
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::println("用法: filekit <command> [args...]");
+        return static_cast<int>(ErrorCode::InvalidArgs);
+    }
+    std::string_view cmd = argv[1];  // 现在安全了
+    // ...
+}
+}
+}
+
+// 错误二：文件忘记检查打开状态
+
+\danger{
+\code[cpp]{
+// ❌ 错误示范——打开就用，不管成没成功
+std::ifstream file("data.txt");
+std::string line;
+std::getline(file, line);  // 如果文件不存在，这里不会崩溃但读到空数据——静默错误！
+
+// ✅ 正确做法——打开后立即检查
+std::ifstream file("data.txt");
+if (!file.is_open()) {
+    std::println(stderr, "错误：无法打开文件 data.txt");
+    return;
+}
+}
+}
+
+// 错误三：路径的跨平台陷阱
+
+\warning{Windows 用 `\` 做路径分隔符，Linux/macOS 用 `/`。如果你硬编码路径分隔符，换个系统就挂了。**解决方案：用 `std::filesystem::path`**，它会自动处理平台差异。
+
+\code[cpp]{
+// ❌ 不要这样
+std::string path = "src\\main.cpp";   // 只在 Windows 上正确
+
+// ✅ 这样
+std::filesystem::path p = "src" / std::filesystem::path("main.cpp");
+// std::filesystem::path 重载了 / 运算符，自动用正确的分隔符拼接
+}
+}
+
+\quiz[choice]{
+Q: 下面这段代码有什么问题？
+\code[cpp]{
+int main(int argc, char* argv[]) {
+    if (argc < 3) return 1;
+    std::string_view file1 = argv[2];
+    std::string_view file2 = argv[3];  // ← 这行
+}
+}
+A: `std::string_view` 不能用 `char*` 初始化
+B: 当 `argc == 3` 时，`argv[3]` 是越界访问
+C: `argv[2]` 和 `argv[3]` 不能同时赋值给 `string_view`
+D: 缺少 `#include <string_view>`
+ANS: B
+EXP: `argc == 3` 表示有 3 个参数（`argv[0]`、`argv[1]`、`argv[2]`），合法下标是 0 到 2。`argv[3]` 越界了！正确的检查应该是 `argc < 4`。这是"差一错误"（off-by-one error）的经典案例——`argc` 是参数**个数**，最大合法下标是 `argc - 1`。
+}
+
+// 错误四：switch 中忘记 break 或遗漏 Unknown
+
+\warning{分发命令时如果用 `switch`，千万别忘了 `default` 分支。用户输入什么你没法控制，你的代码必须能优雅地处理"意料之外"的输入。
+
+\code[cpp]{
+switch (cmd) {
+    case Command::Info:  cmdInfo(args);  break;
+    case Command::List:  cmdList(args);  break;
+    // ... 其他命令 ...
+    case Command::Unknown:
+    default:
+        std::println(stderr, "未知命令。输入 'filekit help' 查看用法。");
+        return static_cast<int>(ErrorCode::InvalidArgs);
+}
+}
+}
+
+/// 实战作业
+
+// 🟢 基础练习：实现 stats 命令的核心逻辑
+
+下面的程序框架已经搭好了，你需要完成 `countStats()` 函数——逐行读取文件内容，统计总行数、空白行数和总字符数。`/* TODO */` 的地方就是你要写代码的位置：
+
+\run[cpp]{
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <cstdint>
+
+struct FileStats {
+    uint64_t totalLines = 0;
+    uint64_t blankLines = 0;
+    uint64_t chars = 0;
+};
+
+// TODO: 实现这个函数
+// 提示：用 std::getline 逐行读取，用 line.empty() 判断空行
+// 字符数 = 每行的 line.size() 之和（不含换行符）
+FileStats countStats(const std::string& filename) {
+    FileStats stats;
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        std::cerr << "无法打开文件: " << filename << "\n";
+        return stats;
+    }
+
+    std::string line;
+    /* TODO: 你的代码 */
+    // while (std::getline(file, line)) {
+    //     统计 totalLines, blankLines, chars
+    // }
+
+    return stats;
+}
+
+int main() {
+    // 测试用——你可以改成你自己的文件路径
+    std::cout << "请将此程序保存为文件并用真实文本文件测试！\n";
+    std::cout << "用法: ./stats <filename>\n";
+
+    // 示例输出格式：
+    std::cout << "\n--- 期望输出格式 ---\n";
+    std::cout << "总行数:   42\n";
+    std::cout << "空白行:   8\n";
+    std::cout << "总字符:   1523\n";
+
+    return 0;
+}
+}
+
+// 🟡 进阶练习：实现完整的命令分发器
+
+这道题要求你把 `parseCommand()` 和 `main()` 的命令分发逻辑完整写出来。你需要：
+1. 定义 `Command` 枚举和 `parseCommand()` 函数
+2. 在 `main()` 中检查参数、解析命令、用 `switch` 分发
+3. 每个命令的处理函数暂时只需要打印一行说明（如 "执行 info 命令..."）
+
+\collapse[🔑 参考思路]{
+1. `parseCommand()` 里用 `if` 链把每个命令字符串映射到 `Command` 枚举值
+2. `main()` 里先检查 `argc >= 2`，再调用 `parseCommand(argv[1])`
+3. 用 `switch` 分发到各个处理函数，别忘了 `default` 分支
+4. 每个 `case` 都要 `break`
+5. `return static_cast<int>(ErrorCode::...)` 设置退出码
+}
+
+/// 扩展挑战
+
+这些是可选的额外功能，做完基础项目后可以挑战：
+
+\list{
+- 添加 `--color` / `--no-color` 全局选项控制终端颜色输出
+- 实现 `filekit count <dir> --ext=.cpp,.h` 统计项目代码量
+- 支持通配符文件匹配（如 `*.cpp`）
+- 添加 `--json` 输出选项，将结果以 JSON 格式输出
+- 使用 `std::expected`（C++23）替代错误码进行错误处理
+}
+
+/// 参考资源
+
+\list{
+- C++ Reference: cppreference.com — 标准库文档
+- `std::filesystem` 文档 — 路径和目录操作
+- `std::format` 格式说明符参考 — 替代 printf/cout 的现代方式
+- ANSI 颜色码：`\033[31m` 红色、`\033[32m` 绿色、`\033[0m` 重置
+}

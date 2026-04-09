@@ -1,0 +1,223 @@
+/// 简介
+
+本项目是内存管理章节的综合实战——你将构建一个**游戏导向的自定义内存分配器系统**，包含线性分配器（帧分配器）、固定大小对象池和栈分配器三种策略，并对它们进行性能基准测试。
+
+这个项目模拟了真实游戏引擎的分层内存架构：底层预分配大块内存（Arena），上层分配器从 Arena 中获取内存并以不同策略管理。你将体验到自定义分配器比默认 `malloc`/`new` 快多少，以及如何根据使用场景选择合适的分配策略。
+
+/// 项目需求
+
+**项目名称：** GameAllocSystem — 游戏引擎分层内存分配器
+
+**核心组件：**
+
+1. **MemoryArena — 内存区域**
+
+\code[cpp]{
+class MemoryArena {
+    void* base_;
+    std::size_t totalSize_;
+    std::size_t usedSize_ = 0;
+    std::string name_;
+
+public:
+    MemoryArena(std::string_view name, std::size_t size);
+    ~MemoryArena(); // 释放底层内存
+
+    // 从 Arena 中切分一块连续区域给分配器使用
+    struct Region {
+        void* ptr;
+        std::size_t size;
+    };
+    [[nodiscard]] Region reserve(std::size_t size, std::size_t alignment = 64);
+
+    std::size_t remaining() const;
+    void printUsage() const;
+};
+}
+
+2. **LinearAllocator — 线性/帧分配器**
+
+\code[cpp]{
+class LinearAllocator {
+public:
+    LinearAllocator(void* buffer, std::size_t size);
+
+    [[nodiscard]] void* allocate(std::size_t size,
+        std::size_t alignment = alignof(std::max_align_t));
+    void reset(); // 一键释放所有分配
+
+    std::size_t used() const;
+    std::size_t remaining() const;
+};
+}
+
+3. **PoolAllocator\<T, N\> — 固定大小对象池**
+
+\code[cpp]{
+template<typename T, std::size_t N>
+class PoolAllocator {
+public:
+    struct Handle {
+        uint32_t index;
+        uint32_t generation;
+    };
+
+    PoolAllocator(void* buffer, std::size_t bufferSize);
+
+    template<typename... Args>
+    [[nodiscard]] Handle create(Args&&... args);
+    void destroy(Handle h);
+    [[nodiscard]] T* get(Handle h);
+    bool isValid(Handle h) const;
+
+    std::size_t activeCount() const;
+};
+}
+
+4. **StackAllocator — 栈分配器**
+
+\code[cpp]{
+class StackAllocator {
+public:
+    using Marker = std::size_t;
+
+    StackAllocator(void* buffer, std::size_t size);
+
+    [[nodiscard]] void* allocate(std::size_t size,
+        std::size_t alignment = alignof(std::max_align_t));
+    Marker getMarker() const;
+    void freeToMarker(Marker m);
+    void reset();
+};
+}
+
+5. **Benchmark — 性能基准测试**
+
+\code[cpp]{
+// 基准测试框架：对比自定义分配器 vs malloc/new
+struct BenchResult {
+    std::string name;
+    double totalTimeMs;
+    std::size_t allocCount;
+    double avgAllocNs; // 平均每次分配耗时（纳秒）
+};
+
+// 三个测试场景：
+// 场景1：帧分配 — 10000帧，每帧分配1000个int + reset
+// 场景2：对象池 — 创建/销毁10万个粒子对象（混合操作）
+// 场景3：栈分配 — 嵌套两层作用域，10000次迭代
+
+void runBenchmarks();
+void printReport(const std::vector<BenchResult>& results);
+}
+
+**运行流程：**
+
+\code[cpp]{
+int main() {
+    // 1. 初始化 Arena（预分配 32MB）
+    MemoryArena arena("Main", 32 * 1024 * 1024);
+
+    // 2. 从 Arena 划分区域给不同分配器
+    auto frameRegion = arena.reserve(4 * 1024 * 1024);   // 4MB 给帧分配器
+    auto poolRegion  = arena.reserve(8 * 1024 * 1024);   // 8MB 给对象池
+    auto stackRegion = arena.reserve(2 * 1024 * 1024);   // 2MB 给栈分配器
+
+    // 3. 创建分配器实例
+    LinearAllocator frameAlloc(frameRegion.ptr, frameRegion.size);
+    PoolAllocator<Particle, 50000> particlePool(poolRegion.ptr, poolRegion.size);
+    StackAllocator stackAlloc(stackRegion.ptr, stackRegion.size);
+
+    // 4. 功能验证（模拟游戏帧循环）
+    runGameSimulation(frameAlloc, particlePool, stackAlloc);
+
+    // 5. 性能基准测试
+    runBenchmarks();
+
+    // 6. 输出内存使用报告
+    arena.printUsage();
+    return 0;
+}
+}
+
+/// 技术要求
+
+\list{
+- 所有分配器从 `MemoryArena` 获取底层内存，不直接调用 malloc（Arena 本身除外）
+- 分配时手动处理**内存对齐（Memory Alignment）**，确保返回地址满足 alignment 要求
+- 对象池使用**版本化句柄（Versioned Handle）**，detect use-after-free
+- 使用 `[[nodiscard]]` 标记所有返回指针/句柄的函数
+- 使用 `<chrono>` 进行高精度计时，输出纳秒级对比结果
+- 调试模式（`#ifndef NDEBUG`）下：
+  - 分配时填充 `0xCD`（检测未初始化读取）
+  - 释放时填充 `0xDD`（检测 use-after-free）
+  - 对象池 destroy 后检测旧句柄无效
+- 编译选项建议：`-std=c++17 -O2 -Wall -Wextra`
+}
+
+/// 实现提示
+
+\steps{
+\step[Arena 与区域划分]{
+Arena 在构造时通过 `std::malloc` 申请一大块内存。`reserve()` 从中切分区域时，注意对齐到缓存行（64 字节）。返回的 `Region` 包含起始地址和大小。
+
+\code[cpp]{
+// 对齐计算
+std::size_t alignedOffset = (usedSize_ + alignment - 1) & ~(alignment - 1);
+}
+}
+\step[线性分配器]{
+最简单的分配器——维护一个 offset，每次分配向前移动。对齐用位运算处理。`reset()` 只需把 offset 归零。注意处理 `aligned + size > capacity` 的溢出情况。
+}
+\step[对象池]{
+用联合体（union）实现侵入式空闲链表。构造时将所有槽位串成链表。分配 = 从链表头取一个。释放 = 放回链表头 + 版本号递增。`get(Handle)` 时检查 index 范围、alive 状态和版本匹配。
+}
+\step[栈分配器]{
+在线性分配器基础上增加 Marker 机制。`getMarker()` 返回当前 offset，`freeToMarker()` 把 offset 回退到指定位置。适合嵌套作用域。
+}
+\step[基准测试]{
+每个场景循环执行大量次数。用 `std::chrono::high_resolution_clock` 测量总耗时。同时用 `new`/`delete` 执行相同操作作为对照组。输出表格化对比结果。
+
+\code[cpp]{
+auto start = std::chrono::high_resolution_clock::now();
+// ... 被测试的分配操作 ...
+auto end = std::chrono::high_resolution_clock::now();
+double ms = std::chrono::duration<double, std::milli>(end - start).count();
+}
+}
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+Arena + 区域划分 | 15分 | 正确分配/释放大块内存，对齐处理，边界检查
+线性分配器 | 20分 | allocate 对齐正确，reset 功能正常，O(1) 复杂度
+对象池 | 25分 | 空闲链表正确，版本化句柄有效检测 use-after-free
+栈分配器 | 15分 | Marker 机制正确，嵌套释放验证通过
+基准测试 | 15分 | 三个场景覆盖，对照组完整，结果格式化输出
+代码质量 | 10分 | 现代 C++ 特性（`[[nodiscard]]`、constexpr 等），调试填充
+}
+
+/// 扩展挑战
+
+\list{
+- **PMR 适配：** 将 LinearAllocator 包装为 `std::pmr::memory_resource`，让 `pmr::vector` 可以使用它
+- **线程安全对象池：** 用 `std::mutex` 或原子操作让 PoolAllocator 支持多线程并发分配
+- **内存可视化：** 用终端 ASCII 艺术输出内存使用热图，直观展示各分配器的内存占用
+- **泄漏检测器：** 在 Arena 析构时检查所有分配器是否已经 reset/释放完毕，报告未释放的字节数
+- **对比 jemalloc / mimalloc：** 编译链接第三方分配器，将其纳入基准测试对比
+}
+
+/// 参考资源
+
+\list{
+- 本章前置知识：`05-memory/stack-heap.txt`（栈堆基础）、`05-memory/new-delete.txt`（new/delete 机制）
+- 分配器原理：`05-memory/allocators.txt`（Allocator 接口与 PMR）
+- 内存池详解：`05-memory/memory-pool.txt`（Free List Pool、Object Pool）
+- 对齐基础：`05-memory/alignment.txt`（alignas、alignof）
+- cppreference: `std::pmr::memory_resource`（https://en.cppreference.com/w/cpp/memory/memory_resource）
+- Game Engine Architecture (Jason Gregory) — Chapter 5: Engine Support Systems / Memory Management
+- CppCon 2017: Pablo Halpern "Allocators: The Good Parts"
+}

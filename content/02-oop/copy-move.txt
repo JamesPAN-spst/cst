@@ -1,0 +1,699 @@
+/// 简介
+
+上一节学了构造函数与析构函数，知道了对象的"生"与"死"。但现在有新问题——当你把一个游戏角色塞进 `std::vector`，或者从函数返回一个大型纹理缓冲区时，对象会被**复制**。如果你的类里有一个 10 万像素的纹理数组，每次拷贝都老老实实复制全部数据？这也太贵了！
+
+**拷贝语义（Copy Semantics）** 决定对象如何被复制；**移动语义（Move Semantics）** 是 C++11 的性能大杀器——当源对象即将销毁时，不复制数据，直接"搬家"。就像搬家公司比复印店快一万倍。
+
+理解拷贝与移动，是写出**正确且高效** C++ 类的关键。本节从"为什么要自己写拷贝"讲到 Rule of Five/Zero，再到编译器的黑科技——**拷贝消除（Copy Elision）**。
+
+/// 知识点列表
+
+\list{
+- 拷贝构造函数（Copy Constructor）与拷贝赋值运算符（Copy Assignment Operator）
+- 深拷贝（Deep Copy）vs 浅拷贝（Shallow Copy）——内存图解
+- 移动构造函数（Move Constructor）与移动赋值运算符（Move Assignment Operator）
+- std::move 的本质——仅做类型转换
+- Rule of Five / Rule of Zero
+- copy-and-swap 惯用法
+- noexcept 对移动的重要性
+- 拷贝消除（Copy Elision）/ RVO / NRVO
+- C++17 强制拷贝消除（Mandatory Copy Elision）
+}
+
+/// 知识点详解
+
+// 拷贝构造函数与拷贝赋值运算符
+
+先回顾：当你写 `Sprite b = a;` 时，编译器调用**拷贝构造函数（Copy Constructor）**创建 `b`。当你写 `b = a;`（`b` 已存在）时，调用的是**拷贝赋值运算符（Copy Assignment Operator）**。
+
+\code[cpp]{
+class Sprite {
+    std::string name;
+    int hp;
+public:
+    Sprite(std::string n, int h) : name(std::move(n)), hp(h) {}
+
+    // 拷贝构造：用 const 引用接收源对象，创建新对象
+    Sprite(const Sprite& other) : name(other.name), hp(other.hp) {
+        std::cout << "拷贝构造: " << name << "\n";
+    }
+
+    // 拷贝赋值：用 const 引用接收源，修改已有对象
+    Sprite& operator=(const Sprite& other) {
+        std::cout << "拷贝赋值: " << other.name << "\n";
+        name = other.name;
+        hp = other.hp;
+        return *this;   // ← 返回自身引用，支持连续赋值 a = b = c
+    }
+};
+}
+
+如果你不写这两个函数，编译器会**自动生成默认版本**——对每个成员执行拷贝。对于 `std::string`、`int` 这类类型，默认版本完全够用。那什么时候需要自己写？答案是：**当类管理裸资源（Raw Resource）时**。
+
+// 深拷贝 vs 浅拷贝
+
+想象你有个 `TextureBuffer` 类，用 `new int[]` 在**堆（Heap）**上分配纹理数据。编译器默认拷贝只复制指针值——两个对象的 `data` 指向**同一块内存**！这就是**浅拷贝（Shallow Copy）**。
+
+\diagram[memory]{
+stack:
+  [0x7ff0] a.size = 4
+  [0x7fe8] a.data = 0x5500
+  [0x7fe0] b.size = 4
+  [0x7fd8] b.data = 0x5500
+heap:
+  [0x5500] {10, 20, 30, 40}
+arrow: a.data -> {10, 20, 30, 40}
+arrow: b.data -> {10, 20, 30, 40}
+}
+
+两个对象都认为自己拥有 `0x5500` 处的数据。`a` 析构时 `delete[]` 释放内存，`b` 析构再次 `delete[]`——**双重释放（Double Free）**，程序崩溃！
+
+**深拷贝（Deep Copy）**：分配全新内存，逐字节复制。两个对象各自独立，互不干扰。
+
+\diagram[memory]{
+stack:
+  [0x7ff0] a.size = 4
+  [0x7fe8] a.data = 0x5500
+  [0x7fe0] b.size = 4
+  [0x7fd8] b.data = 0x6600
+heap:
+  [0x5500] {10, 20, 30, 40}
+  [0x6600] {10, 20, 30, 40}
+arrow: a.data -> 0x5500
+arrow: b.data -> 0x6600
+}
+
+下面用一个完整示例展示深拷贝的实现：
+
+\run[cpp]{
+#include <iostream>
+#include <algorithm>
+#include <cstddef>
+
+class TextureBuffer {
+    std::size_t size;
+    int* data;
+public:
+    TextureBuffer(std::size_t n) : size(n), data(new int[n]{}) {
+        std::cout << "构造: 分配 " << n << " 个 int\n";
+    }
+    ~TextureBuffer() {
+        std::cout << "析构: 释放 data @" << data << "\n";
+        delete[] data;
+    }
+
+    // ✅ 深拷贝构造：分配新内存，复制内容
+    TextureBuffer(const TextureBuffer& other)
+        : size(other.size), data(new int[other.size])
+    {
+        std::copy(other.data, other.data + size, data);
+        std::cout << "深拷贝: " << size << " 个 int\n";
+    }
+
+    // ✅ 深拷贝赋值
+    TextureBuffer& operator=(const TextureBuffer& other) {
+        if (this == &other) return *this;  // 自赋值检查
+        delete[] data;                     // 释放旧内存
+        size = other.size;
+        data = new int[size];
+        std::copy(other.data, other.data + size, data);
+        std::cout << "深拷贝赋值: " << size << " 个 int\n";
+        return *this;
+    }
+
+    void set(std::size_t i, int val) { data[i] = val; }
+    int  get(std::size_t i) const { return data[i]; }
+};
+
+int main() {
+    TextureBuffer a(4);
+    a.set(0, 42);
+
+    TextureBuffer b = a;            // 调用深拷贝构造
+    std::cout << "b[0] = " << b.get(0) << "\n";
+
+    a.set(0, 99);                   // 修改 a 不影响 b
+    std::cout << "a[0] = " << a.get(0) << ", b[0] = " << b.get(0) << "\n";
+    return 0;
+}
+}
+
+\warning{**上面的拷贝赋值有隐患！** 如果 `new int[size]` 抛出异常，此时旧 `data` 已经 `delete`，对象处于破损状态。后面的 **copy-and-swap 惯用法**会彻底解决这个问题。}
+
+// 移动构造函数与移动赋值运算符
+
+深拷贝是正确的，但有时是浪费的。看这个场景：
+
+\code[cpp]{
+TextureBuffer createHugeTexture() {
+    TextureBuffer buf(1000000);  // 100 万个 int
+    return buf;                  // 返回时拷贝 100 万个 int？太贵了！
+}
+TextureBuffer tex = createHugeTexture();
+}
+
+函数返回时 `buf` 马上要销毁，数据复制完就丢弃——能不能直接"搬"给 `tex`？这就是**移动语义（Move Semantics）**的动机。
+
+**移动构造函数（Move Constructor）** 接受一个**右值引用（Rvalue Reference，`&&`）**——代表"我是一个即将过期的临时值，你可以偷走我的资源"。
+
+\code[cpp]{
+class TextureBuffer {
+    // ... 成员同上 ...
+
+    // 移动构造：窃取资源，零开销
+    TextureBuffer(TextureBuffer&& other) noexcept
+        : size(other.size), data(other.data)   // ← 直接拿走指针
+    {
+        other.size = 0;
+        other.data = nullptr;  // ← 源对象置空，防止析构时释放
+    }
+
+    // 移动赋值
+    TextureBuffer& operator=(TextureBuffer&& other) noexcept {
+        if (this != &other) {
+            delete[] data;         // 释放自己的旧资源
+            size = other.size;
+            data = other.data;
+            other.size = 0;
+            other.data = nullptr;
+        }
+        return *this;
+    }
+};
+}
+
+移动操作后，源对象变成"空壳"——`delete[] nullptr` 安全无操作。100 万数据的转移？一个指针赋值，O(1)。
+
+\run[cpp]{
+#include <iostream>
+#include <algorithm>
+#include <cstddef>
+#include <utility>
+
+class TextureBuffer {
+    std::size_t size;
+    int* data;
+public:
+    TextureBuffer(std::size_t n) : size(n), data(new int[n]{}) {
+        std::cout << "[构造] 分配 " << n << " 个 int\n";
+    }
+    ~TextureBuffer() {
+        std::cout << "[析构] data=" << data << "\n";
+        delete[] data;
+    }
+    // 深拷贝构造
+    TextureBuffer(const TextureBuffer& other)
+        : size(other.size), data(new int[other.size]) {
+        std::copy(other.data, other.data + size, data);
+        std::cout << "[拷贝构造] 复制了 " << size << " 个 int\n";
+    }
+    // 移动构造
+    TextureBuffer(TextureBuffer&& other) noexcept
+        : size(other.size), data(other.data) {
+        other.size = 0;
+        other.data = nullptr;
+        std::cout << "[移动构造] 零开销搬家！\n";
+    }
+    // 移动赋值
+    TextureBuffer& operator=(TextureBuffer&& other) noexcept {
+        if (this != &other) {
+            delete[] data;
+            size = other.size;
+            data = other.data;
+            other.size = 0;
+            other.data = nullptr;
+            std::cout << "[移动赋值] 零开销搬家！\n";
+        }
+        return *this;
+    }
+    std::size_t getSize() const { return size; }
+};
+
+int main() {
+    TextureBuffer a(100);
+    std::cout << "--- 移动 a 到 b ---\n";
+    TextureBuffer b = std::move(a);      // 移动构造
+    std::cout << "a.size=" << a.getSize()
+              << ", b.size=" << b.getSize() << "\n";
+    return 0;
+}
+}
+
+// std::move 的本质
+
+很多初学者以为 `std::move` 做了什么神奇操作。真相是——**`std::move` 不移动任何东西！** 它只是把**左值（Lvalue）**转换为**右值引用（Rvalue Reference）**，本质是 `static_cast<T&&>`。
+
+下面用类比理解：`std::move(a)` 就像给 `a` 贴一张"可回收"标签——告诉后续构造/赋值函数可以拆零件用。但贴标签本身不拆东西，真正的资源转移发生在移动构造/赋值执行时。
+
+\code[cpp]{
+// std::move 的简化实现
+template<typename T>
+std::remove_reference_t<T>&& move(T&& t) noexcept {
+    return static_cast<std::remove_reference_t<T>&&>(t);
+}
+// 就一行 static_cast，没有任何数据操作！
+}
+
+\danger{**使用 `std::move` 后的对象不要再读取其值！** 标准只保证对象处于"有效但未指定（valid but unspecified）"的状态——可以析构、可以赋新值，但具体值不确定。}
+
+// Rule of Five / Rule of Zero
+
+如果你的类需要自定义**析构函数**，那几乎一定也需要自定义其余四个：**拷贝构造、拷贝赋值、移动构造、移动赋值**。这就是**五之法则（Rule of Five）**——你管理了资源，编译器默认版本不知道如何正确处理。
+
+\tabs{
+\tab[Rule of Five]{
+\code[cpp]{
+class TextureBuffer {
+    std::size_t size;
+    int* data;
+public:
+    TextureBuffer(std::size_t n);           // 构造函数
+    ~TextureBuffer();                       // 1. 析构
+    TextureBuffer(const TextureBuffer&);    // 2. 拷贝构造
+    TextureBuffer& operator=(const TextureBuffer&);  // 3. 拷贝赋值
+    TextureBuffer(TextureBuffer&&) noexcept;         // 4. 移动构造
+    TextureBuffer& operator=(TextureBuffer&&) noexcept; // 5. 移动赋值
+};
+// 需要手动管理裸指针，5 个全得写！
+}
+}
+\tab[Rule of Zero]{
+\code[cpp]{
+class GameEntity {
+    std::string name;                      // string 管自己的内存
+    std::vector<int> stats;                // vector 管自己的内存
+    std::unique_ptr<Weapon> weapon;        // unique_ptr 管指针
+    // 不需要写任何析构/拷贝/移动！
+    // 编译器自动生成的默认版本全部正确 ✅
+};
+// 推荐！让 RAII 包装器替你管理资源
+}
+}
+}
+
+\note{**零之法则（Rule of Zero）是现代 C++ 的黄金法则。** 只在你确实需要自定义资源管理时（实现智能指针、内存池等底层设施）才使用 Rule of Five。业务代码尽量让每个成员自己管好自己。}
+
+// copy-and-swap 惯用法
+
+前面提到直接写拷贝赋值有**异常安全（Exception Safety）**隐患。**copy-and-swap 惯用法**三步解决：
+
+\steps{
+\step[第一步：写一个 swap 成员函数]{
+交换两个对象的每个成员，用 `std::swap`，本身不会抛异常。
+
+\code[cpp]{
+void swap(TextureBuffer& other) noexcept {
+    std::swap(size, other.size);
+    std::swap(data, other.data);
+}
+}
+}
+\step[第二步：拷贝赋值按值传参]{
+参数按值传递——进入函数时拷贝构造已完成。如果分配内存时抛异常，`this` 完全不受影响（**强异常安全保证，Strong Exception Safety**）。
+
+\code[cpp]{
+TextureBuffer& operator=(TextureBuffer other) {  // ← 注意：传值！
+    swap(other);      // 交换 this 和副本
+    return *this;
+}   // other 析构，旧数据被释放
+}
+}
+\step[第三步：自动兼容移动赋值]{
+当参数是右值时，"按值传参"触发的是**移动构造**而非拷贝构造——一个函数同时搞定拷贝赋值和移动赋值！
+
+\code[cpp]{
+TextureBuffer a(100), b(200);
+a = b;              // b 被拷贝构造到 other → swap → 旧 a 数据随 other 析构
+a = std::move(b);   // b 被移动构造到 other → swap → 旧 a 数据随 other 析构
+}
+}
+}
+
+\tip{**copy-and-swap 是编写赋值运算符的最安全模式。** 代价是一次额外的拷贝/移动构造，但获得了强异常安全保证和极简的代码。在游戏引擎的资源管理类中广泛使用。}
+
+// noexcept 对移动的重要性
+
+标准库容器（如 `std::vector`）扩容时需要搬运旧元素。移动构造标记 `noexcept` 时用**移动**（O(1)/元素），没标时退而用**拷贝**（O(n)/元素）。
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+
+struct WithNoexcept {
+    int id;
+    WithNoexcept(int i) : id(i) {}
+    WithNoexcept(const WithNoexcept& o) : id(o.id) { std::cout << "  [拷贝] " << id << "\n"; }
+    WithNoexcept(WithNoexcept&& o) noexcept : id(o.id) { std::cout << "  [移动] " << id << "\n"; }
+    WithNoexcept& operator=(WithNoexcept&&) noexcept = default;
+};
+
+struct WithoutNoexcept {
+    int id;
+    WithoutNoexcept(int i) : id(i) {}
+    WithoutNoexcept(const WithoutNoexcept& o) : id(o.id) { std::cout << "  [拷贝] " << id << "\n"; }
+    WithoutNoexcept(WithoutNoexcept&& o) : id(o.id) { std::cout << "  [移动] " << id << "\n"; }
+    WithoutNoexcept& operator=(WithoutNoexcept&&) = default;
+};
+
+int main() {
+    std::cout << "=== 带 noexcept ===\n";
+    std::vector<WithNoexcept> v1;
+    v1.reserve(2);
+    v1.emplace_back(1); v1.emplace_back(2);
+    std::cout << "扩容:\n";
+    v1.emplace_back(3);      // 旧元素被移动 ✅
+
+    std::cout << "\n=== 无 noexcept ===\n";
+    std::vector<WithoutNoexcept> v2;
+    v2.reserve(2);
+    v2.emplace_back(1); v2.emplace_back(2);
+    std::cout << "扩容:\n";
+    v2.emplace_back(3);      // 旧元素被拷贝 😱
+    return 0;
+}
+}
+
+\danger{**忘记 `noexcept` = 性能白白损失！** 移动构造和移动赋值只要不分配新资源、不调用可能抛异常的函数，就应该标记 `noexcept`。这是最容易忽略的性能优化点之一。}
+
+// 拷贝消除（Copy Elision）/ RVO / NRVO
+
+编译器比你想的更聪明。很多场景下会直接在目标位置构造对象，跳过拷贝/移动：
+
+\list{
+- **RVO（Return Value Optimization，返回值优化）**：函数返回一个临时对象时，编译器直接在调用方的内存中构造它。
+- **NRVO（Named RVO，具名返回值优化）**：函数返回一个有名字的局部变量时同理（但不保证）。
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cstddef>
+
+class BigObject {
+public:
+    BigObject() { std::cout << "构造\n"; }
+    BigObject(const BigObject&) { std::cout << "拷贝构造\n"; }
+    BigObject(BigObject&&) noexcept { std::cout << "移动构造\n"; }
+};
+
+BigObject createRVO() {
+    return BigObject();     // RVO：返回临时对象
+}
+
+BigObject createNRVO() {
+    BigObject obj;          // NRVO：返回具名局部变量
+    return obj;
+}
+
+int main() {
+    std::cout << "--- RVO ---\n";
+    BigObject a = createRVO();     // 可能只看到一次"构造"
+    std::cout << "--- NRVO ---\n";
+    BigObject b = createNRVO();    // 也可能只看到一次"构造"
+    return 0;
+}
+}
+
+\note{在 C++11/14 中，RVO/NRVO 是**可选优化**——几乎所有编译器都会做，但语言标准并不强制。}
+
+// C++17 强制拷贝消除
+
+C++17 做了重大改变：**特定场景下拷贝消除是强制的（Mandatory Copy Elision）**。编译器**必须**省略拷贝/移动，即使构造函数有副作用。
+
+\code[cpp]{
+// C++17 之后，以下场景保证无拷贝/无移动：
+BigObject a = BigObject();          // 直接构造，不调用拷贝/移动
+BigObject b = createRVO();          // 函数返回 prvalue → 直接构造
+
+// 这意味着——即使拷贝和移动构造函数被 delete 了，也能编译：
+class NoCopyNoMove {
+public:
+    NoCopyNoMove() = default;
+    NoCopyNoMove(const NoCopyNoMove&) = delete;
+    NoCopyNoMove(NoCopyNoMove&&) = delete;
+};
+NoCopyNoMove make() { return NoCopyNoMove(); }  // C++17 OK!
+}
+
+\collapse[🤔 NRVO 是否也被 C++17 强制？]{
+**不是。** C++17 强制拷贝消除只适用于**纯右值（prvalue）**的场景，如 `return T();`。对于返回具名局部变量（NRVO），仍然是编译器的可选优化。但实际上几乎所有主流编译器都会做 NRVO，所以实践中差异不大。
+}
+
+/// 新版特性（C++17/20/23）
+
+// C++17
+
+\list{
+- **强制拷贝消除**：`return T();` 保证零开销，即使拷贝/移动构造被删除。
+- **结构化绑定（Structured Bindings）** 与移动语义配合更自然。
+}
+
+// C++20/23
+
+\list{
+- **概念（Concepts）** 约束模板参数是否可移动：`std::movable`、`std::copyable`（C++20）。
+- **`std::move_only_function`**（C++23）：只可移动的函数包装器，替代不需要拷贝的 `std::function`。
+- **推导 this（Deducing this，C++23）**：简化同时需要 `const&` 和 `&&` 重载的场景。
+}
+
+\compare{
+old: C++11/14 中工厂函数返回大对象需要依赖编译器的 RVO 优化（不保证）。连智能指针和不可拷贝类型的工厂函数都需要额外小心。
+
+new: C++17 之后 `return T(args...);` 保证零开销——大胆写值语义代码！`auto widget = makeWidget();` 既清晰又高效，不再需要输出参数或指针来"避免拷贝"。
+}
+
+/// 工程实践
+
+// 游戏开发中的最佳实践
+
+\list{
+- **资源句柄（纹理、音频、Mesh）遵循 Rule of Five**，移动操作转移底层句柄，拷贝深拷贝或 `= delete`。
+- **组件/实体类遵循 Rule of Zero**，只用标准库容器和智能指针做成员。
+- **移动操作始终标记 `noexcept`**，否则 `std::vector` 扩容回退到拷贝。
+- **移动后不要读源对象的值**，只允许析构或赋新值。
+- **优先按值返回**——C++17 保证拷贝消除，不必用输出参数"优化"。
+- **`std::move` 只用在确实不再需要的对象上**——滥用会阻止拷贝消除。
+}
+
+\warning{**常见反模式：`return std::move(localVar);`** 反而**阻止** NRVO！编译器看到 `return localVar;` 可做就地构造，`std::move` 把它变成右值引用表达式，破坏消除条件。直接 `return localVar;` 就好。}
+
+// 什么时候禁止拷贝？
+
+有些对象天然不应被拷贝——持有唯一 GPU 纹理句柄的对象、线程、互斥锁。用 `= delete` 明确禁止：
+
+\code[cpp]{
+class Texture {
+    unsigned int glHandle;  // OpenGL 纹理句柄
+public:
+    Texture(const Texture&) = delete;             // 禁止拷贝
+    Texture& operator=(const Texture&) = delete;  // 禁止拷贝赋值
+    Texture(Texture&& other) noexcept             // 允许移动
+        : glHandle(other.glHandle) { other.glHandle = 0; }
+    Texture& operator=(Texture&& other) noexcept {
+        if (this != &other) {
+            glDeleteTextures(1, &glHandle);       // 释放旧纹理
+            glHandle = other.glHandle;
+            other.glHandle = 0;
+        }
+        return *this;
+    }
+    ~Texture() { if (glHandle) glDeleteTextures(1, &glHandle); }
+};
+}
+
+/// 难点易错点分析
+
+\danger{**浅拷贝导致双重释放：** 如果类持有裸指针却不自定义拷贝操作，编译器默认浅拷贝。两个对象指向同一块内存，先析构的释放内存，后析构的再释放 → 崩溃。**解法：写深拷贝，或优先用 `std::vector` / `std::unique_ptr` 替代裸指针。**}
+
+\danger{**编译器何时不生成特殊函数：** 一旦你声明了任何一个拷贝/移动操作或析构函数，编译器可能**不再**自动生成其余的。规则复杂，最安全的做法：要么 5 个全写（Rule of Five），要么一个都别写（Rule of Zero），要么显式 `= default`。}
+
+\danger{**移动 `const` 对象实际上是拷贝：**}
+
+\code[cpp]{
+const std::string s = "hello";
+auto t = std::move(s);  // s 是 const → move 产生 const string&&
+// 匹配到拷贝构造（接受 const&），而非移动构造（接受非 const&&）
+// 完全没有性能提升！静默回退到拷贝。
+}
+
+\danger{**`return std::move(x)` 是反模式：** 对于返回局部变量，直接 `return x;` 即可。加 `std::move` 反而阻止 NRVO，多出一次移动操作。}
+
+\quiz[tf|判断]{
+Q: `std::move(obj)` 会立刻将 `obj` 的资源转移走。
+ANS: F
+EXP: `std::move` 只是将 `obj` 转换为右值引用（类型变成 `T&&`），本身不做任何数据操作。真正的资源转移发生在移动构造函数或移动赋值运算符被调用时。
+}
+
+\quiz[choice|单选]{
+Q: 以下哪种情况 `std::vector` 扩容时会使用拷贝而非移动？
+A: 元素类型的移动构造函数标记了 `noexcept`
+B: 元素类型没有移动构造函数
+C: 元素类型的移动构造函数**没有**标记 `noexcept`
+D: B 和 C 都会导致回退到拷贝
+ANS: D
+EXP: 没有移动构造函数时只能拷贝；有移动构造但未标记 `noexcept` 时，`std::vector` 为了强异常安全保证也会选择拷贝。所以 B 和 C 都对。
+}
+
+\quiz[choice|单选]{
+Q: 以下 C++17 代码能否编译通过？`NoCopy make() { return NoCopy(); }` `NoCopy x = make();` 其中 `NoCopy` 删除了拷贝和移动构造函数。
+A: 编译失败——需要拷贝或移动构造函数
+B: 编译成功——C++17 强制拷贝消除，不需要拷贝/移动
+C: 取决于编译器优化级别
+D: 运行时错误
+ANS: B
+EXP: C++17 的强制拷贝消除（mandatory copy elision）保证 `return T();` 直接在调用方构造，不需要可访问的拷贝/移动构造函数。
+}
+
+/// 实战作业
+
+// 🟢 基础题：完善 GameItem 的拷贝与移动
+
+实现 `GameItem` 的深拷贝构造、移动构造（`noexcept`）和 copy-and-swap 赋值，确保放入 `vector` 扩容时触发移动而非拷贝。
+
+\run[cpp]{
+#include <iostream>
+#include <algorithm>
+#include <vector>
+#include <cstddef>
+#include <utility>
+#include <cstring>
+
+class GameItem {
+    char* name;
+    int   damage;
+public:
+    GameItem(const char* n, int d) : damage(d) {
+        std::size_t len = std::strlen(n) + 1;
+        name = new char[len];
+        std::copy(n, n + len, name);
+    }
+    ~GameItem() { delete[] name; }
+
+    // TODO: 实现深拷贝构造函数
+    /* TODO: 你的代码 */
+
+    // TODO: 实现移动构造函数（标记 noexcept）
+    /* TODO: 你的代码 */
+
+    // TODO: 实现 copy-and-swap 赋值运算符（按值传参）
+    /* TODO: 你的代码 */
+
+    void print() const {
+        if (name) std::cout << name << " (伤害:" << damage << ")\n";
+        else std::cout << "[已移动]\n";
+    }
+};
+
+int main() {
+    GameItem sword("Excalibur", 50);
+    GameItem copy = sword;          // 应调用深拷贝构造
+    copy.print();
+
+    std::vector<GameItem> inventory;
+    inventory.reserve(2);
+    inventory.emplace_back("Sword", 30);
+    inventory.emplace_back("Shield", 5);
+    std::cout << "--- 扩容 ---\n";
+    inventory.emplace_back("Bow", 25);  // 应触发移动
+
+    for (auto& item : inventory) item.print();
+    return 0;
+}
+}
+
+// 🟡 进阶题 1：ResourceHandle 模板 — Rule of Five 完整实现
+
+实现 `ResourceHandle<T>` 类模板（简化版 `unique_ptr`，支持深拷贝）。要求完整 Rule of Five + copy-and-swap + `noexcept` 移动。
+
+\run[cpp]{
+#include <iostream>
+#include <utility>
+#include <vector>
+
+template<typename T>
+class ResourceHandle {
+    T* ptr;
+public:
+    explicit ResourceHandle(const T& val) : ptr(new T(val)) {}
+
+    // TODO: 析构函数
+    // TODO: 拷贝构造函数（深拷贝）
+    // TODO: 移动构造函数（noexcept）
+    // TODO: 赋值运算符（copy-and-swap，同时处理拷贝和移动）
+
+    T& get() { return *ptr; }
+    const T& get() const { return *ptr; }
+
+    void swap(ResourceHandle& other) noexcept {
+        std::swap(ptr, other.ptr);
+    }
+};
+
+int main() {
+    ResourceHandle<int> a(42);
+    ResourceHandle<int> b = a;             // 深拷贝
+    std::cout << "a=" << a.get() << " b=" << b.get() << "\n";
+
+    b.get() = 100;
+    std::cout << "修改 b 后: a=" << a.get() << " b=" << b.get() << "\n";
+
+    ResourceHandle<int> c = std::move(a);  // 移动
+    std::cout << "c=" << c.get() << "\n";
+
+    // 放入 vector 测试扩容
+    std::vector<ResourceHandle<int>> vec;
+    vec.reserve(2);
+    vec.push_back(ResourceHandle<int>(1));
+    vec.push_back(ResourceHandle<int>(2));
+    std::cout << "扩容前: " << vec.size() << " 个元素\n";
+    vec.push_back(ResourceHandle<int>(3));  // 触发扩容
+    std::cout << "扩容后: ";
+    for (auto& h : vec) std::cout << h.get() << " ";
+    std::cout << "\n";
+    return 0;
+}
+}
+
+// 🟡 进阶题 2：用 Rule of Zero 重构
+
+将上面的 `ResourceHandle<T>` 改为内部使用 `std::unique_ptr<T>` 存储，不写任何特殊成员函数。**禁止**拷贝（因为 `unique_ptr` 不可拷贝），只支持移动。验证它在 `std::vector` 扩容时能正确移动。
+
+\collapse[参考思路]{
+\code[cpp]{
+template<typename T>
+class ResourceHandle {
+    std::unique_ptr<T> ptr;
+public:
+    explicit ResourceHandle(const T& val)
+        : ptr(std::make_unique<T>(val)) {}
+    // 不写析构、不写拷贝、不写移动——Rule of Zero！
+    // unique_ptr 自动提供移动语义，自动禁止拷贝
+    T& get() { return *ptr; }
+    const T& get() const { return *ptr; }
+};
+}
+}
+
+// 🔴 挑战题：实现游戏对象池的移动优化
+
+设计一个 `ObjectPool<T>` 类，预分配 N 个 `T` 对象，提供 `acquire()` 和 `release()` 接口：
+
+\list{
+- `acquire()` 返回 `std::optional<T>`（C++17），池空返回 `std::nullopt`
+- `release(T&&)` 回收对象，所有操作保持强异常安全
+- 用游戏子弹（Bullet）场景测试反复 acquire/release
+}
+
+\collapse[参考思路]{
+内部用 `std::vector<T>` 作空闲列表。`acquire()` 从尾部 `std::move` 出对象并 `pop_back`；`release()` 用 `push_back(std::move(obj))` 归还。`T` 的移动构造必须 `noexcept`。
+
+\code[cpp]{
+template<typename T>
+class ObjectPool {
+    std::vector<T> pool;
+public:
+    explicit ObjectPool(std::size_t n) { pool.reserve(n); }
+    // acquire: 从池尾移动出一个对象
+    // release: 把对象移动回池中
+};
+}
+}

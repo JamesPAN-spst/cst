@@ -1,0 +1,442 @@
+/// 简介
+
+游戏引擎不是一个程序，而是一个 **高度集成的软件系统**——它协调渲染、物理、音频、输入、资源管理、脚本等数十个子系统，让它们在每帧 16ms 内协同工作。好的引擎架构决定了项目的可维护性、可扩展性和团队协作效率。
+
+本章从分层架构设计讲起，覆盖游戏循环、场景管理、资源管线、序列化、事件系统、热重载机制，最后分析 Unreal/Unity/Godot 等商业引擎的架构选型。这些是从"写游戏"跨越到"写引擎"的关键知识。
+
+/// 知识点列表
+
+\list{
+- 游戏引擎分层架构
+- 游戏循环（Game Loop）与帧率控制
+- 场景管理（Scene Graph / Scene Manager）
+- 资源管理系统（Asset Pipeline）
+- 序列化与反序列化
+- 事件系统设计
+- 热重载（Hot Reload）概念
+- 商业引擎架构分析（Unreal, Unity, Godot）
+}
+
+/// 知识点详解
+
+// 游戏引擎分层架构
+
+\diagram[tree]{
+root: 游戏引擎架构(自下而上)
+  L: 平台层(Platform)
+    L: 窗口/输入/文件系统/线程
+  R: 核心层(Core)
+    L: 数学库/内存管理/日志/事件/容器
+    R: 运行时层(Runtime)
+      L: 资源层(Asset)
+      R: 功能层(Feature)
+        L: 渲染/物理/音频/脚本
+        R: 场景层(Scene)
+          L: 场景图/ECS/游戏对象
+}
+
+\code[cpp]{
+// 依赖原则：上层依赖下层，下层不知道上层的存在
+// 平台层 ← 核心层 ← 资源层 ← 渲染/物理/音频 ← 场景层 ← 游戏逻辑
+
+// 子系统接口
+class ISubsystem {
+public:
+    virtual ~ISubsystem() = default;
+    virtual void init() = 0;
+    virtual void update(float dt) = 0;
+    virtual void shutdown() = 0;
+    virtual const char* name() const = 0;
+};
+}
+
+\code[cpp]{
+class Engine {
+    struct SubsystemEntry {
+        std::unique_ptr<ISubsystem> instance;
+        int priority;  // 更新优先级（越小越先更新）
+    };
+    std::vector<SubsystemEntry> subsystems;
+
+public:
+    template<typename T, typename... Args>
+    T& add(int priority, Args&&... args) {
+        auto sys = std::make_unique<T>(std::forward<Args>(args)...);
+        T& ref = *sys;
+        subsystems.push_back({std::move(sys), priority});
+        std::ranges::sort(subsystems, {}, &SubsystemEntry::priority);
+        return ref;
+    }
+
+    void init()   { for (auto& s : subsystems) s.instance->init(); }
+    void update(float dt) { for (auto& s : subsystems) s.instance->update(dt); }
+    void shutdown() {
+        // 逆序关闭——后初始化的先销毁
+        for (auto it = subsystems.rbegin(); it != subsystems.rend(); ++it)
+            it->instance->shutdown();
+    }
+};
+}
+
+\danger{**子系统的初始化和关闭顺序必须正确。** 渲染器依赖窗口系统，物理依赖场景——如果关闭顺序混乱 → 访问已销毁的子系统 → 崩溃。初始化按依赖顺序，关闭严格逆序。在 `shutdown()` 中加日志标记每步。}
+
+// 游戏循环与帧率控制
+
+\code[cpp]{
+// 固定时间步长 + 渲染插值——处理物理与渲染帧率解耦
+void Engine::run() {
+    const float fixedDt = 1.0f / 60.0f;
+    float accumulator = 0.0f;
+    auto prevTime = Clock::now();
+
+    while (running) {
+        auto now = Clock::now();
+        float frameTime = seconds(now - prevTime);
+        prevTime = now;
+        // 防止死亡螺旋：限制单帧最大步进
+        frameTime = std::min(frameTime, 0.25f);
+        accumulator += frameTime;
+
+        // 输入处理（每帧一次）
+        inputSystem.poll();
+
+        // 物理 / 逻辑按固定步长推进
+        while (accumulator >= fixedDt) {
+            physicsWorld.step(fixedDt);
+            scriptSystem.update(fixedDt);
+            accumulator -= fixedDt;
+        }
+
+        // 渲染插值：alpha = accumulator / fixedDt
+        float alpha = accumulator / fixedDt;
+        renderer.draw(alpha);  // 在上帧位置和当前位置之间插值
+    }
+}
+}
+
+\tip{**死亡螺旋（Spiral of Death）：** 如果一帧的物理计算耗时 > fixedDt，下一帧 accumulator 会更大 → 需要更多步进 → 更慢 → 无限恶化。`std::min(frameTime, 0.25f)` 是安全阀——允许最多 0.25s 的"慢动作"而非崩溃。}
+
+// 场景管理
+
+\code[cpp]{
+class Scene {
+    std::string name;
+    std::vector<std::unique_ptr<GameObject>> objects;
+    bool loaded = false;
+
+public:
+    void load(const std::string& path) {
+        auto data = loadJson(path);
+        for (auto& objData : data["objects"]) {
+            auto obj = std::make_unique<GameObject>();
+            obj->deserialize(objData);
+            objects.push_back(std::move(obj));
+        }
+        loaded = true;
+    }
+    void unload() { objects.clear(); loaded = false; }
+    void update(float dt) {
+        for (auto& obj : objects) obj->update(dt);
+    }
+};
+
+class SceneManager {
+    std::unordered_map<std::string, std::unique_ptr<Scene>> scenes;
+    Scene* active = nullptr;
+    std::string pendingLoad; // 延迟加载——避免在 update 中途切换
+
+public:
+    void requestLoad(const std::string& name) { pendingLoad = name; }
+
+    void processPendingLoad() {
+        if (pendingLoad.empty()) return;
+        if (active) active->unload();
+        active = scenes[pendingLoad].get();
+        active->load(pendingLoad + ".scene");
+        pendingLoad.clear();
+    }
+};
+}
+
+\warning{**永远不要在 `update()` 循环中直接切换场景。** 这会导致正在迭代的游戏对象列表被清空——未定义行为。用"请求+延迟执行"模式：在 update 中设置标记，在帧末或帧间处理加载。}
+
+// 资源管理系统
+
+\code[cpp]{
+// 通用资源管理器：加载、缓存、引用计数、热重载
+template<typename T>
+class ResourceManager {
+    struct Entry {
+        std::shared_ptr<T> resource;
+        std::filesystem::file_time_type lastModified;
+    };
+    std::unordered_map<std::string, Entry> cache;
+
+public:
+    std::shared_ptr<T> load(const std::string& path) {
+        if (auto it = cache.find(path); it != cache.end())
+            return it->second.resource; // 缓存命中
+
+        auto res = std::make_shared<T>();
+        res->loadFromFile(path);
+        cache[path] = {res, std::filesystem::last_write_time(path)};
+        return res;
+    }
+
+    void checkHotReload() {
+        for (auto& [path, entry] : cache) {
+            auto curTime = std::filesystem::last_write_time(path);
+            if (curTime > entry.lastModified) {
+                entry.resource->loadFromFile(path);
+                entry.lastModified = curTime;
+                // 所有持有 shared_ptr 的使用者自动获得新数据
+            }
+        }
+    }
+};
+}
+
+\note{**资源句柄（Handle）模式：** 直接暴露 `shared_ptr` 给游戏逻辑存在循环引用风险。更稳健的设计是返回一个轻量级 **句柄（Handle）**——内部是索引/ID，通过 ResourceManager 间接访问实际资源。句柄可判空、可序列化、可做 weak 引用。}
+
+// 序列化与反序列化
+
+\tabs{
+\tab[JSON 序列化]{
+\code[cpp]{
+// 人类可读，适合编辑器和配置文件
+void Transform::serialize(JsonWriter& w) const {
+    w.key("position"); w.vec3(position);
+    w.key("rotation"); w.value(rotation);
+    w.key("scale");    w.vec3(scale);
+}
+void Transform::deserialize(const JsonValue& v) {
+    position = v["position"].asVec3();
+    rotation = v["rotation"].asFloat();
+    scale    = v["scale"].asVec3();
+}
+}
+}
+\tab[二进制序列化]{
+\code[cpp]{
+// 紧凑高效，适合存档和网络传输
+void Transform::serialize(BinaryWriter& w) const {
+    w.write(position);  // 直接写 12 字节
+    w.write(rotation);  // 4 字节
+    w.write(scale);     // 12 字节
+}
+// 总计 28 字节 vs JSON 可能 150+ 字节
+}
+}
+}
+
+\tip{**版本兼容策略：** 序列化数据必须包含版本号。读取时先检查版本——旧版本的数据用迁移函数升级，未知新版本输出警告。否则每次更新数据结构都会破坏所有存档。}
+
+// 事件系统设计
+
+\code[cpp]{
+// 类型安全的事件系统——基于 typeid 分派
+class EventBus {
+    using HandlerBase = std::function<void(const void*)>;
+    std::unordered_map<std::type_index, std::vector<HandlerBase>> handlers;
+
+public:
+    template<typename EventType>
+    void subscribe(std::function<void(const EventType&)> handler) {
+        handlers[typeid(EventType)].push_back(
+            [handler](const void* e) {
+                handler(*static_cast<const EventType*>(e));
+            });
+    }
+
+    template<typename EventType>
+    void publish(const EventType& event) {
+        auto it = handlers.find(typeid(EventType));
+        if (it != handlers.end())
+            for (auto& h : it->second) h(&event);
+    }
+};
+
+// 使用示例
+struct PlayerDied { int playerId; Vec2 position; };
+struct EnemySpawned { int enemyId; std::string type; };
+
+eventBus.subscribe<PlayerDied>([](const PlayerDied& e) {
+    audioSystem.play("death_sound", e.position);
+    particleSystem.spawn("blood", e.position);
+});
+}
+
+\note{**事件系统解耦子系统间的依赖。** 物理系统检测到碰撞 → 发布 `CollisionEvent` → 音频系统播放碰撞音效、粒子系统生成火花、UI 系统更新血条。没有一个系统需要知道其他系统的存在。}
+
+// 热重载
+
+**热重载（Hot Reload）** 让开发者修改资源或代码后无需重启游戏即可看到效果——极大提升迭代速度。
+
+\code[cpp]{
+// 文件监视 + 资源重载
+class HotReloadSystem {
+    using ReloadCallback = std::function<void(const std::string&)>;
+    std::unordered_map<std::string, ReloadCallback> watchers;
+
+public:
+    void watch(const std::string& path, ReloadCallback cb) {
+        watchers[path] = std::move(cb);
+    }
+
+    void poll() {
+        for (auto& [path, cb] : watchers) {
+            if (fileWasModified(path)) {
+                try {
+                    cb(path);
+                } catch (const std::exception& e) {
+                    log::error("Hot reload failed: {} - {}", path, e.what());
+                    // 保持旧版本运行，不崩溃
+                }
+            }
+        }
+    }
+};
+
+// 注册热重载
+hotReload.watch("shaders/phong.glsl", [&](auto& p) { renderer.reloadShader(p); });
+hotReload.watch("scripts/enemy_ai.lua", [&](auto& p) { scriptSys.reloadScript(p); });
+hotReload.watch("data/config.json", [&](auto& p) { config.reload(p); });
+}
+
+// 商业引擎架构分析
+
+\table{
+引擎 | 对象模型 | 脚本 | 渲染 | 特点
+---
+Unreal Engine 5 | Actor + Component | C++ / Blueprint | Nanite + Lumen | 重量级，AAA 标准，大型团队
+Unity | GameObject + Component | C# | URP / HDRP | 灵活，中小型团队首选
+Godot | Node 树 | GDScript / C# | Vulkan | 开源轻量，独立开发者友好
+Bevy | ECS (Rust) | Rust | wgpu | 纯 ECS，数据驱动，新兴生态
+}
+
+\collapse[Unreal vs Unity 架构哲学对比]{
+**Unreal** 是"全包式（Batteries Included）"——编辑器、网络、动画、AI、物理、音频全部内置，高度优化但定制需要深入源码（C++ 水平要求高）。Blueprint 可视化脚本让策划独立工作。
+
+**Unity** 是"组装式（Modular）"——核心小巧，功能通过 Package Manager 按需引入。C# 降低了入门门槛。ECS（DOTS）是性能架构方向但生态仍在完善中。
+
+**Godot** 是"简约式（Minimal but Complete）"——Node 树结构直觉清晰，信号（Signal）机制是内置的观察者模式。GDScript 极易上手但性能有限。适合 2D 和中小 3D 项目。
+}
+
+/// 工程实践
+
+\list{
+- 子系统用接口（虚基类）隔离，方便替换实现（如切换物理后端）
+- 游戏循环使用固定物理步长 + 渲染插值，永远不要把 deltaTime 直接传给物理
+- 资源使用句柄而非裸指针，支持延迟加载和安全销毁
+- 事件系统在编辑器中可视化（谁发布了什么事件、谁在监听），方便调试
+- 序列化数据包含版本号，支持向前兼容的数据迁移
+- 热重载失败必须 gracefully fallback（保持旧版本运行、打印错误日志）
+}
+
+/// 难点易错点分析
+
+\danger{**资源循环引用：** 材质引用纹理 A，纹理 A 的后处理引用材质 B…全用 `shared_ptr` 可能形成循环无法释放。解法：资源管理器持有 `shared_ptr`，使用者持有句柄或 `weak_ptr`。}
+
+\warning{**"上帝对象"反模式：** 把所有功能塞进一个 `Engine` 或 `Game` 类。几个月后这个类会膨胀到数千行、无法维护。正确做法：每个子系统独立，通过事件或服务定位器（Service Locator）通信。}
+
+\quiz[choice]{
+Q: 游戏循环中"固定时间步长 + 渲染插值"解决的核心问题是？
+A: 减少 CPU 的计算负担
+B: 让物理模拟与渲染帧率解耦，保证物理行为一致
+C: 提高画面分辨率
+D: 减少网络延迟
+ANS: B
+EXP: 物理模拟用固定 dt（如 1/60s）保证在不同硬件上行为完全一致。渲染可以在不同帧率运行，通过在上帧位置与当前位置之间按 alpha 插值实现平滑显示。如果让物理直接使用可变 dt，快机器和慢机器上弹跳高度、碰撞结果都会不同。
+}
+
+\quiz[tf]{
+Q: 子系统关闭时应该按照与初始化相同的顺序进行。
+ANS: F
+EXP: 应该**逆序**关闭。后初始化的子系统可能依赖先初始化的子系统（如渲染器依赖窗口），因此必须先关闭渲染器再关闭窗口。LIFO（后进先出）是标准原则。
+}
+
+\quiz[choice]{
+Q: 以下哪种方式最适合解耦物理碰撞事件与音效播放？
+A: 物理系统直接调用音频系统的 `playSound()` 函数
+B: 音频系统每帧轮询物理系统的碰撞列表
+C: 物理系统发布碰撞事件，音频系统订阅该事件
+D: 在全局变量中存储碰撞信息，音频系统读取
+ANS: C
+EXP: 事件系统（观察者模式）让物理和音频彼此不知道对方的存在——物理只管发布事件，音频只管订阅事件。A 方案造成直接依赖，B 是轮询开销大且耦合，D 用全局变量做通信极难维护。
+}
+
+/// 实战作业
+
+// 🟢 基础：子系统生命周期管理
+
+\run[cpp]{
+#include <iostream>
+#include <vector>
+#include <memory>
+#include <algorithm>
+#include <string>
+
+class ISubsystem {
+public:
+    virtual ~ISubsystem() = default;
+    virtual void init() = 0;
+    virtual void update(float dt) = 0;
+    virtual void shutdown() = 0;
+    virtual const char* name() const = 0;
+};
+
+// TODO: 实现 Engine 类
+// 1. add<T>(priority) 注册子系统
+// 2. init() 按 priority 升序初始化
+// 3. update(dt) 按 priority 升序更新
+// 4. shutdown() 逆序关闭
+class Engine {
+    /* TODO: 你的代码 */
+};
+
+// 测试用子系统
+class WindowSystem : public ISubsystem {
+public:
+    void init() override { std::cout << "Window init\n"; }
+    void update(float) override {}
+    void shutdown() override { std::cout << "Window shutdown\n"; }
+    const char* name() const override { return "Window"; }
+};
+class RenderSystem : public ISubsystem {
+public:
+    void init() override { std::cout << "Render init\n"; }
+    void update(float) override {}
+    void shutdown() override { std::cout << "Render shutdown\n"; }
+    const char* name() const override { return "Render"; }
+};
+
+int main() {
+    Engine engine;
+    // 预期 init: Window → Render;  shutdown: Render → Window
+    // engine.add<RenderSystem>(200);
+    // engine.add<WindowSystem>(100);
+    // engine.init();
+    // engine.update(0.016f);
+    // engine.shutdown();
+}
+}
+
+// 🟡 进阶：带缓存和热重载的资源管理器
+
+实现 `ResourceManager<T>`：load 时自动缓存、重复 load 返回缓存副本、`checkHotReload()` 检测文件修改时间并自动重载。用 `std::filesystem` 实现。
+
+// 🟡 进阶：类型安全事件系统
+
+实现上文的 EventBus，支持 `subscribe<EventType>(handler)` 和 `publish<EventType>(event)`。测试：发布 `PlayerDied` 事件，两个不同订阅者分别收到通知。
+
+// 🔴 挑战：MiniEngine 框架
+
+\collapse[参考思路]{
+1. 实现 Engine 类（子系统注册、生命周期管理）
+2. 实现 EventBus（类型安全的发布-订阅）
+3. 实现 ResourceManager（缓存 + 热重载）
+4. 实现 SceneManager（场景加载/卸载/切换）
+5. 实现固定步长游戏循环（物理 60Hz + 渲染插值）
+6. 将之前的物理引擎、数学库集成为子系统
+7. JSON 序列化场景文件
+}

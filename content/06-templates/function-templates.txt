@@ -1,0 +1,441 @@
+/// 简介
+
+上一章我们学习了如何用类和继承来复用代码。但如果你需要一个 `max` 函数同时适用于 `int`、`double`、`std::string`——难道要写三遍几乎一模一样的代码？复制粘贴不仅丑陋，还容易遗漏修改。
+
+**函数模板（Function Template）** 就是C++给出的答案：写一份代码，让编译器根据你传入的类型自动生成对应版本。这不是运行时的多态，而是**编译期（Compile-time）** 的代码生成——零运行时开销。函数模板是泛型编程（Generic Programming）的起点，也是理解整个STL的基础。
+
+/// 知识点列表
+
+\list{
+- 函数模板基本语法（`template<typename T>`）
+- 模板参数推导（Template Argument Deduction）
+- 显式模板实参（Explicit Template Arguments）
+- 非类型模板参数（Non-Type Template Parameters）
+- 模板重载与特化（Overloading & Specialization）
+- auto 返回类型与模板
+- 函数模板 vs 重载 vs 宏
+- C++20 缩写函数模板（Abbreviated Function Templates）
+}
+
+/// 知识点详解
+
+// 函数模板基本语法
+
+没有模板的时代，想写一个通用的"取较大值"函数，你只能用宏或者为每种类型写一个重载。模板让你用 `typename T` 作为"类型占位符"，编译器在调用时自动填入具体类型。
+
+\code[cpp]{
+// template 关键字声明这是模板
+// typename T 声明一个类型参数（也可以写 class T，效果相同）
+template<typename T>
+T maximum(T a, T b) {
+    return (a > b) ? a : b;
+}
+
+// 使用时，编译器自动推导 T 的类型
+maximum(3, 5);         // T = int
+maximum(3.14, 2.71);   // T = double
+maximum('a', 'z');     // T = char
+}
+
+\note{`typename` 和 `class` 在模板参数声明中完全等价。推荐统一用 `typename`，因为 `class` 容易让人误以为 T 必须是类类型。}
+
+当你写 `maximum(3, 5)` 时，编译器看到两个 `int`，推导出 `T = int`，然后**实例化（Instantiate）** 出一个 `int maximum(int, int)` 的具体函数。这个过程完全发生在编译期。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+template<typename T>
+T maximum(T a, T b) {
+    return (a > b) ? a : b;
+}
+
+int main() {
+    std::cout << maximum(3, 5) << '\n';           // 5
+    std::cout << maximum(3.14, 2.71) << '\n';     // 3.14
+    std::cout << maximum(std::string("apple"),
+                         std::string("banana")) << '\n'; // banana
+}
+}
+
+// 模板参数推导
+
+编译器通常能从函数实参自动推导出模板参数。但推导有规则——不同的参数形式，推导结果不同：
+
+\code[cpp]{
+template<typename T>
+void byValue(T param);       // 按值传递：去掉 const 和引用
+
+template<typename T>
+void byRef(T& param);        // 左值引用：保留 const
+
+template<typename T>
+void byFwdRef(T&& param);    // 转发引用（Forwarding Reference）：保留一切
+
+const int cx = 42;
+byValue(cx);    // T = int（const 被去掉了）
+byRef(cx);      // T = const int（const 保留）
+byFwdRef(cx);   // T = const int&（左值 → 左值引用）
+byFwdRef(42);   // T = int（右值 → 右值引用）
+}
+
+\warning{**数组会退化为指针！** `int a[10]` 传给 `byValue` 时，T 推导为 `int*`。但传给 `byRef` 时，T 是 `int[10]`——引用阻止了退化。利用这点可以在编译期获取数组大小：}
+
+\code[cpp]{
+template<typename T, std::size_t N>
+constexpr std::size_t arraySize(T (&)[N]) { return N; }
+
+int data[42];
+static_assert(arraySize(data) == 42); // 编译期计算！
+}
+
+\diagram[flow]{
+函数调用 maximum(3, 5) -> 编译器推导 T=int -> 实例化 int maximum(int,int) -> 目标代码中生成具体函数 -> 与手写 int 版本性能相同
+}
+
+// 显式模板实参
+
+有些情况编译器推导不出来，或者推导结果不是你想要的——这时用**显式模板实参（Explicit Template Arguments）** 手动指定：
+
+\code[cpp]{
+template<typename T>
+T maximum(T a, T b) { return (a > b) ? a : b; }
+
+// maximum(1, 2.5); // 错误！T 不能同时是 int 和 double
+maximum<double>(1, 2.5); // 手动指定 T=double，1 隐式转为 double
+
+// 返回类型无法推导时，从左到右部分指定
+template<typename Ret, typename T1, typename T2>
+Ret convert(T1 a, T2 b) { return static_cast<Ret>(a + b); }
+
+convert<double>(1, 2);  // Ret=double, T1=int, T2=int
+}
+
+// 非类型模板参数
+
+模板参数不一定是类型，也可以是**编译期常量值**——比如整数、枚举、指针。这叫**非类型模板参数（Non-Type Template Parameter, NTTP）**。
+
+\code[cpp]{
+// N 是编译期整数
+template<typename T, int N>
+struct FixedArray {
+    T data[N];
+    constexpr int size() const { return N; }
+};
+
+FixedArray<int, 100> arr;  // 编译期确定大小
+
+// C++17：auto 非类型参数——编译器推导值的类型
+template<auto Value>
+struct Constant {
+    static constexpr auto value = Value;
+};
+Constant<42>::value;    // int 类型
+Constant<'A'>::value;   // char 类型
+Constant<true>::value;  // bool 类型
+}
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+
+template<typename T, std::size_t N>
+void printArray(const std::array<T, N>& arr) {
+    std::cout << "[";
+    for (std::size_t i = 0; i < N; ++i) {
+        if (i > 0) std::cout << ", ";
+        std::cout << arr[i];
+    }
+    std::cout << "]\n";
+}
+
+template<auto V>
+void printValue() {
+    std::cout << "value = " << V << ", size = " << sizeof(V) << " bytes\n";
+}
+
+int main() {
+    std::array<int, 5> nums = {10, 20, 30, 40, 50};
+    printArray(nums);
+
+    printValue<42>();
+    printValue<'X'>();
+    printValue<100L>();
+}
+}
+
+// 模板重载与特化
+
+函数模板可以和普通函数共存。编译器选择规则：**精确匹配的非模板函数 > 模板特化 > 模板通用版本**。
+
+\code[cpp]{
+// 通用模板
+template<typename T>
+std::string stringify(T val) {
+    return std::to_string(val);
+}
+
+// 显式特化（template<> 表示"无模板参数"）
+template<>
+std::string stringify<bool>(bool val) {
+    return val ? "true" : "false";
+}
+
+// 普通函数重载（不是模板！）
+std::string stringify(const char* s) {
+    return std::string(s);
+}
+
+stringify(42);       // 通用模板：T=int
+stringify(true);     // 特化版本：bool
+stringify("hello");  // 普通重载：优先于模板
+}
+
+\tip{**优先用重载而非函数模板特化。** 函数模板特化不参与重载决议——编译器先从主模板和普通函数中选最佳匹配，选中主模板后才看特化。这可能导致特化被意外跳过。}
+
+// auto 返回类型与模板
+
+C++14 起允许函数模板用 `auto` 推导返回类型，让编写更简洁：
+
+\tabs{
+\tab[C++11]{
+\code[cpp]{
+// 必须用尾置返回类型（trailing return type）
+template<typename T, typename U>
+auto add(T a, U b) -> decltype(a + b) {
+    return a + b;
+}
+}
+}
+\tab[C++14]{
+\code[cpp]{
+// 编译器自动推导返回类型
+template<typename T, typename U>
+auto add(T a, U b) {
+    return a + b;
+}
+}
+}
+\tab[C++20]{
+\code[cpp]{
+// 缩写函数模板——auto 参数即模板
+auto add(auto a, auto b) {
+    return a + b;
+}
+// 等价于 template<typename T, typename U> auto add(T a, U b)
+}
+}
+}
+
+// 函数模板 vs 重载 vs 宏
+
+\table{
+特性 | 宏 | 函数重载 | 函数模板
+---
+类型安全 | ❌ 无 | ✅ 有 | ✅ 有
+代码重复 | ❌ 无重复但危险 | ❌ 每类型一份 | ✅ 一份搞定
+可调试 | ❌ 难 | ✅ 容易 | ✅ 容易
+参数求值 | ❌ 可能多次 | ✅ 一次 | ✅ 一次
+}
+
+\compare{
+old: 宏 `#define MAX(a,b) ((a)>(b)?(a):(b))` — 纯文本替换，无类型检查，`MAX(i++, j++)` 导致副作用，调试噩梦。
+
+new: 函数模板 `template<typename T> T max(T a, T b)` — 编译期类型安全，支持推导和约束，性能零开销，现代C++首选。
+}
+
+// C++20 缩写函数模板
+
+C++20 引入**缩写函数模板（Abbreviated Function Templates）**：参数类型写 `auto`，编译器自动创建模板参数。还可以用 Concept 约束：
+
+\run[cpp]{
+#include <iostream>
+#include <concepts>
+
+// 无约束缩写模板
+auto multiply(auto a, auto b) {
+    return a * b;
+}
+
+// 带 Concept 约束——只接受整型
+void printInt(std::integral auto n) {
+    std::cout << "integer: " << n << '\n';
+}
+
+// 带 Concept 约束——只接受浮点
+void printFloat(std::floating_point auto n) {
+    std::cout << "float: " << n << '\n';
+}
+
+int main() {
+    std::cout << multiply(3, 4) << '\n';     // 12
+    std::cout << multiply(2.5, 3.0) << '\n'; // 7.5
+
+    printInt(42);
+    printFloat(3.14);
+    // printInt(3.14); // 编译错误：不满足 integral
+}
+}
+
+// 模板的编译模型
+
+\note{**函数模板的定义必须放在头文件中。** 编译器在实例化模板时需要看到完整定义。定义放在 `.cpp` 文件中，其他翻译单元（Translation Unit）看不到→链接错误。这是模板与普通函数最大的区别。}
+
+\collapse[🤔 有没有办法把模板实现放在 .cpp 里？]{
+有——**显式实例化（Explicit Instantiation）**，但很少用：
+
+\code[cpp]{
+// math.cpp
+template<typename T>
+T square(T x) { return x * x; }
+
+template int square<int>(int);       // 只为 int 生成
+template double square<double>(double); // 只为 double 生成
+// 其他类型无法使用这个模板
+}
+
+适用场景：模板只服务于有限的几种类型，且不希望暴露实现。
+}
+
+/// 工程实践
+
+\list{
+- 模板函数放在 `.hpp` 头文件中，用 `#pragma once` 防止重复包含
+- 用 `static_assert` 在模板体内检查类型要求，给出清晰错误信息
+- C++20 优先用 Concepts 约束参数类型，而非裸的 `typename T`
+- 模板参数名用有意义的名字（`Container` 而非 `T`），提升可读性
+- 避免函数模板特化——用重载替代
+}
+
+/// 难点易错点分析
+
+\danger{**推导不做隐式类型转换！** `max(1, 2.5)` 中，T 不能同时推导为 `int` 和 `double`，编译器报错。修复：①显式指定 `max<double>(1, 2.5)`；②用两个参数 `template<typename T, typename U>`。}
+
+\danger{**函数模板特化的优先级陷阱：**}
+
+\code[cpp]{
+template<typename T> void f(T) {}    // 主模板 A
+template<> void f<int*>(int*) {}      // A 的特化
+
+template<typename T> void f(T*) {}   // 主模板 B（重载）
+
+int* p = nullptr;
+f(p); // 调用 B！重载决议先选 B（更匹配），A 的特化被跳过
+}
+
+\warning{**模板代码的错误在实例化时才暴露。** 你写了一个有bug的模板但从未调用→编译不报错。一旦用某个类型实例化，错误才出现。C++20 的 Concepts 能提前检查约束。}
+
+\quiz[choice]{
+Q: `auto result = add(1, 2.5);` 中 `result` 是什么类型？（`add` 定义为 `template<typename T, typename U> auto add(T a, U b) { return a + b; }`）
+A: `int`
+B: `double`
+C: `float`
+D: 编译错误
+ANS: B
+EXP: T=int, U=double，`int + double` 的结果是 `double`（算术提升规则）。auto 推导为表达式的类型。
+}
+
+\quiz[tf]{
+Q: `template<typename T> void f(T x);` 和 `template<class T> void f(T x);` 是完全相同的声明。
+ANS: T
+EXP: 在模板参数声明中 `typename` 和 `class` 完全等价，声明的是同一个函数模板。
+}
+
+\quiz[choice]{
+Q: 调用 `maximum("hello", "world")` 时，T 被推导为什么？（按值传递版本）
+A: `std::string`
+B: `const char*`
+C: `const char[6]`
+D: 编译错误
+ANS: B
+EXP: 字符串字面量的类型是 `const char[N]`，按值传递时数组退化为指针，所以 T = `const char*`。注意：`const char*` 的 `>` 比较的是指针地址而非字符串内容！
+}
+
+/// 实战作业
+
+// 🟢 基础题：泛型 clamp
+
+\run[cpp]{
+#include <iostream>
+
+// TODO: 实现 clamp(val, lo, hi)
+// val < lo 返回 lo；val > hi 返回 hi；否则返回 val
+template<typename T>
+T clamp(T val, T lo, T hi) {
+    /* TODO: 你的代码 */
+    return val;
+}
+
+int main() {
+    std::cout << clamp(5, 1, 10) << '\n';       // 期望: 5
+    std::cout << clamp(-3, 0, 100) << '\n';     // 期望: 0
+    std::cout << clamp(999, 0, 100) << '\n';    // 期望: 100
+    std::cout << clamp(3.7, 1.0, 3.5) << '\n'; // 期望: 3.5
+}
+}
+
+// 🟢 基础题：双参数 safeDiv
+
+\run[cpp]{
+#include <iostream>
+
+// TODO: 实现 safeDiv(a, b) — 两个参数可以是不同类型
+// b == 0 时返回 0
+
+/* TODO: 你的代码 */
+
+int main() {
+    std::cout << safeDiv(10, 3) << '\n';     // 期望: 3
+    std::cout << safeDiv(10.0, 3) << '\n';   // 期望: 3.33333
+    std::cout << safeDiv(7, 0) << '\n';      // 期望: 0
+}
+}
+
+// 🟡 进阶题：编译期数组工具
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+
+// TODO 1: arraySize — 返回 C 风格数组大小（编译期）
+// TODO 2: arraySum — 对 std::array 所有元素求和
+
+/* TODO: 你的代码 */
+
+int main() {
+    int raw[] = {1, 2, 3, 4, 5};
+    static_assert(arraySize(raw) == 5);
+    std::cout << "size = " << arraySize(raw) << '\n';
+
+    std::array<double, 4> arr = {1.5, 2.5, 3.5, 4.5};
+    std::cout << "sum = " << arraySum(arr) << '\n'; // 期望: 12
+}
+}
+
+// 🟡 进阶题：带约束的 lerp
+
+实现 `lerp(a, b, t)` 函数模板（线性插值 `a + t*(b-a)`）。要求只接受算术类型，非算术类型给出清晰编译错误。
+
+\collapse[参考思路]{
+\code[cpp]{
+#include <type_traits>
+template<typename T>
+T lerp(T a, T b, T t) {
+    static_assert(std::is_arithmetic_v<T>, "lerp requires arithmetic type");
+    return a + t * (b - a);
+}
+// C++20: auto lerp(std::floating_point auto a, ...) { ... }
+}
+}
+
+// 🔴 挑战题：泛型函数调度器
+
+设计一个 `Dispatcher`，存储"命令名→处理函数"映射：
+1. `register_handler<Ret, Args...>(name, func)` 注册处理函数
+2. `call<Ret, Args...>(name, args...)` 调用函数
+3. 处理函数可以是 lambda、函数指针、`std::function`
+4. 类型不匹配时给出清晰错误信息
+
+\collapse[参考思路]{
+用 `std::unordered_map<std::string, std::any>` 存储，注册时包装为 `std::function<Ret(Args...)>`，调用时 `std::any_cast` 还原。用 `static_assert(std::is_invocable_v<F, Args...>)` 做编译期检查。
+}

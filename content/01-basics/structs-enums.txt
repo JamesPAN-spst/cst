@@ -1,0 +1,620 @@
+/// 简介
+
+到目前为止，我们学了变量——一个变量只能存一个值。但你想想：描述一个游戏角色，你得记住它的名字、血量、攻击力、位置坐标……难道每个都单独搞一个变量？那十个角色岂不是要几十个散落的变量？
+
+这就好比你搬家，把衣服、书、锅碗瓢盆全散着堆地上——你能找到东西才怪！你需要的是**收纳箱**：把相关的东西装到一个箱子里，贴个标签。
+
+在C++里，**结构体（struct）** 就是这个收纳箱——把相关的数据打包成一个新类型。而 **枚举（enum）** 呢？就像一组固定的标签贴纸：方向只有"上下左右"四个选项，角色状态只有"空闲/战斗/死亡"几种。不用记0、1、2这种莫名其妙的数字，直接用名字说话。
+
+这节课我们先学会用 `struct` 打包数据，再学用 `enum class`（强类型枚举，Scoped Enum）定义专属标签。它们是你走向面向对象（OOP）的第一步！
+
+/// 知识点列表
+
+\list{
+- struct 的声明与使用——把数据打包
+- 成员初始化（C++11 默认成员初始化器）
+- 聚合初始化与指定初始化器（C++20）
+- struct 与 class 的唯一区别
+- struct 中也能放函数
+- 传统 enum 的缺陷
+- enum class（强类型枚举，C++11）
+- 枚举的底层类型
+- using enum（C++20）
+- 结构化绑定与 struct（C++17）
+- 位域（bit field）简介
+}
+
+/// 知识点详解
+
+// struct 基础——你的第一个"收纳箱"
+
+想象你在做一个2D小游戏，角色有一个位置：x 坐标和 y 坐标。没有 struct 之前，你只能这样：
+
+\code[cpp]{
+float playerX = 100.0f;
+float playerY = 200.0f;
+float enemyX = 50.0f;
+float enemyY = 80.0f;
+// 如果还有速度、血量……变量爆炸了！
+}
+
+有了 struct，就像拿了一个箱子把它们装起来：
+
+\code[cpp]{
+struct Vec2 {
+    float x;    // 箱子里第一样东西：x 坐标
+    float y;    // 箱子里第二样东西：y 坐标
+};              // ← 注意这个分号！新手最常忘的
+
+Vec2 playerPos;     // "我要一个Vec2类型的箱子，贴标签叫playerPos"
+Vec2 enemyPos;      // 再来一个给敌人用
+playerPos.x = 100;  // 用小数点 . 访问箱子里的东西
+playerPos.y = 200;
+}
+
+`struct` 关键字声明结构体，花括号里列出**成员（member）**，最后别忘了分号。用的时候，`.` 操作符就像打开箱子取东西。
+
+来，动手跑一下你的第一个 struct 程序：
+
+\run[cpp]{
+#include <iostream>
+
+struct Vec2 {
+    float x;
+    float y;
+};
+
+int main() {
+    Vec2 pos{3.0f, 4.0f};   // 聚合初始化：按顺序给值
+    Vec2 zero{};              // 值初始化：x=0, y=0
+
+    std::cout << "pos = (" << pos.x << ", " << pos.y << ")\n";
+    std::cout << "zero = (" << zero.x << ", " << zero.y << ")\n";
+
+    // 试试修改成员
+    pos.x = 10.0f;
+    std::cout << "修改后 pos.x = " << pos.x << "\n";
+
+    return 0;
+}
+}
+
+\danger{**struct 的成员默认不初始化！** 写 `Vec2 pos;` 之后，`pos.x` 和 `pos.y` 是**垃圾值**（Indeterminate Value），读取它们是**未定义行为（Undefined Behavior, UB）**。务必使用 `{}` 初始化！}
+
+// struct 的内存长什么样？
+
+你可能好奇：struct 在内存里到底怎么排的？其实很简单——成员**按声明顺序**依次排列在一块连续的内存中，就像货架上的盒子挨着放：
+
+\diagram[memory]{
+stack:
+  [0x7FF0] Vec2 pos
+  [0x7FF0 +0] float x = 3.0f  (4字节)
+  [0x7FF0 +4] float y = 4.0f  (4字节)
+  sizeof(Vec2) = 8 字节
+}
+
+\collapse[🔍 关于内存对齐（Alignment）]{
+实际上，编译器可能在成员之间插入**填充字节（padding）**来满足对齐要求。比如：
+
+\code[cpp]{
+struct Example {
+    char a;    // 1 字节
+    // 3字节填充（padding）！
+    int b;     // 4 字节
+};
+// sizeof(Example) = 8，而不是你以为的 5！
+}
+
+对齐是为了让 CPU 更高效地访问内存。现在你只需要知道 `sizeof` 给出的大小可能比你手算的大就行了。详细机制将在「05-内存管理」章节展开。
+}
+
+// 默认成员初始化器（C++11）——再也不怕忘记赋值
+
+刚才说了，忘记初始化 struct 成员会得到垃圾值。C++11 给了一个超棒的解决方案：**直接在 struct 声明里写默认值！**
+
+\code[cpp]{
+struct GameConfig {
+    int width = 1920;            // 默认1080p
+    int height = 1080;
+    float fps = 60.0f;
+    bool fullscreen = false;
+    std::string title = "My Game";
+};
+
+GameConfig cfg;             // 全部使用默认值——安全！
+GameConfig cfg2{1280, 720}; // width=1280, height=720，其余用默认值
+}
+
+\tip{**最佳实践：为所有成员提供默认值。** 这样即使有人忘记初始化某个成员，也不会得到垃圾值。这是现代C++的标配做法。}
+
+// 聚合初始化与指定初始化器（C++20）
+
+**聚合初始化（Aggregate Initialization）** 就是用花括号 `{}` 按顺序给成员赋值，刚才我们已经用过了。
+
+C++20 带来了一个更酷的新功能——**指定初始化器（Designated Initializers）**，让你可以按名字初始化，跳过中间成员：
+
+\code[cpp]{
+struct Color {
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    uint8_t a = 255;   // 默认不透明
+};
+
+Color red{.r = 255};                     // 只设红色，其余用默认值
+Color semiTransBlue{.b = 200, .a = 128}; // 半透明蓝色
+// Color bad{.b = 255, .r = 100};        // ❌ 错误！顺序必须与声明一致
+}
+
+\warning{**指定初始化器必须按声明顺序！** 这跟C语言不一样——C允许任意顺序，但C++要求你按成员声明的顺序来写，只是允许跳过中间的成员。}
+
+// struct vs class——只差一个字母的秘密
+
+很多新手困惑：`struct` 和 `class` 到底有啥区别？答案简单到令人发指：
+
+\code[cpp]{
+struct A {
+    int x;     // 默认是 public（公开的，谁都能访问）
+};
+
+class B {
+    int x;     // 默认是 private（私有的，外面不能直接访问）
+};
+}
+
+**就这？就这！** 除了默认访问权限不同，`struct` 和 `class` 在功能上完全一样。
+
+**惯例（Convention）：**
+- 纯数据打包（像 `Vec2`、`Color` 这种）→ 用 `struct`
+- 有复杂行为和封装逻辑的 → 用 `class`（下节课OOP会详细讲）
+
+\quiz[choice]{
+Q: `struct` 和 `class` 在C++中的**唯一**区别是什么？
+A: struct 不能有成员函数，class 可以
+B: struct 成员默认 public，class 成员默认 private
+C: struct 在栈上，class 在堆上
+D: struct 不能继承，class 可以
+ANS: B
+EXP: 在C++中，`struct` 和 `class` 功能完全等价，唯一区别是默认访问权限：struct 默认 public，class 默认 private。struct 同样可以有成员函数、继承、模板等所有特性。
+}
+
+// struct 中也能放函数
+
+是的！struct 不只能装数据，还能带**成员函数（Member Function）**。这就像你的收纳箱自带了使用说明书：
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec2 {
+    float x = 0;
+    float y = 0;
+
+    // 计算向量长度（勾股定理）
+    float length() const {          // ← const 表示"不修改成员"
+        return std::sqrt(x*x + y*y);
+    }
+
+    // 向量加法
+    Vec2 operator+(const Vec2& other) const {
+        return {x + other.x, y + other.y};
+    }
+};
+
+int main() {
+    Vec2 a{3.0f, 4.0f};
+    Vec2 b{1.0f, 2.0f};
+
+    std::cout << "a 的长度 = " << a.length() << "\n";  // 5
+
+    Vec2 c = a + b;      // 使用运算符重载
+    std::cout << "a + b = (" << c.x << ", " << c.y << ")\n";
+
+    return 0;
+}
+}
+
+看到没？`a.length()` 就像问箱子"你多长？"——方法直接绑定在数据上，比到处传参的裸函数优雅多了。运算符重载（Operator Overloading）让你可以像普通数字一样用 `+` 把两个向量加起来。这些内容在「02-OOP」章节会深入讲解。
+
+// 传统 enum 的问题——为什么要淘汰它
+
+在引入 `enum class` 之前，我们先看看老式的 `enum` 有多糟糕：
+
+\code[cpp]{
+enum Color { Red, Green, Blue };
+enum TrafficLight { Red, Yellow, Green };  // ❌ 编译错误！Red 和 Green 重定义了！
+}
+
+名字直接泄露到整个作用域——两个 enum 里不能有重名的！更离谱的是：
+
+\code[cpp]{
+enum Fruit { Apple, Orange };
+enum Animal { Cat, Dog };
+
+if (Apple == Cat) {               // 居然能比较！而且返回 true！
+    // "苹果 == 猫"？？？这是什么离谱逻辑
+}
+int x = Apple + 3;                // 能隐式转成 int，结果是 3
+}
+
+传统 enum 的三大罪状：
+1. **名字污染**——枚举值泄露到外层作用域
+2. **隐式转 int**——一个枚举值可以随意跟整数混用
+3. **跨类型比较**——水果和动物能比较且相等，简直荒谬
+
+\tabs{
+\tab[传统 enum（老式，不推荐）]{
+\code[cpp]{
+enum Color { Red, Green, Blue };
+
+Color c = Red;           // 不需要加前缀
+int x = c;               // 隐式转int，x = 0
+if (c == 0) { ... }      // 能跟int比较
+// enum TrafficLight { Red }; // ❌ 名字冲突！
+}
+问题：名字泄漏、隐式转换、类型不安全
+}
+\tab[enum class（C++11，推荐）]{
+\code[cpp]{
+enum class Color { Red, Green, Blue };
+
+Color c = Color::Red;     // 必须加 Color:: 前缀
+// int x = c;             // ❌ 编译错误！不能隐式转int
+int x = static_cast<int>(c);  // 必须显式转换
+// if (c == 0) { ... }    // ❌ 不能跟int比较
+}
+好处：作用域隔离、类型安全、底层类型可控
+}
+}
+
+// enum class——现代C++的正确选择
+
+C++11 引入的 `enum class`（也叫 **scoped enum，作用域枚举**）解决了所有老 enum 的问题：
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+
+// 指定底层类型为 uint8_t，节省内存
+enum class Direction : uint8_t {
+    Up,       // 0
+    Down,     // 1
+    Left,     // 2
+    Right     // 3
+};
+
+enum class Color : uint8_t {
+    Red, Green, Blue
+};
+
+int main() {
+    Direction dir = Direction::Up;    // 必须加 Direction::
+
+    // Direction::Up == Color::Red;   // ❌ 不同类型不能比较——安全！
+    // int x = dir;                   // ❌ 不能隐式转int——安全！
+
+    int x = static_cast<int>(dir);   // ✅ 显式转换：0
+    std::cout << "Direction::Up 的值 = " << x << "\n";
+
+    // switch 是 enum 的好搭档
+    switch (dir) {
+        case Direction::Up:    std::cout << "向上\n"; break;
+        case Direction::Down:  std::cout << "向下\n"; break;
+        case Direction::Left:  std::cout << "向左\n"; break;
+        case Direction::Right: std::cout << "向右\n"; break;
+    }
+
+    std::cout << "sizeof(Direction) = " << sizeof(Direction) << "\n"; // 1
+
+    return 0;
+}
+}
+
+\tip{**永远使用 `enum class` 而非 `enum`。** 它提供了类型安全、作用域隔离和可控的底层类型。这是 C++ Core Guidelines 的强烈推荐（Enum.3）。}
+
+\quiz[tf]{
+Q: `enum class Color { Red }; int x = Red;` 这段代码可以编译通过。
+ANS: F
+EXP: `enum class` 的成员不会泄露到外层作用域，必须用 `Color::Red` 访问。而且 `enum class` 不能隐式转换为 `int`，需要 `static_cast<int>(Color::Red)`。所以这行代码有两个错误。
+}
+
+// 枚举的底层类型
+
+每个 enum 在内存里其实就是一个整数。`enum class` 默认底层是 `int`（4字节），但你可以指定更小的类型来节省内存：
+
+\code[cpp]{
+enum class SmallEnum : uint8_t { A, B, C };        // 1字节
+enum class BigEnum : int64_t { X = 1LL << 40 };    // 8字节
+
+// 查询底层类型（元编程工具）
+using UT = std::underlying_type_t<SmallEnum>;       // uint8_t
+
+// C++23: std::to_underlying 方便转换
+// auto val = std::to_underlying(SmallEnum::B);     // uint8_t(1)
+}
+
+在游戏开发中，如果你有成千上万个实体都携带某个枚举标记，用 `uint8_t` 就比 `int` 省4倍内存。
+
+// using enum（C++20）——在局部"解包"枚举
+
+`enum class` 有一个小烦恼：每次都要写 `Color::Red`、`Color::Green`……在 `switch` 里特别啰嗦。C++20 的 `using enum` 让你在局部作用域里"解包"枚举成员：
+
+\code[cpp]{
+enum class Color { Red, Green, Blue };
+
+void paint(Color c) {
+    using enum Color;           // ← 在这个函数里直接用 Red/Green/Blue
+    switch (c) {
+        case Red:   /* ... */ break;   // 不需要 Color::Red
+        case Green: /* ... */ break;
+        case Blue:  /* ... */ break;
+    }
+}
+// 出了函数，Red/Green/Blue 又不可见了——安全！
+}
+
+// 结构化绑定与 struct（C++17）
+
+C++17 引入了**结构化绑定（Structured Bindings）**，让你可以把 struct 的成员"拆"成独立变量：
+
+\code[cpp]{
+struct Result {
+    bool success;
+    std::string message;
+    int code;
+};
+
+Result doWork() {
+    return {true, "完成", 0};
+}
+
+// 用 auto [变量名...] 解构
+auto [ok, msg, code] = doWork();
+if (ok) {
+    std::cout << "成功: " << msg << "\n";
+}
+}
+
+就像拆快递——一个箱子里有三样东西，直接一次性拆出来分别拿在手里用，不用再一个个 `.` 访问了。
+
+\collapse[🔍 结构化绑定 + if 初始化语句]{
+C++17 还允许在 `if` 语句里同时声明变量：
+
+\code[cpp]{
+if (auto [ok, msg, code] = doWork(); ok) {
+    std::cout << msg << "\n";
+}
+// ok, msg, code 在 if 外不可见——作用域干净！
+}
+
+这两个C++17特性组合使用，让代码既简洁又安全。
+}
+
+// 位域（Bit Field）简介
+
+\collapse[🔧 位域——把一个字节掰成几瓣用]{
+有时候你需要极致节省内存，比如网络包的头部里，某个字段只需要4位（0-15），不想浪费一整个 `int`：
+
+\code[cpp]{
+struct PacketHeader {
+    uint8_t version : 4;    // 4位，范围0-15
+    uint8_t type    : 4;    // 4位，和version共享一个字节
+    uint16_t length : 12;   // 12位
+    uint16_t flags  : 4;    // 4位
+};
+// sizeof(PacketHeader) 可能是 4 字节
+}
+
+\warning{**位域的内存布局是实现定义的（Implementation Defined）！** 不同编译器、不同平台排列方式可能不同。如果需要精确控制二进制布局（如网络协议），用位运算手动打包更可靠。}
+
+这是进阶内容，在入门阶段了解它的存在就够了——等遇到性能敏感的场景再回来深入研究。
+}
+
+/// 新版特性（C++17/20/23）
+
+\table{
+特性 | 版本 | 说明
+---
+默认成员初始化器 | C++11 | 在 struct 声明中给成员默认值
+`enum class` | C++11 | 强类型、有作用域的枚举
+结构化绑定 `auto [a, b]` | C++17 | 把 struct 解构为独立变量
+指定初始化器 `{.x=1}` | C++20 | 按成员名初始化，可跳过中间成员
+`using enum` | C++20 | 在局部作用域导入 enum 成员名
+`operator<=>() = default` | C++20 | 自动生成全部比较运算符
+`std::to_underlying` | C++23 | enum class 安全转换为底层整数类型
+}
+
+\compare{
+old: C++98/03 的 enum 没有作用域隔离和类型安全。struct 成员不能有默认值。初始化只能按顺序。比较运算符必须全部手写。
+
+new: C++11 引入 `enum class` 和默认成员初始化器。C++17 引入结构化绑定。C++20 引入指定初始化器、`using enum`、`operator<=>`。C++23 加入 `std::to_underlying`。趋势：struct 越来越像"有命名字段的元组"，`enum class` 完全取代传统 enum。
+}
+
+/// 工程实践
+
+\list{
+- **所有 struct 成员都给默认值**——防止未初始化的垃圾值
+- **永远用 `enum class`，不用裸 `enum`**——类型安全第一
+- **纯数据用 struct，有行为封装用 class**——这是社区共识
+- **枚举当位标志用时，别忘了重载 `|` `&` 运算符**——`enum class` 不自带位运算
+- **大量 struct 实例时考虑 `sizeof`**——注意内存对齐带来的额外开销
+- **C++20 优先用指定初始化器**——代码可读性远大于按顺序初始化
+}
+
+/// 难点易错点分析
+
+\danger{**陷阱一：忘记初始化 struct 成员**
+`Vec2 pos;` 里的 `x` 和 `y` 是垃圾值，读取它们是 UB。养成习惯：要么给默认值，要么用 `{}` 初始化。}
+
+\danger{**陷阱二：聚合类型的条件**
+一个类型能用 `Type{值1, 值2}` 聚合初始化的前提：没有用户声明的构造函数、没有私有成员、没有虚函数。一旦你加了自定义构造函数，它就不再是聚合类型了：}
+
+\code[cpp]{
+struct Agg { int x; int y; };
+Agg a{1, 2};           // ✅ 聚合初始化
+
+struct NotAgg {
+    int x; int y;
+    NotAgg(int x) : x(x), y(0) {}  // 有构造函数了！
+};
+// NotAgg b{1, 2};     // ❌ 不再是聚合，不能这样初始化
+NotAgg b{1};           // ✅ 调用构造函数
+}
+
+\danger{**陷阱三：enum class 不支持位运算**
+想把 `enum class` 当位标志（flags）用？你得自己重载运算符：}
+
+\code[cpp]{
+enum class Flags : uint32_t { None = 0, Read = 1, Write = 2, Exec = 4 };
+
+// Flags f = Flags::Read | Flags::Write;  // ❌ 编译错误！
+
+// 必须手动重载
+constexpr Flags operator|(Flags a, Flags b) {
+    return static_cast<Flags>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b)
+    );
+}
+
+Flags f = Flags::Read | Flags::Write;     // ✅ 现在可以了
+}
+
+\quiz[choice]{
+Q: 以下代码的输出是什么？
+`struct S { int a = 10; int b = 20; int c = 30; }; S s{1, 2}; std::cout << s.a << " " << s.b << " " << s.c;`
+A: 10 20 30
+B: 1 2 30
+C: 1 2 0
+D: 编译错误
+ANS: B
+EXP: `s{1, 2}` 使用聚合初始化，按顺序给 a=1、b=2。c 没有提供值，所以使用默认成员初始化器的值 30。聚合初始化可以只提供部分值，未提供的使用默认值。
+}
+
+/// 实战作业
+
+// 🟢 基础题：游戏角色数据卡
+
+用 struct 和 enum class 定义一个游戏角色数据卡片，然后打印角色信息。
+
+**要求：**
+1. 定义 `enum class Role`，包含 Warrior、Mage、Archer 三个角色类型
+2. 定义 `struct Character`，包含名字、角色类型、血量、攻击力，都给默认值
+3. 创建两个角色并打印它们的信息
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+// TODO: 定义 enum class Role，包含 Warrior, Mage, Archer
+
+
+// TODO: 定义 struct Character，包含：
+//   std::string name = "Unknown"
+//   Role role = Role::Warrior
+//   int hp = 100
+//   int attack = 10
+
+
+// 这个函数帮你把 Role 转成字符串（已写好）
+const char* roleToString(Role r) {
+    switch (r) {
+        case Role::Warrior: return "Warrior";
+        case Role::Mage:    return "Mage";
+        case Role::Archer:  return "Archer";
+    }
+    return "Unknown";
+}
+
+void printCharacter(const Character& c) {
+    std::cout << "[" << roleToString(c.role) << "] "
+              << c.name << " - HP: " << c.hp
+              << ", ATK: " << c.attack << "\n";
+}
+
+int main() {
+    // TODO: 创建角色 alice（Warrior，HP=120，ATK=15）
+    // TODO: 创建角色 bob（Mage，HP=80，ATK=25）
+
+    // 提示：可以用聚合初始化 Character{"Alice", Role::Warrior, 120, 15}
+
+    // printCharacter(alice);
+    // printCharacter(bob);
+
+    return 0;
+}
+}
+
+// 🟢 基础题：方向枚举与移动
+
+用 enum class 和 switch 实现一个简单的位置移动函数。
+
+\run[cpp]{
+#include <iostream>
+
+struct Vec2 {
+    int x = 0;
+    int y = 0;
+};
+
+enum class Direction { Up, Down, Left, Right };
+
+// TODO: 实现 move 函数
+// 根据方向移动坐标：Up: y+1, Down: y-1, Left: x-1, Right: x+1
+Vec2 move(Vec2 pos, Direction dir) {
+    /* TODO: 你的代码 */
+    return pos;
+}
+
+int main() {
+    Vec2 pos{5, 5};
+    std::cout << "起始位置: (" << pos.x << ", " << pos.y << ")\n";
+
+    pos = move(pos, Direction::Up);
+    pos = move(pos, Direction::Up);
+    pos = move(pos, Direction::Right);
+
+    std::cout << "移动后: (" << pos.x << ", " << pos.y << ")\n";
+    // 预期输出: (6, 7)
+
+    return 0;
+}
+}
+
+// 🟡 进阶题（选做）：颜色混合器
+
+结合 struct 和 enum class，实现一个简单的颜色混合系统。
+
+**要求：**
+1. 定义 `struct Color`，包含 r、g、b、a 四个 `uint8_t` 成员，都给默认值
+2. 定义 `enum class BlendMode { Normal, Add, Multiply }`
+3. 实现 `Color blend(Color base, Color layer, BlendMode mode)` 函数
+   - Normal：直接返回 layer
+   - Add：每个通道 = min(base + layer, 255)
+   - Multiply：每个通道 = base * layer / 255
+4. 打印混合结果
+
+\collapse[💡 参考思路]{
+\code[cpp]{
+Color blend(Color base, Color layer, BlendMode mode) {
+    switch (mode) {
+        case BlendMode::Normal:
+            return layer;
+        case BlendMode::Add:
+            return {
+                static_cast<uint8_t>(std::min(base.r + layer.r, 255)),
+                static_cast<uint8_t>(std::min(base.g + layer.g, 255)),
+                static_cast<uint8_t>(std::min(base.b + layer.b, 255)),
+                static_cast<uint8_t>(std::min(base.a + layer.a, 255))
+            };
+        case BlendMode::Multiply:
+            return {
+                static_cast<uint8_t>(base.r * layer.r / 255),
+                static_cast<uint8_t>(base.g * layer.g / 255),
+                static_cast<uint8_t>(base.b * layer.b / 255),
+                static_cast<uint8_t>(base.a * layer.a / 255)
+            };
+    }
+    return base;
+}
+}
+}

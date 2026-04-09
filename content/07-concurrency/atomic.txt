@@ -1,0 +1,355 @@
+/// 简介
+
+互斥量保证正确性，但加锁/解锁有代价。**原子操作（Atomic Operation）**在硬件层面保证操作不可分割——无需锁就能安全地在线程间共享数据。`std::atomic` 是高性能并发的基石，但它的**内存序（Memory Order）**模型是 C++ 中最难的主题之一。
+
+本节目标：理解 `std::atomic` 的操作语义，掌握常用内存序，能实现基础的无锁模式（如自旋锁、标志位通信）。更深层的无锁数据结构将在 patterns 章节讨论。
+
+/// 知识点列表
+
+\list{
+- std::atomic<T> 基础：load、store、exchange
+- fetch_add / fetch_sub 等 Read-Modify-Write 操作
+- compare_exchange_weak / strong（CAS）
+- 内存序（memory_order）：relaxed, acquire, release, acq_rel, seq_cst
+- std::atomic_flag 与自旋锁实现
+- C++20: atomic_ref, atomic<shared_ptr>, atomic::wait/notify
+- lock-free 编程的基本原则
+}
+
+/// 知识点详解
+
+// std::atomic<T> 基础
+
+为什么 `counter++` 不是线程安全的？因为它在 CPU 层面是"读→加→写"三步——其间可被中断。`std::atomic` 用硬件指令保证整个读-改-写不可分割。
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <vector>
+
+std::atomic<int> counter{0};
+
+void increment(int n) {
+    for (int i = 0; i < n; ++i)
+        counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+int main() {
+    constexpr int N = 100000;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i)
+        threads.emplace_back(increment, N);
+    for (auto& t : threads) t.join();
+    std::cout << "counter = " << counter.load()
+              << " (expected " << 4 * N << ")\n";
+    return 0;
+}
+}
+
+核心操作一览：
+
+\table{
+操作 | 含义 | 返回值
+---
+`load()` | 原子读取 | 当前值
+`store(val)` | 原子写入 | void
+`exchange(val)` | 原子交换 | 旧值
+`fetch_add(n)` | 原子 += n | 旧值
+`fetch_sub(n)` | 原子 -= n | 旧值
+`fetch_and(mask)` | 原子位与 | 旧值
+`fetch_or(mask)` | 原子位或 | 旧值
+`compare_exchange_weak/strong` | CAS | bool
+}
+
+// CAS——无锁编程的核心
+
+**比较并交换（Compare-And-Swap, CAS）**是所有无锁算法的基本构件。语义：如果当前值等于 `expected`，则替换为 `desired` 并返回 `true`；否则将当前值写入 `expected` 并返回 `false`。
+
+\code[cpp]{
+std::atomic<int> x{0};
+
+// strong 版本：不会虚假失败
+int expected = 0;
+bool ok = x.compare_exchange_strong(expected, 42);
+// ok == true, x == 42
+
+// weak 版本：可能虚假失败（即使 x == expected 也可能返回 false）
+// 但在循环中使用通常更快（某些架构上产生更优指令）
+int e = 42;
+while (!x.compare_exchange_weak(e, e + 1)) {
+    // e 被更新为 x 的当前值，自动重试
+}
+}
+
+\note{**何时用 weak vs strong？** 循环 CAS 用 `weak`（略快），单次 CAS 用 `strong`（不会虚假失败）。}
+
+// 内存序（Memory Order）
+
+这是原子操作最核心也最困难的部分。内存序控制的不是原子操作本身的正确性（那是保证的），而是**原子操作周围的非原子读写在其他线程中的可见顺序**。
+
+\table{
+内存序 | 保证 | 性能 | 使用场景
+---
+`seq_cst`（默认） | 所有线程看到一致的全局操作顺序 | 最慢 | 默认选择，最安全
+`acquire` | 此 load 之后的读写不会被重排到此 load 之前 | 中等 | 消费方读标志位
+`release` | 此 store 之前的读写不会被重排到此 store 之后 | 中等 | 生产方写标志位
+`acq_rel` | 同时具有 acquire + release 语义 | 中等 | CAS 操作
+`relaxed` | 只保证原子性，不保证顺序 | 最快 | 计数器、统计
+}
+
+\tabs{
+\tab[seq_cst（默认，安全）]{
+\code[cpp]{
+std::atomic<int> x{0};
+x.store(42);                     // 默认 seq_cst
+int v = x.load();                // 默认 seq_cst
+// 所有线程看到的操作顺序一致——最容易推理
+}
+}
+\tab[acquire-release（常用优化）]{
+\code[cpp]{
+std::atomic<bool> ready{false};
+int data = 0; // 非原子——被 ready 的内存序"保护"
+
+// 生产者
+data = 42;                                   // 普通写
+ready.store(true, std::memory_order_release); // release 保证:
+                                              // data=42 在 ready=true 之前可见
+
+// 消费者
+while (!ready.load(std::memory_order_acquire)) {} // acquire 保证:
+assert(data == 42);                               // 看到 ready==true 时
+                                                  // 一定能看到 data==42
+}
+}
+\tab[relaxed（仅计数器）]{
+\code[cpp]{
+std::atomic<int> stat{0};
+// 多线程统计——只需最终一致，不需要顺序保证
+stat.fetch_add(1, std::memory_order_relaxed);
+}
+}
+}
+
+\danger{**内存序错误是最难调试的并发 bug。** 它可能在 x86 上正常运行（x86 有强内存模型），但在 ARM/RISC-V 上崩溃（弱内存模型）。原则：**默认 `seq_cst`，只有 profiling 确认原子操作是瓶颈后才降低**。}
+
+// std::atomic_flag 与自旋锁
+
+`std::atomic_flag` 是标准保证的 **lock-free** 原子布尔类型——它是实现自旋锁（Spinlock）的最小构件。
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <vector>
+
+class Spinlock {
+    std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+public:
+    void lock() {
+        while (flag_.test_and_set(std::memory_order_acquire)) {
+            // TTAS 优化：先只读检查，减少缓存行争用
+            while (flag_.test(std::memory_order_relaxed)) {
+                #if defined(__x86_64__) || defined(_M_X64)
+                __builtin_ia32_pause(); // x86 PAUSE 指令
+                #else
+                std::this_thread::yield();
+                #endif
+            }
+        }
+    }
+    void unlock() {
+        flag_.clear(std::memory_order_release);
+    }
+};
+
+Spinlock spin;
+int shared_val = 0;
+
+void work(int n) {
+    for (int i = 0; i < n; ++i) {
+        spin.lock();
+        ++shared_val;
+        spin.unlock();
+    }
+}
+
+int main() {
+    constexpr int N = 100000;
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 4; ++i) ts.emplace_back(work, N);
+    for (auto& t : ts) t.join();
+    std::cout << "shared_val = " << shared_val
+              << " (expected " << 4 * N << ")\n";
+    return 0;
+}
+}
+
+\warning{**自旋锁只适用于临界区极短（< 1 μs）的场景。** 线程在自旋时占满 CPU。若临界区可能阻塞（I/O、内存分配），必须用 `std::mutex`。}
+
+// C++20 新增：atomic_ref / atomic<shared_ptr> / wait-notify
+
+\code[cpp]{
+#include <atomic>
+#include <memory>
+
+// atomic_ref：给非原子对象提供原子访问
+int plain_var = 0;
+std::atomic_ref<int> aref(plain_var);
+aref.fetch_add(1); // 原子操作 plain_var
+// 用途：不想/不能改变变量类型，但需要线程安全访问
+
+// atomic<shared_ptr>：C++20 起合法
+std::atomic<std::shared_ptr<int>> asp;
+asp.store(std::make_shared<int>(42));
+auto p = asp.load(); // 原子获取 shared_ptr
+
+// wait/notify：轻量级条件等待（无需 mutex）
+std::atomic<int> flag{0};
+// 线程A：flag.wait(0);    // 阻塞直到 flag != 0
+// 线程B：flag.store(1); flag.notify_one(); // 唤醒 A
+}
+
+\collapse[atomic_ref 的对齐要求]{
+`atomic_ref<T>` 要求被引用的对象自然对齐于 `atomic_ref<T>::required_alignment`——通常等于 `sizeof(T)`。如果对象未正确对齐（如打包到结构体中），行为未定义。使用前检查 `alignof(T) >= atomic_ref<T>::required_alignment`。
+}
+
+// lock-free 编程基本原则
+
+\table{
+原则 | 说明
+---
+ABA 警惕 | CAS 只比较值——值从 A→B→A 变回来，CAS 看不出中间变化
+最小化竞争窗口 | CAS 循环体尽量短，减少重试概率
+避免内存回收陷阱 | 无锁容器中已删除的节点可能仍被其他线程引用（需 Hazard Pointer / RCU）
+渐进式后退 | CAS 高频失败时加入 yield/backoff，减少总线竞争
+验证 lock-free 性 | 用 `is_lock_free()` 检查——某些类型/平台会退化为内部加锁
+}
+
+\quiz[choice|单选]{
+Q: 以下哪种内存序组合适合"一个线程写标志位通知另一个线程数据就绪"模式？
+A: store 用 relaxed，load 用 relaxed
+B: store 用 release，load 用 acquire
+C: store 用 acquire，load 用 release
+D: store 和 load 都用 relaxed
+ANS: B
+EXP: 生产者先写数据再 **release store** 标志位，保证写入在标志位之前可见。消费者 **acquire load** 标志位后，保证能看到之前的所有写入。relaxed 不保证顺序，acquire/release 方向不对。
+}
+
+\quiz[tf|判断]{
+Q: `std::atomic<std::string>` 是合法的类型。
+ANS: F
+EXP: `std::atomic<T>` 要求 `T` 是 **TriviallyCopyable**（可平凡拷贝的）。`std::string` 含有指针和动态内存，不满足此要求。C++20 特别支持了 `atomic<shared_ptr<T>>` 和 `atomic<weak_ptr<T>>`——这是标准的特殊例外。
+}
+
+/// 工程实践
+
+\list{
+- 默认用 `seq_cst`，只在 profiling 证明是瓶颈后才降级到 `acquire/release` 或 `relaxed`
+- 使用 `atomic::is_lock_free()` 验证——某些平台上 `atomic<struct>` 可能退化为内部加锁
+- 自旋锁只用于极短临界区（几条指令），否则用 `mutex`
+- 无锁数据结构极难正确实现——优先从经过验证的库获取（Folly、moodycamel、Boost.Lockfree）
+- `atomic_ref` 在不能修改类型声明时是安全访问的良好选择
+- 所有无锁代码必须用 TSan 测试 + 在弱内存模型平台（ARM）上验证
+}
+
+/// 常用方法速查
+
+\table{
+API | 用途 | 标准
+---
+`atomic<T>::load(order)` | 原子读 | C++11
+`atomic<T>::store(val, order)` | 原子写 | C++11
+`atomic<T>::exchange(val, order)` | 原子交换 | C++11
+`atomic<T>::compare_exchange_weak/strong` | CAS | C++11
+`atomic<T>::fetch_add/sub/and/or/xor` | 原子算术/位运算 | C++11
+`atomic_flag::test_and_set` | 设置并返回旧值 | C++11
+`atomic_flag::clear` | 清除 | C++11
+`atomic<T>::wait(old)` | 阻塞直到值改变 | C++20
+`atomic<T>::notify_one/all` | 唤醒等待 | C++20
+`atomic_ref<T>` | 非原子对象的原子访问 | C++20
+`atomic<shared_ptr<T>>` | shared_ptr 原子操作 | C++20
+}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11 引入完整的原子操作和内存模型。`atomic_flag` 是唯一保证 lock-free 的类型。对 `shared_ptr` 的原子操作只有独立函数（`std::atomic_load` 等），使用笨拙。
+
+new: C++20 引入 `atomic_ref`（无需修改类型即可原子访问）、`atomic<shared_ptr>`（终于可以直接用了）、`atomic::wait/notify`（轻量级 futex 式等待）。`atomic_flag` 新增 `test()` 只读操作。C++20 还为 `atomic_flag` 提供了默认构造为 clear 状态。
+}
+
+/// 难点易错点分析
+
+\danger{**`std::atomic<T>` 不保证 T 的成员访问是原子的。** `atomic<Point>` 只能整体 `load`/`store`，不能 `atomic_point.x = 1`。如果需要独立更新成员，为每个成员单独声明 `atomic`。}
+
+\danger{**CAS 循环中忘了更新 expected。** `compare_exchange_weak/strong` 失败时会自动将 `expected` 更新为当前值——利用这个特性就不需要额外的 `load()`。}
+
+\danger{**relaxed 内存序 + 多变量通信 = bug。** relaxed 只为单个变量保证原子性，不保证不同变量间的可见顺序。跨变量的协调至少需要 acquire/release。}
+
+/// 实战作业
+
+🟢 **基础：原子计数器**
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <vector>
+
+int main() {
+    std::atomic<int> counter{0};
+    constexpr int THREADS = 8, OPS = 100000;
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < THREADS; ++i)
+        threads.emplace_back([&counter]{
+            for (int j = 0; j < OPS; ++j)
+                /* TODO: 用 fetch_add 原子自增 counter */;
+        });
+    for (auto& t : threads) t.join();
+
+    std::cout << "counter = " << counter.load()
+              << " (expected " << THREADS * OPS << ")\n";
+    return 0;
+}
+}
+
+🟡 **进阶：TTAS 自旋锁**
+
+实现 Test-and-Test-and-Set 自旋锁：
+- `lock()` 先只读检查 `flag_.test(relaxed)`，为 false 时才尝试 `test_and_set(acquire)`
+- `unlock()` 用 `clear(release)`
+- 用 4 个线程各自增 100000 次共享计数器验证正确性
+- 对比简单 TAS 和 TTAS 的缓存行争用情况（可用 `perf stat` 测 L1 miss）
+
+🔴 **挑战：无锁 SPSC 环形缓冲区**
+
+实现**单生产者单消费者（SPSC）**环形队列：
+- 用 `atomic<size_t>` 的 `acquire/release` 管理 head/tail
+- 缓冲区大小为 2 的幂，用位运算取模
+- 不使用 `seq_cst`——全部用 `release`（写）/ `acquire`（读）
+- 测试：一个线程写 100 万条消息，一个线程读，验证结果正确且无数据竞争
+
+\collapse[SPSC 队列核心设计]{
+\code[cpp]{
+template<typename T, size_t N> // N 必须是 2 的幂
+class SPSCQueue {
+    std::array<T, N> buf_;
+    alignas(64) std::atomic<size_t> head_{0}; // 生产者写
+    alignas(64) std::atomic<size_t> tail_{0}; // 消费者写
+
+public:
+    bool push(const T& val) {
+        size_t h = head_.load(std::memory_order_relaxed);
+        size_t next = (h + 1) & (N - 1);
+        if (next == tail_.load(std::memory_order_acquire)) return false; // 满
+        buf_[h] = val;
+        head_.store(next, std::memory_order_release);
+        return true;
+    }
+    // pop 类似，读 tail_、写 head_...
+};
+}
+}

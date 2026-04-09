@@ -1,0 +1,704 @@
+/// 简介
+
+上一节你学会了用类把数据和行为绑在一起。但如果类的所有成员都能被外部随意读写，就像游戏角色的血量可以被任何代码直接改成 -9999——那封装就毫无意义了。**访问控制（Access Control）**正是 C++ 用来回答"谁能碰什么"的机制。
+
+想象一台游戏机：玩家能看到屏幕、按手柄按键（`public` 接口），维修技师可以打开后盖检查主板（`protected` 扩展点），但只有内部电路自己知道怎么运作（`private` 实现细节）。你不会希望玩家直接焊电路板——同样的道理，好的类设计应该把"能做什么"和"怎么做到"分开。
+
+本节将从三个访问级别出发，逐步深入到封装哲学、`friend` 机制和接口设计原则，帮助你设计出既安全又灵活的类。
+
+/// 知识点列表
+
+\list{
+- public / private / protected 三种访问级别的语义
+- struct 与 class 的默认访问级别差异
+- 封装（Encapsulation）的意义与实践：行为接口 vs 数据接口
+- getter / setter 模式及其现代替代方案
+- friend 函数与 friend 类
+- friend 的传递性与继承性规则
+- 接口设计原则：最小暴露（Minimum Exposure）
+- C++20/23 相关特性
+}
+
+/// 知识点详解
+
+// public / private / protected 语义
+
+**为什么需要访问级别？** 当多人协作开发一个游戏引擎时，如果所有成员都可以随意访问，任何人都可能不小心修改某个内部状态，导致难以追踪的 Bug。访问级别让你明确表达设计意图："这个可以用，那个别碰。"
+
+C++ 提供三种**访问说明符（Access Specifier）**：
+
+\table{
+说明符 | 类自身 | 派生类（子类） | 外部代码
+--- | --- | --- | ---
+`public` | ✅ | ✅ | ✅
+`protected` | ✅ | ✅ | ❌
+`private` | ✅ | ❌ | ❌
+}
+
+来看一个游戏角色的例子：
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <algorithm>
+
+class Player {
+public:      // 公开接口——任何代码都能调用
+    std::string name;
+
+    void takeDamage(int dmg) {
+        hp = std::max(0, hp - dmg);
+        std::cout << name << " 受到 " << dmg
+                  << " 伤害, 剩余 HP: " << hp << "\n";
+    }
+
+    bool isDead() const { return hp <= 0; }
+
+protected:   // 保护成员——只有自己和子类能访问
+    int level = 1;
+
+    void levelUp() {
+        ++level;
+        maxHp += 20;
+        hp = maxHp;  // 升级回满血
+        std::cout << name << " 升级到 Lv." << level << "!\n";
+    }
+
+private:     // 私有成员——只有自己能访问
+    int hp = 100;
+    int maxHp = 100;
+};
+
+int main() {
+    Player p;
+    p.name = "Alice";      // OK: name 是 public
+    p.takeDamage(30);       // OK: takeDamage 是 public
+    std::cout << "Dead? " << std::boolalpha << p.isDead() << "\n";
+
+    // p.hp = 9999;         // 编译错误！hp 是 private
+    // p.level = 99;        // 编译错误！level 是 protected
+    // p.levelUp();         // 编译错误！levelUp 是 protected
+}
+}
+
+\tip{**经验法则：** 成员变量默认 `private`，对外方法 `public`，为子类预留的扩展点用 `protected`。能不暴露就不暴露——暴露出去的东西日后很难收回。}
+
+// struct 与 class 的默认访问级别
+
+很多初学者困惑 `struct` 和 `class` 到底有什么区别。答案简洁到让人意外：**在 C++ 中，它们几乎完全等价，唯一的区别是默认访问级别。**
+
+\code[cpp]{
+struct EnemyA {
+    int hp;         // 默认 public
+    void attack();  // 默认 public
+};
+
+class EnemyB {
+    int hp;         // 默认 private
+    void attack();  // 默认 private
+};
+}
+
+\note{这不仅仅是成员的默认级别——**继承时的默认访问级别**也不同。`struct` 默认 `public` 继承，`class` 默认 `private` 继承。详见继承章节。}
+
+在实际工程中，惯例是：
+
+\list{
+- `struct`：纯数据聚合（Plain Old Data），几乎没有成员函数，如 `Vec2`、`Color`、`Config`
+- `class`：有行为逻辑和不变量需要维护的对象，如 `Player`、`Scene`、`Engine`
+}
+
+\quiz[tf]{
+Q: 在 C++ 中，`struct` 和 `class` 除了默认访问级别不同，在功能上完全等价。
+ANS: T
+EXP: 这是 C++ 与 C 的一个关键区别。C 的 `struct` 不能有成员函数，但 C++ 的 `struct` 和 `class` 在功能上完全相同（都可以有成员函数、继承、虚函数等），唯一不同的是默认访问级别：`struct` 默认 `public`，`class` 默认 `private`。
+}
+
+// 封装的意义与实践
+
+**封装（Encapsulation）**不只是"把数据藏起来"那么简单——它的核心目标是**维护不变量（Invariant）**。所谓不变量，就是"对象在任何时刻都应该满足的条件"。
+
+比如 `Player` 的不变量是：`0 <= hp <= maxHp`。如果 `hp` 是 `public`，任何代码都可以写 `p.hp = -1`，不变量就被破坏了。
+
+来对比两种设计风格：
+
+\tabs{
+\tab[数据接口（不推荐）]{
+\code[cpp]{
+// "数据接口"：暴露数据，由调用方负责维护规则
+class BadPlayer {
+public:
+    int hp = 100;
+    int maxHp = 100;
+    // 调用方必须自己检查 hp 范围——但你能保证每个人都记得吗？
+};
+
+BadPlayer p;
+p.hp = -42;         // 编译通过，但逻辑错误
+p.hp = p.maxHp + 1; // 也没人阻止
+}
+}
+\tab[行为接口（推荐）]{
+\code[cpp]{
+// "行为接口"：隐藏数据，通过有含义的操作来修改状态
+class GoodPlayer {
+    int hp = 100;
+    int maxHp = 100;
+public:
+    int getHp() const { return hp; }
+    int getMaxHp() const { return maxHp; }
+
+    void takeDamage(int dmg) {
+        hp = std::max(0, hp - dmg);  // 保证 hp >= 0
+    }
+    void heal(int amount) {
+        hp = std::min(maxHp, hp + amount);  // 保证 hp <= maxHp
+    }
+    bool isDead() const { return hp <= 0; }
+};
+// 无论外部怎么调用，不变量始终成立！
+}
+}
+}
+
+**行为接口（Behavioral Interface）**的核心思想是：不要让外部决定"如何修改状态"，而是提供"有意义的操作"。`takeDamage(30)` 比 `setHp(getHp() - 30)` 更清晰，也更安全。
+
+// getter / setter 模式及其现代替代
+
+**getter / setter** 是一种常见的封装模式：用 `getX()` 读取私有数据，用 `setX()` 修改。但如果你给每个私有成员都机械地写一对 get/set，那和直接 `public` 没有本质区别——这叫**虚假封装（Illusory Encapsulation）**。
+
+\code[cpp]{
+// ❌ 虚假封装——还不如直接 public
+class Inventory {
+    int gold = 0;
+public:
+    int getGold() const { return gold; }
+    void setGold(int g) { gold = g; }  // 外部可以设任意值，没有保护
+};
+}
+
+更好的做法是提供有语义的操作，并只在确实需要读取时提供 getter：
+
+\code[cpp]{
+// ✅ 有意义的行为接口
+class Inventory {
+    int gold = 0;
+public:
+    int getGold() const { return gold; }  // 只读查询是合理的
+
+    bool spend(int amount) {              // 花钱——自带余额检查
+        if (amount <= 0 || gold < amount) return false;
+        gold -= amount;
+        return true;
+    }
+    void earn(int amount) {               // 赚钱——保证不传入负数
+        if (amount > 0) gold += amount;
+    }
+};
+}
+
+\warning{**不需要 setter 的场景远多于需要的。** 如果你发现自己在给每个私有成员都写 set 方法，停下来想一想：这个成员真的需要被外部任意修改吗？大多数时候答案是"不需要"。}
+
+\quiz[choice]{
+Q: 以下哪种做法最能体现良好的封装设计？
+A: 所有成员变量声明为 `public`，方便访问
+B: 所有成员变量声明为 `private`，并为每个变量提供 `get/set` 方法
+C: 所有成员变量声明为 `private`，仅暴露有语义的行为方法（如 `takeDamage`、`heal`）
+D: 所有成员变量声明为 `protected`，让子类来管理
+ANS: C
+EXP: 选项 B 的"机械 get/set"本质上和 `public` 一样，没有保护不变量。选项 C 通过有意义的行为方法来修改状态，确保对象在任何时候都保持合法状态，这才是封装的真正价值。
+}
+
+// friend 函数与 friend 类
+
+有时候，两个类之间关系非常紧密，严格的 `private` 会让代码变得笨拙。C++ 的 **`friend`（友元）**机制允许你授予特定函数或类访问自己私有成员的权限——可以授权给一个**类**，也可以只授权给一个**函数**。
+
+\code[cpp]{
+class Scene {
+    friend class Engine;                       // 授权整个类
+    friend void debugDump(const Scene&);       // 只授权一个函数
+
+    std::vector<std::string> entities;
+    bool dirty = false;
+public:
+    void addEntity(const std::string& name) {
+        entities.push_back(name);
+        dirty = true;
+    }
+};
+
+class Engine {
+public:
+    void render(const Scene& s) {
+        if (s.dirty)  // OK: Engine 是 Scene 的 friend
+            std::cout << "Rendering " << s.entities.size() << " entities\n";
+    }
+};
+}
+
+`friend` 最常见也最合理的用途之一是 `operator<<` 重载——因为 `operator<<` 是非成员函数，但往往需要读取私有数据：
+
+\code[cpp]{
+class Vec2 {
+    float x, y;
+public:
+    Vec2(float x, float y) : x(x), y(y) {}
+
+    friend std::ostream& operator<<(std::ostream& os, const Vec2& v) {
+        return os << "(" << v.x << ", " << v.y << ")";
+    }
+};
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+
+class Scene {
+    friend void debugDump(const Scene& s);
+    std::vector<std::string> entities;
+    bool dirty = false;
+public:
+    void addEntity(const std::string& name) { entities.push_back(name); dirty = true; }
+};
+
+void debugDump(const Scene& s) {
+    std::cout << "Dirty: " << std::boolalpha << s.dirty
+              << ", Entities: " << s.entities.size() << "\n";
+    for (const auto& e : s.entities) std::cout << "  - " << e << "\n";
+}
+
+int main() {
+    Scene scene;
+    scene.addEntity("Player");
+    scene.addEntity("Enemy_01");
+    debugDump(scene);  // friend 函数可以访问私有成员
+}
+
+// friend 的传递性与继承性
+
+`friend` 权限有两条严格限制，记住它们能帮你避开很多坑：
+
+\danger{**友元不传递。** 如果 A 是 B 的友元，B 是 C 的友元，**不代表** A 是 C 的友元。友元关系是"点对点授权"，不会扩散。}
+
+\danger{**友元不继承。** 如果 `Base` 声明 `DebugTool` 为友元，`Derived` 继承了 `Base`，但 `DebugTool` **无法**访问 `Derived` 新增的 `private` 成员。反过来，`Base` 的友元也不会自动成为 `Derived` 的友元。}
+
+\diagram[flow]{
+A 是 B 的 friend -> B 是 C 的 friend -> A 能访问 C? ❌ 不能！
+}
+
+\code[cpp]{
+class C {
+    int secret = 42;
+    friend class B;       // 只授权 B
+};
+
+class B {
+    friend class A;       // B 授权 A 访问自己，但无法替 C 做决定
+};
+
+class A {
+    void tryAccess(C& c) {
+        // c.secret;      // 编译错误！A 不是 C 的友元
+    }
+};
+}
+
+\tip{**经验法则：** 尽量用 friend 函数而非 friend 类——授权范围越小越安全。如果只有一个函数需要访问私有数据，就只给那个函数开绿灯。}
+
+// 接口设计原则：最小暴露
+
+**最小暴露原则（Principle of Minimum Exposure）**也叫"最小权限原则"——类只暴露外部**必须**使用的接口，其他一切都藏起来。
+
+\list{
+- 把成员变量设为 `private`（除非是纯数据结构体）
+- 只把外部真正需要调用的方法设为 `public`
+- 内部辅助函数（Helper Function）设为 `private`
+- 只有在确定子类需要扩展时才用 `protected`
+- 若只需一个函数访问私有数据，用 `friend` 函数而非 `friend class`
+}
+
+\collapse[🤔 思考：为什么暴露太多是坏事？]{
+假设你写了一个 `Engine` 类，把内部的渲染管线、资源管理器都设为 `public`。一开始没问题，但两个月后你想重构渲染管线——结果发现有 200 处代码直接依赖了你的内部实现。每改一处接口，200 处都要跟着改。这就是**耦合（Coupling）**的代价。接口越小，改动的波及面就越小。
+}
+
+比如一个 `AudioEngine`：`public` 只需 `playSound() / setVolume() / stopAll()`，而内部的 `SoundBuffer`、`mixAndOutput()` 等实现细节都应该是 `private`。外部代码越少依赖内部细节，未来重构的成本就越低。
+
+/// 新版特性（C++17/20/23）
+
+// C++17：结构化绑定与访问控制
+
+C++17 的**结构化绑定（Structured Bindings）**可以解构全 `public` 的类型，但无法绑定 `private` 成员（除非提供 `get<>()` 特化，详见 utility 章节）：
+
+\code[cpp]{
+struct Point { float x, y; };
+auto [px, py] = Point{1.0f, 2.0f};  // OK：全 public
+
+class PrivatePoint { float x, y; /* private */ };
+// auto [qx, qy] = PrivatePoint{...};  // 错误！private 成员无法绑定
+}
+
+// C++20：模块与访问控制
+
+C++20 引入的**模块（Modules）**为访问控制增添了一个新维度——**模块可达性（Module Reachability）**。在模块内部，你可以通过 `export` 控制哪些声明对外可见：
+
+\code[cpp]{
+// GameEngine.cppm（模块接口）
+export module GameEngine;
+
+export class Player {      // 整个类被导出，外部可见
+public:
+    void move(float dx, float dy);
+};
+
+class InternalHelper {     // 未导出，模块外不可见
+    // ...
+};
+}
+
+\note{模块的可见性控制是在 `public/private/protected` 之上的额外一层——你可以让一个类本身有 `public` 成员，但整个类对模块外不可见。这比传统的头文件 + `private` 提供了更强的封装。详见模块与协程章节。}
+
+// C++23：deducing this
+
+C++23 的 **deducing this**（显式对象参数）不改变访问控制规则，但消除了为 `const` / 非 `const` 写两份重载的痛苦：
+
+\code[cpp]{
+class Widget {
+    int value = 0;
+public:
+    // C++23: 一个函数同时处理 const 和非 const
+    auto&& getValue(this auto&& self) {
+        return std::forward<decltype(self)>(self).value;
+    }
+};
+}
+
+/// 工程实践
+
+// 实际项目中的封装策略
+
+\list{
+- **数据传输对象（DTO）用 `struct`：** 配置、网络包、序列化数据等纯数据类型，直接用 `struct` + 全 `public`。不需要不变量的数据不需要封装
+- **业务对象用 `class` + 行为接口：** `Player`、`Scene`、`Engine` 等有状态逻辑的对象，成员变量一律 `private`
+- **`friend` 限定用途：** `operator<<` 重载、序列化器、单元测试辅助。不要因为不想写公开接口就随意 friend
+- **头文件只暴露接口：** 将私有成员的实现放在 `.cpp` 中，必要时使用 **Pimpl 模式（Pointer to Implementation）**彻底隐藏实现
+}
+
+\compare{
+old: C++98/03 时代惯例是为每个成员变量写 getter/setter 对，形成"数据接口"风格。封装主要依赖 `private` + 头文件分离。
+
+new: 现代 C++ 更推崇"行为接口"——只暴露操作而非数据。结合 `[[nodiscard]]`（提醒调用方不要忽略返回值）、`std::expected`（C++23 错误处理）等特性，接口更安全、更具表达力。模块系统提供了超越类级别的可见性控制。
+}
+
+/// 难点易错点分析
+
+\danger{**`protected` 的访问限制比你想的更严格。** 派生类只能通过**自身对象**访问基类的 `protected` 成员，不能通过**其他基类对象**访问：
+
+\code[cpp]{
+class Entity {
+protected:
+    int id = 0;
+};
+
+class Player : public Entity {
+    void copyId(Entity& other) {
+        this->id = 1;    // ✅ 通过自己的对象访问
+        // other.id = 2; // ❌ 编译错误！不能通过其他 Entity 对象访问
+    }
+    void copyFromPlayer(Player& other) {
+        other.id = 2;    // ✅ 可以——因为 other 的类型也是 Player
+    }
+};
+}
+}
+
+\danger{**`friend` 声明不受访问说明符约束。** 无论写在 `public`、`private` 还是 `protected` 区域，效果完全一样——`friend` 不是成员声明，不受访问级别控制。}
+
+\danger{**忘记了 class 默认是 private。** 从 `struct` 转向 `class` 时，很多人忘记加 `public:`，导致所有成员都变成 `private`，编译时报一堆"无法访问"错误。}
+
+\quiz[choice]{
+Q: 下面的代码能编译通过吗？
+\code[cpp]{
+class Item {
+    int weight = 1;
+    friend class Inventory;
+};
+class Inventory {
+    friend class Player;
+};
+class Player {
+    void check(Item& item) {
+        int w = item.weight;  // 这行能通过吗？
+    }
+};
+}
+A: 能编译——Player 是 Inventory 的友元，Inventory 是 Item 的友元，所以 Player 能访问 Item
+B: 编译错误——友元关系不传递，Player 不是 Item 的友元
+C: 能编译——但会有运行时警告
+D: 取决于编译器实现
+ANS: B
+EXP: 友元关系**不传递**。Player 是 Inventory 的友元（可以访问 Inventory 的私有成员），Inventory 是 Item 的友元（可以访问 Item 的私有成员），但 Player 与 Item 之间没有任何友元关系，无法访问 `Item::weight`。
+}
+
+/// 实战作业
+
+// 🟢 基础题 1：封装游戏角色
+
+完善下面的 `GameCharacter` 类，使其满足不变量：`0 <= hp <= maxHp`，`0 <= mp <= maxMp`。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <algorithm>
+
+class GameCharacter {
+    std::string name;
+    int hp;
+    int maxHp;
+    int mp;
+    int maxMp;
+
+public:
+    GameCharacter(const std::string& name, int maxHp, int maxMp)
+        : name(name), hp(maxHp), maxHp(maxHp), mp(maxMp), maxMp(maxMp) {}
+
+    // 读取接口
+    const std::string& getName() const { return name; }
+    int getHp() const { return hp; }
+    int getMp() const { return mp; }
+    bool isDead() const { return hp <= 0; }
+
+    // TODO: 实现 takeDamage(int dmg) —— 受到伤害，hp 不低于 0
+    void takeDamage(int dmg) {
+        /* TODO: 你的代码 */
+    }
+
+    // TODO: 实现 heal(int amount) —— 恢复生命，hp 不超过 maxHp
+    void heal(int amount) {
+        /* TODO: 你的代码 */
+    }
+
+    // TODO: 实现 castSpell(int cost) —— 消耗魔法值，返回 bool 表示是否成功
+    bool castSpell(int cost) {
+        /* TODO: 你的代码 */
+        return false;
+    }
+
+    void printStatus() const {
+        std::cout << name << " [HP: " << hp << "/" << maxHp
+                  << " | MP: " << mp << "/" << maxMp << "]\n";
+    }
+};
+
+int main() {
+    GameCharacter hero("Knight", 100, 50);
+    hero.printStatus();           // Knight [HP: 100/100 | MP: 50/50]
+    hero.takeDamage(30);  hero.printStatus();  // HP 应为 70
+    hero.heal(50);        hero.printStatus();  // HP 应为 100（不超过 maxHp）
+    hero.takeDamage(999); hero.printStatus();  // HP 应为 0
+    hero.heal(20);        hero.printStatus();  // HP 应为 20
+    std::cout << "Cast (cost 30): " << std::boolalpha << hero.castSpell(30) << "\n";
+    hero.printStatus();           // MP 应为 20
+    std::cout << "Cast (cost 30): " << hero.castSpell(30) << "\n";  // 应失败
+    hero.printStatus();           // MP 仍为 20
+}
+}
+
+// 🟢 基础题 2：friend 与 operator<<
+
+为 `Weapon` 类实现 `friend operator<<`，输出武器信息。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Weapon {
+    std::string name;
+    int damage;
+    float attackSpeed;
+
+public:
+    Weapon(const std::string& name, int damage, float speed)
+        : name(name), damage(damage), attackSpeed(speed) {}
+
+    // TODO: 声明并实现 friend operator<< 
+    // 输出格式: "Weapon[name, DMG:damage, SPD:attackSpeed]"
+    // 例如: "Weapon[Excalibur, DMG:150, SPD:1.2]"
+
+    /* TODO: 你的代码 */
+};
+
+int main() {
+    Weapon sword("Excalibur", 150, 1.2f);
+    Weapon dagger("Shadow Blade", 60, 2.5f);
+
+    std::cout << sword << "\n";
+    std::cout << dagger << "\n";
+}
+}
+
+// 🟡 进阶题 1：安全的背包系统
+
+实现一个 `Inventory` 类。要求：
+- 物品列表为 `private`，背包有容量上限
+- `addItem` 在背包满时返回 `false`
+- `removeItem` 在物品不存在时返回 `false`
+- 实现 `friend` 函数 `tradeItem`，在两个背包间安全转移物品
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+class Inventory {
+    std::vector<std::string> items;
+    size_t capacity;
+
+    // 声明 friend 函数
+    friend bool tradeItem(Inventory& from, Inventory& to,
+                          const std::string& itemName);
+
+public:
+    Inventory(size_t cap) : capacity(cap) {}
+
+    // TODO: 实现 addItem —— 背包满返回 false
+    bool addItem(const std::string& name) {
+        /* TODO: 你的代码 */
+        return false;
+    }
+
+    // TODO: 实现 removeItem —— 不存在返回 false
+    bool removeItem(const std::string& name) {
+        /* TODO: 你的代码 */
+        return false;
+    }
+
+    void print(const std::string& owner) const {
+        std::cout << owner << " 的背包 (" << items.size()
+                  << "/" << capacity << "): ";
+        for (const auto& item : items) std::cout << "[" << item << "] ";
+        std::cout << "\n";
+    }
+};
+
+// TODO: 实现 tradeItem —— 从 from 移除物品并添加到 to
+// 如果 from 没有该物品或 to 已满，返回 false
+bool tradeItem(Inventory& from, Inventory& to,
+               const std::string& itemName) {
+    /* TODO: 你的代码 */
+    return false;
+}
+
+int main() {
+    Inventory playerBag(3);
+    Inventory npcShop(5);
+
+    playerBag.addItem("Iron Sword");
+    playerBag.addItem("Health Potion");
+    playerBag.addItem("Shield");
+
+    npcShop.addItem("Magic Staff");
+    npcShop.addItem("Fire Scroll");
+
+    playerBag.print("Player");
+    npcShop.print("NPC");
+
+    std::cout << "\n--- 交易: Player 的 Shield -> NPC ---\n";
+    std::cout << "Trade result: " << std::boolalpha
+              << tradeItem(playerBag, npcShop, "Shield") << "\n";
+
+    playerBag.print("Player");
+    npcShop.print("NPC");
+
+    std::cout << "\n--- 尝试交易不存在的物品 ---\n";
+    std::cout << "Trade result: "
+              << tradeItem(playerBag, npcShop, "Dragon Egg") << "\n";
+}
+}
+
+// 🟡 进阶题 2：最小暴露重构
+
+下面的 `GameEngine` 类暴露了太多内部细节。将不需要对外暴露的成员改为 `private`，只保留 `init / loadScene / update / shutdown` 四个 `public` 接口，确保 `main()` 仍然能正常运行。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <vector>
+
+// TODO: 重构——哪些该 public？哪些该 private？
+class GameEngine {
+public:
+    bool running = false;
+    int fps = 60;
+    float deltaTime = 0.016f;
+    std::vector<std::string> loadedScenes;
+
+    void init() { running = true; std::cout << "Engine initialized.\n"; }
+    void loadScene(const std::string& name) {
+        loadedScenes.push_back(name); std::cout << "Loaded: " << name << "\n";
+    }
+    void calculateDeltaTime() { deltaTime = 1.0f / fps; }
+    void update() { calculateDeltaTime(); std::cout << "Update (dt=" << deltaTime << ")\n"; }
+    void shutdown() { running = false; loadedScenes.clear(); std::cout << "Engine shutdown.\n"; }
+};
+
+int main() {
+    GameEngine engine;
+    engine.init();
+    engine.loadScene("MainMenu");
+    engine.loadScene("Level1");
+    engine.update();
+    engine.shutdown();
+}
+}
+
+// 🔴 挑战题：设计一个权限系统
+
+设计一个简单的游戏权限系统，包含以下类：
+- `Player`：普通玩家，只能执行基本操作
+- `Admin`：管理员，可以执行特殊操作（踢人、封号）
+- `GameServer`：服务器，维护玩家列表和 ban 列表
+
+要求：
+1. `GameServer` 的玩家列表和 ban 列表为 `private`
+2. 普通 `Player` 只能通过 `public` 接口查询自己是否被 ban
+3. `Admin` 是 `GameServer` 的 `friend class`，可以直接操作内部数据
+4. 实现 `friend` 函数 `serverStatus()` 输出服务器内部状态（调试用）
+5. 运用最小暴露原则，只暴露必要的接口
+
+\collapse[参考思路]{
+\code[cpp]{
+class GameServer {
+    friend class Admin;
+    friend void serverStatus(const GameServer&);
+
+    std::vector<std::string> players;
+    std::vector<std::string> banList;
+
+    bool isBannedInternal(const std::string& name) const;
+
+public:
+    bool join(const std::string& name);      // 加入服务器
+    void leave(const std::string& name);     // 离开服务器
+    bool isBanned(const std::string& name) const;  // 查询是否被 ban
+    size_t playerCount() const;
+};
+
+class Admin {
+    std::string name;
+public:
+    void kick(GameServer& server, const std::string& target);
+    void ban(GameServer& server, const std::string& target);
+    void unban(GameServer& server, const std::string& target);
+    void listAllPlayers(const GameServer& server) const;  // 直接读内部列表
+};
+}
+
+关键设计点：
+- `GameServer` 的两个列表严格 `private`
+- `Admin` 通过 `friend` 直接操作（模拟管理面板的高权限）
+- 普通调用者只能通过 `join/leave/isBanned` 等 `public` 接口交互
+- `serverStatus` 是一个诊断用的 `friend` 函数，不暴露为成员方法
+}

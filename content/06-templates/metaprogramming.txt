@@ -1,0 +1,494 @@
+/// 简介
+
+模板不仅能在编译期生成代码，还能在编译期**做计算**。这就是**模板元编程（Template Metaprogramming, TMP）**——用类型系统模拟循环、条件、数据结构。虽然 `constexpr` 和 `consteval` 已经替代了大部分编译期值计算，但 TMP 在类型变换、类型列表操作、静态多态等场景中**仍不可替代**。
+
+本节聚焦那些"只有模板才能做到"的技巧：CRTP 静态多态、类型列表操作、标签分发，以及它们在游戏开发（ECS组件注册、序列化）中的实际应用。学完之后你能区分"何时该用 TMP"和"何时 constexpr 就够了"。
+
+/// 知识点列表
+
+\list{
+- 编译期计算：模板递归 vs `constexpr`
+- 类型列表（Type List）
+- 编译期条件（`std::conditional`）
+- CRTP（Curiously Recurring Template Pattern，奇异递归模板模式）
+- 标签分发（Tag Dispatch）
+- 模板元编程在游戏中的应用
+- 何时该用/不该用元编程
+}
+
+/// 知识点详解
+
+// 编译期计算：TMP vs constexpr
+
+TMP 的经典教学案例是编译期 Fibonacci。但我们要先看看 `constexpr` 如何做同样的事，这样你才能判断**何时真的需要 TMP**：
+
+\tabs{
+\tab[TMP 风格（C++98可用）]{
+\code[cpp]{
+template<int N>
+struct Fibonacci {
+    static constexpr int value =
+        Fibonacci<N-1>::value + Fibonacci<N-2>::value;
+};
+template<>
+struct Fibonacci<0> { static constexpr int value = 0; };
+template<>
+struct Fibonacci<1> { static constexpr int value = 1; };
+
+static_assert(Fibonacci<10>::value == 55);
+}
+}
+\tab[constexpr 风格（C++14+，推荐）]{
+\code[cpp]{
+constexpr int fibonacci(int n) {
+    if (n <= 1) return n;
+    int a = 0, b = 1;
+    for (int i = 2; i <= n; ++i) {
+        int t = a + b; a = b; b = t;
+    }
+    return b;
+}
+
+static_assert(fibonacci(10) == 55);
+}
+}
+}
+
+\note{**值计算用 `constexpr`，类型计算用 TMP。** Fibonacci、阶乘这类纯数值计算，`constexpr` 函数写起来和普通代码一样自然。TMP 的真正战场是操作**类型**——类型列表、类型映射、静态多态。}
+
+// 类型列表（Type List）
+
+类型列表是 TMP 的核心数据结构——在编译期存储和操作一组类型。C++ 没有内建的类型容器，但用可变参数模板可以轻松构建：
+
+\code[cpp]{
+// 类型列表：只是一个空的模板壳
+template<typename... Ts>
+struct TypeList {};
+
+// 获取大小
+template<typename List> struct Size;
+template<typename... Ts>
+struct Size<TypeList<Ts...>> {
+    static constexpr std::size_t value = sizeof...(Ts);
+};
+
+// 获取第一个类型
+template<typename List> struct Front;
+template<typename Head, typename... Tail>
+struct Front<TypeList<Head, Tail...>> {
+    using type = Head;
+};
+
+// 弹出第一个
+template<typename List> struct PopFront;
+template<typename Head, typename... Tail>
+struct PopFront<TypeList<Head, Tail...>> {
+    using type = TypeList<Tail...>;
+};
+
+// 追加一个类型
+template<typename List, typename T> struct PushBack;
+template<typename... Ts, typename T>
+struct PushBack<TypeList<Ts...>, T> {
+    using type = TypeList<Ts..., T>;
+};
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <type_traits>
+
+template<typename... Ts> struct TypeList {};
+
+template<typename List> struct Size;
+template<typename... Ts>
+struct Size<TypeList<Ts...>> {
+    static constexpr std::size_t value = sizeof...(Ts);
+};
+
+template<typename List> struct Front;
+template<typename Head, typename... Tail>
+struct Front<TypeList<Head, Tail...>> {
+    using type = Head;
+};
+
+// Contains: 检查类型是否在列表中
+template<typename List, typename T> struct Contains;
+template<typename T>
+struct Contains<TypeList<>, T> : std::false_type {};
+template<typename Head, typename... Tail, typename T>
+struct Contains<TypeList<Head, Tail...>, T>
+    : std::conditional_t<std::is_same_v<Head, T>,
+                         std::true_type,
+                         Contains<TypeList<Tail...>, T>> {};
+
+int main() {
+    using MyTypes = TypeList<int, double, std::string>;
+
+    std::cout << "Size: " << Size<MyTypes>::value << '\n';  // 3
+    std::cout << "Front is int: "
+              << std::is_same_v<Front<MyTypes>::type, int> << '\n'; // 1
+    std::cout << "Contains double: "
+              << Contains<MyTypes, double>::value << '\n';  // 1
+    std::cout << "Contains float: "
+              << Contains<MyTypes, float>::value << '\n';   // 0
+}
+}
+
+// 编译期条件（std::conditional）
+
+`std::conditional` 是 TMP 中的 if-else——根据布尔值在编译期选择两个类型之一：
+
+\code[cpp]{
+#include <type_traits>
+
+// conditional<true, A, B>::type  → A
+// conditional<false, A, B>::type → B
+
+// 根据大小选择存储类型
+template<std::size_t N>
+using SmallestInt = std::conditional_t<
+    (N <= 255), uint8_t,
+    std::conditional_t<
+        (N <= 65535), uint16_t,
+        std::conditional_t<
+            (N <= 4294967295ULL), uint32_t,
+            uint64_t
+        >
+    >
+>;
+
+static_assert(std::is_same_v<SmallestInt<100>, uint8_t>);
+static_assert(std::is_same_v<SmallestInt<1000>, uint16_t>);
+static_assert(std::is_same_v<SmallestInt<100000>, uint32_t>);
+}
+
+// CRTP（奇异递归模板模式）
+
+**CRTP（Curiously Recurring Template Pattern）** 是 TMP 中最实用的模式：基类通过模板参数"知道"派生类的类型，从而在编译期解析调用——实现**零开销的静态多态**。
+
+\code[cpp]{
+// 基类：通过 static_cast 调用派生类方法
+template<typename Derived>
+class Shape {
+public:
+    void draw() const {
+        static_cast<const Derived*>(this)->drawImpl();
+    }
+    double area() const {
+        return static_cast<const Derived*>(this)->areaImpl();
+    }
+};
+
+class Circle : public Shape<Circle> {
+    double r_;
+public:
+    Circle(double r) : r_(r) {}
+    void drawImpl() const { /* 画圆 */ }
+    double areaImpl() const { return 3.14159265 * r_ * r_; }
+};
+
+class Rect : public Shape<Rect> {
+    double w_, h_;
+public:
+    Rect(double w, double h) : w_(w), h_(h) {}
+    void drawImpl() const { /* 画矩形 */ }
+    double areaImpl() const { return w_ * h_; }
+};
+
+// 使用：模板函数接受 Shape<T>
+template<typename T>
+void render(const Shape<T>& s) {
+    s.draw();  // 编译期确定调用哪个 drawImpl，零虚函数开销
+}
+}
+
+\tip{**CRTP 的核心价值：零开销静态多态。** 虚函数每个对象多占 8 字节（vtable指针），调用有间接跳转开销。CRTP 在编译期解析，性能等同直接调用。在数学库、ECS组件、序列化框架中很常见。}
+
+CRTP 另一个经典应用是**实例计数器**——每个类独立统计对象数量：
+
+\run[cpp]{
+#include <iostream>
+
+template<typename Derived>
+class Countable {
+    static inline int count_ = 0;
+protected:
+    Countable() { ++count_; }
+    Countable(const Countable&) { ++count_; }
+    ~Countable() { --count_; }
+public:
+    static int getCount() { return count_; }
+};
+
+class Widget : public Countable<Widget> {};
+class Gadget : public Countable<Gadget> {};
+
+int main() {
+    Widget w1, w2, w3;
+    Gadget g1, g2;
+
+    std::cout << "Widget count: " << Widget::getCount() << '\n'; // 3
+    std::cout << "Gadget count: " << Gadget::getCount() << '\n'; // 2
+    // 各自独立计数！因为 Countable<Widget> 和 Countable<Gadget> 是不同的类
+}
+}
+
+// 标签分发（Tag Dispatch）
+
+**标签分发（Tag Dispatch）** 用空结构体作为"标签"，通过函数重载在编译期选择不同实现。这是 Concepts 出现前的经典技巧：
+
+\code[cpp]{
+#include <iterator>
+
+// 针对随机访问迭代器（Random Access Iterator）：O(1)
+template<typename Iter>
+void advanceImpl(Iter& it, int n, std::random_access_iterator_tag) {
+    it += n;
+}
+
+// 针对输入迭代器（Input Iterator）：O(n)
+template<typename Iter>
+void advanceImpl(Iter& it, int n, std::input_iterator_tag) {
+    for (int i = 0; i < n; ++i) ++it;
+}
+
+template<typename Iter>
+void myAdvance(Iter& it, int n) {
+    // iterator_traits 提取迭代器的 category 标签
+    advanceImpl(it, n,
+        typename std::iterator_traits<Iter>::iterator_category{});
+}
+}
+
+\note{C++20 中，标签分发可以被 `if constexpr` + Concepts 替代：`if constexpr (std::random_access_iterator<Iter>) it += n; else ...`。但在遗留代码和标准库源码中，标签分发仍然随处可见。}
+
+// 模板元编程在游戏中的应用
+
+TMP 在游戏引擎中的两个典型应用场景：
+
+**① ECS组件注册——编译期类型到ID：**
+
+\code[cpp]{
+template<typename List, typename T> struct IndexOf;
+template<typename Head, typename... Tail, typename T>
+struct IndexOf<TypeList<Head, Tail...>, T> {
+    static constexpr std::size_t value =
+        std::is_same_v<Head, T> ? 0 : 1 + IndexOf<TypeList<Tail...>, T>::value;
+};
+
+using Components = TypeList<Position, Velocity, Sprite, Health>;
+constexpr auto posId = IndexOf<Components, Position>::value;  // 0
+constexpr auto velId = IndexOf<Components, Velocity>::value;  // 1
+// 编译期ID→零运行时查找开销
+}
+
+**② 自动序列化：** 配合 `if constexpr` 和 type traits 根据类型自动选择序列化策略。更复杂的成员级反射需等 C++26。
+}
+
+// 何时该用/不该用元编程
+
+\table{
+场景 | 用 TMP | 用 constexpr | 理由
+---
+编译期数值计算 | ❌ | ✅ | constexpr 更可读
+类型列表操作 | ✅ | ❌ | constexpr 无法操作类型
+静态多态（CRTP） | ✅ | ❌ | 需要类型层面的分发
+标签分发 | ✅ (C++17前) | ✅ (if constexpr) | C++17后可选
+编译期字符串处理 | ❌ | ✅ | constexpr string (C++20)
+类型到ID映射 | ✅ | ❌ | 需要类型信息
+条件类型选择 | ✅ | ❌ | std::conditional 是 TMP
+}
+
+\warning{**TMP 的最大缺点是可读性差、编译时间长。** 过度使用 TMP 会让代码变成只有作者（也许连作者都不行）才能读懂的"天书"。90% 的情况下，`constexpr` + `if constexpr` + Concepts 是更好的选择。只在它们做不到的场景才用 TMP。}
+
+/// 工程实践
+
+\list{
+- 值计算用 `constexpr`/`consteval`，别用模板递归
+- 类型操作（TypeList、type traits）是 TMP 的正当领地
+- CRTP 用于性能敏感的静态多态（数学库、ECS、渲染器）
+- 模板递归深度有编译器限制（通常 256-1024），超深递归会编译失败
+- 复杂的 TMP 代码必须配 `static_assert` 测试和清晰注释
+- 用 `using` 别名简化 TMP 类型表达式：`using Front_t = typename Front<List>::type;`
+}
+
+/// 难点易错点分析
+
+\danger{**模板递归深度限制：** 编译器默认限制通常是 256-1024 层。`Fibonacci<500>` 这样的深递归会导致 "template instantiation depth exceeded" 错误。用 `constexpr` 函数替代值递归，或用折叠表达式替代包递归。}
+
+\danger{**CRTP 中不要在基类构造函数中调用派生类方法！** 基类构造时，派生类还未初始化，`static_cast<Derived*>(this)` 指向的对象不完整：}
+
+\code[cpp]{
+template<typename D>
+class Base {
+public:
+    Base() {
+        // static_cast<D*>(this)->init(); // ❌ UB！派生类未构造
+    }
+    void safeInit() {
+        static_cast<D*>(this)->init(); // ✅ 在构造之后调用
+    }
+};
+}
+
+\warning{**偏特化匹配是按"最特殊"原则。** 如果多个偏特化都能匹配，编译器选最具体的。如果无法判断→歧义错误。此时需要添加更具体的特化来消除歧义。}
+
+\quiz[choice]{
+Q: 以下哪个任务**必须**用 TMP 而不能用 `constexpr`？
+A: 计算编译期阶乘
+B: 实现编译期类型列表的 Contains 操作
+C: 生成编译期查找表（lookup table）
+D: 编译期字符串长度计算
+ANS: B
+EXP: Contains 需要操作**类型**——检查一个类型是否在类型列表中。这只能通过模板偏特化/递归实现。其他三个都是值计算，`constexpr` 更合适。
+}
+
+\quiz[tf]{
+Q: CRTP 提供的静态多态和虚函数提供的动态多态，在运行时有相同的性能开销。
+ANS: F
+EXP: CRTP 是编译期解析的，零运行时开销（等同直接调用）。虚函数需要 vtable 间接调用和额外的 vtable 指针存储。CRTP 的代价是无法做运行时多态（不能用基类指针指向不同派生类）。
+}
+
+\quiz[choice]{
+Q: `std::conditional_t<(sizeof(int) > 4), long, int>` 在 32 位 int 平台上结果是什么？
+A: `long`
+B: `int`
+C: 编译错误
+D: 依赖平台
+ANS: B
+EXP: 32 位平台上 `sizeof(int) == 4`，条件 `4 > 4` 为 `false`，所以选择第二个类型 `int`。
+}
+
+/// 实战作业
+
+// 🟢 基础题：CRTP 计数器
+
+\run[cpp]{
+#include <iostream>
+
+// TODO: 实现 CRTP 基类 Countable<Derived>
+// 每个派生类独立计数创建和析构的对象数
+
+/* TODO: 你的代码 */
+
+class Player : public Countable<Player> {};
+class Enemy : public Countable<Enemy> {};
+
+int main() {
+    Player p1, p2, p3;
+    Enemy e1, e2;
+
+    std::cout << "Players: " << Player::getCount() << '\n'; // 期望: 3
+    std::cout << "Enemies: " << Enemy::getCount() << '\n';  // 期望: 2
+}
+}
+
+// 🟢 基础题：conditional 类型选择
+
+\run[cpp]{
+#include <iostream>
+#include <type_traits>
+#include <cstdint>
+
+// TODO: 实现 SmallestUint<N>
+// N <= 255 → uint8_t
+// N <= 65535 → uint16_t
+// 否则 → uint32_t
+
+/* TODO: 你的代码 */
+
+int main() {
+    SmallestUint<100> a = 42;
+    SmallestUint<1000> b = 42;
+    SmallestUint<100000> c = 42;
+
+    std::cout << "a size: " << sizeof(a) << '\n'; // 期望: 1
+    std::cout << "b size: " << sizeof(b) << '\n'; // 期望: 2
+    std::cout << "c size: " << sizeof(c) << '\n'; // 期望: 4
+}
+}
+
+// 🟡 进阶题：TypeList 操作
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <type_traits>
+
+template<typename... Ts> struct TypeList {};
+
+// TODO: 实现以下 TypeList 操作
+// Size<List>::value     — 元素个数
+// Front<List>::type     — 第一个类型
+// Contains<List, T>::value — 是否包含类型 T
+// IndexOf<List, T>::value  — T 在列表中的索引
+
+/* TODO: 你的代码 */
+
+int main() {
+    using Types = TypeList<int, double, std::string>;
+
+    static_assert(Size<Types>::value == 3);
+    static_assert(std::is_same_v<Front<Types>::type, int>);
+    static_assert(Contains<Types, double>::value);
+    static_assert(!Contains<Types, float>::value);
+    static_assert(IndexOf<Types, std::string>::value == 2);
+
+    std::cout << "All static_asserts passed!\n";
+}
+}
+
+// 🟡 进阶题：CRTP 静态接口
+
+实现 CRTP 基类 `Serializable<Derived>`，要求：
+1. 基类提供 `std::string toJson()` 和 `void fromJson(string_view)` 接口
+2. 各自调用派生类的 `toJsonImpl()` / `fromJsonImpl()`
+3. 基类额外提供 `save(filename)` 和 `load(filename)` 便捷方法
+4. 用 `static_assert` 确保派生类实现了必需的 Impl 方法
+
+\collapse[参考思路]{
+\code[cpp]{
+template<typename D>
+class Serializable {
+public:
+    std::string toJson() const {
+        return static_cast<const D*>(this)->toJsonImpl();
+    }
+    void save(const std::string& path) const {
+        std::ofstream f(path);
+        f << toJson();
+    }
+};
+
+struct Player : Serializable<Player> {
+    std::string name; int hp;
+    std::string toJsonImpl() const { return "{...}"; }
+};
+}
+}
+
+// 🔴 挑战题：编译期类型注册表
+
+实现一个完整的 `TypeRegistry`：
+1. `TypeList<Ts...>` 及所有操作（Size, Front, PopFront, PushBack, Contains, IndexOf, Transform）
+2. `Transform<List, MetaFunc>` 对每个类型应用元函数（如 `AddPointer`）
+3. `ForEach<List>(func)` 运行时对每个类型执行操作（用 `std::index_sequence`）
+4. 编译期"类型→整数ID"映射
+5. 用 `static_assert` 全面测试
+
+\collapse[参考思路]{
+Transform 的关键是定义元函数协议：
+\code[cpp]{
+template<typename T> struct AddPointer { using type = T*; };
+
+template<typename List, template<typename> class F> struct Transform;
+template<typename... Ts, template<typename> class F>
+struct Transform<TypeList<Ts...>, F> {
+    using type = TypeList<typename F<Ts>::type...>;
+};
+// 包展开 + 元函数 = TypeList 的 map 操作
+}
+ForEach 需要用 `std::index_sequence` + 折叠表达式遍历。
+}

@@ -1,0 +1,173 @@
+/// 简介
+
+这是整个 C++ 技能树的 **毕业设计（Capstone Project）**。你将整合全部 18 章的知识，从零构建一个包含物理、渲染、音频、脚本、工具链的 **完整 2D 游戏引擎**，并用这个引擎制作一个可玩的 DEMO 游戏。
+
+这不是一个"做着玩"的小练习——它是一个真正的工程项目，要求你做出架构决策、管理子系统依赖、处理跨模块集成问题。完成后，你将拥有一个可以写进简历的引擎项目，以及对 C++ 工程能力的全面验证。
+
+/// 项目需求
+
+**项目名称：** MiniEngine2D — 完整的 2D 游戏引擎 + DEMO 游戏
+
+\list{
+- 构建一个分层架构的 2D 游戏引擎
+- 引擎包含：物理、渲染、音频、脚本、资源管理、工具链
+- 使用该引擎制作一个可玩的 DEMO 游戏（类型自选）
+- DEMO 必须包含：至少 2 个关卡/场景、存档、音效、基本 AI
+}
+
+**DEMO 游戏参考方向（三选一或自拟）：**
+
+\tabs{
+\tab[方向A: 平台跳跃]{
+经典 2D 平台跳跃游戏。物理引擎驱动角色运动和碰撞，多个关卡，收集物品，敌人 AI（巡逻+追踪），粒子特效（跳跃尘土、死亡效果）。
+}
+\tab[方向B: 顶视角射击]{
+双摇杆射击（或键鼠控制）。波次刷怪、不同敌人类型、弹道物理、道具掉落、分数系统。物理引擎处理弹丸碰撞和击退效果。
+}
+\tab[方向C: 物理解谜]{
+用物理交互解谜：推箱子、杠杆、绳索（Verlet）、弹簧。物理引擎是核心玩法。关卡由 Lua 脚本驱动。需要关卡编辑器（简易版）导出关卡数据。
+}
+}
+
+/// 技术要求
+
+**引擎必须包含以下子系统：**
+
+\table{
+子系统 | 对应章节 | 必需功能
+---
+数学库 | Ch.10 | Vec2, Mat3, 碰撞检测函数
+物理引擎 | Ch.11 | 刚体、碰撞检测（圆+AABB）、冲量响应、固定步长
+渲染器 | Ch.12 | 精灵批处理、纹理图集、正交投影、Z-order
+音频系统 | Ch.13 | 预加载音效、背景音乐流式播放、音量控制
+资源管理 | Ch.15 | 纹理/音频/脚本的缓存加载 + 热重载
+脚本系统 | Ch.16 | Lua (sol3) 绑定、热重载、沙箱安全
+场景管理 | Ch.15 | 场景加载/卸载/切换
+事件系统 | Ch.15 | 类型安全的 publish/subscribe
+工具集 | Ch.17 | ImGui 调试面板、帧分析器、控制台
+}
+
+**C++ 知识点必须覆盖：**
+
+\table{
+知识板块 | 必须体现的知识点
+---
+Ch.01 基础 | 基本语法、控制流、函数
+Ch.02 OOP | 继承（ISubsystem 基类）、多态、封装
+Ch.03 STL | vector, unordered_map, algorithm, string
+Ch.04 现代 C++ | auto, move, smart_ptr, optional/variant, concepts（至少1处）
+Ch.05 内存 | 对象池或自定义分配器（至少1个热路径使用）
+Ch.06 模板 | 模板类（ResourceManager<T>）、变参模板（至少1处）
+Ch.07 并发 | 至少1个后台线程（资源加载或音频回调）
+Ch.08 设计模式 | 至少5种（观察者、命令、状态、组件、工厂/单例）
+Ch.09 构建 | CMake 项目、FetchContent 管理依赖、Debug/Release 配置
+Ch.14 网络 | 可选加分项（本地多人或网络多人）
+}
+
+/// 实现提示
+
+\steps{
+\step[M1 — 项目骨架（第1周）]{
+CMake 项目结构、SDL2 窗口创建、游戏循环（固定步长）、输入处理、数学库。此阶段结束时：能打开窗口、显示纯色背景、响应键盘输入、以固定 60Hz 步进。
+}
+\step[M2 — 核心引擎（第2周）]{
+精灵渲染器（批处理）、纹理加载、物理引擎（圆+AABB碰撞+响应）、音频系统（miniaudio）。此阶段结束时：能在屏幕上画精灵、有碰撞反弹的物体、能播放音效。
+}
+\step[M3 — 引擎框架（第3周）]{
+子系统管理（Engine 类）、资源管理器（缓存+热重载）、事件系统、场景管理。Lua 集成（sol3）——绑定游戏对象。此阶段结束时：引擎架构完整，可以用 Lua 脚本控制游戏逻辑。
+}
+\step[M4 — DEMO 游戏（第4周）]{
+用引擎制作 DEMO：关卡设计、敌人 AI（Lua 编写）、粒子特效、UI（分数/血条）、存档系统（JSON 序列化）。ImGui 调试面板。此阶段结束时：DEMO 完整可玩。
+}
+\step[M5 — 打磨与文档（第5周）]{
+性能优化（profiler 定位瓶颈）、内存检查（ASan）、Bug 修复、README 文档、构建说明。此阶段结束时：项目可提交。
+}
+}
+
+\warning{**不要试图一开始就设计"完美架构"。** 先让最简版本跑起来（窗口 + 一个精灵 + 碰撞），然后迭代重构。过早抽象会拖慢进度。}
+
+\tip{**依赖管理推荐方案：** 用 CMake FetchContent 拉取 SDL2、sol2、miniaudio、stb_image、nlohmann_json、Dear ImGui。避免手动管理第三方库路径。}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+可玩性 | 15 分 | DEMO 完整可玩、有胜负条件、无致命 Bug
+引擎架构 | 20 分 | 子系统分层清晰、低耦合、生命周期正确
+知识覆盖 | 25 分 | 上表所有知识板块都有体现
+代码质量 | 15 分 | 现代 C++ 风格、零编译警告、ASan 通过
+性能 | 10 分 | 帧率稳定 60fps、无明显卡顿、profiler 数据支撑
+工具集成 | 5 分 | ImGui 调试面板可运行时调节参数
+构建系统 | 5 分 | CMake 一键构建、README 说明完整、CI 友好
+创意加分 | 5 分 | 超出基本要求的创新（网络多人、粒子编辑器、可视化脚本等）
+}
+
+/// 扩展挑战
+
+以下为可选加分项，每完成一项额外加分（不超过 5 分上限）：
+
+\list{
+- 🌐 网络多人支持（ENet，2~4 人本地网络对战）
+- 🎨 粒子系统编辑器（ImGui 面板实时调参 + 保存为 JSON）
+- 📦 自定义关卡编辑器（ImGui + 场景序列化）
+- 🧩 可视化脚本原型（ImNodes 节点图 → 生成 Lua 代码）
+- ⚡ GPU 渲染（OpenGL / sokol_gfx 替代 SDL 软渲染）
+- 📊 完整的性能分析报告（Chrome Tracing 格式导出）
+- 🔧 CI/CD 流水线（GitHub Actions 构建 + 自动测试）
+}
+
+/// 参考资源
+
+\list{
+- 《Game Programming Patterns》— Robert Nystrom（免费在线：gameprogrammingpatterns.com）
+- 《Game Engine Architecture》— Jason Gregory（引擎架构圣经）
+- 《Real-Time Collision Detection》— Christer Ericson
+- SDL2 文档：wiki.libsdl.org
+- sol2 文档：sol2.readthedocs.io
+- miniaudio：miniaud.io
+- Dear ImGui 示例：github.com/ocornut/imgui
+- stb 单头文件库：github.com/nothings/stb
+- nlohmann/json：github.com/nlohmann/json
+}
+
+\note{**完成这个项目意味着你已经：**
+1. 掌握了 C++ 从基础到高级的核心知识
+2. 理解了游戏引擎各子系统的设计和实现
+3. 能独立完成一个完整的 C++ 工程项目
+4. 拥有可写入简历、展示给面试官的实战作品
+}
+
+\collapse[项目目录结构参考]{
+\code[text]{
+MiniEngine2D/
+├── CMakeLists.txt
+├── README.md
+├── cmake/
+│   └── FetchDependencies.cmake
+├── engine/
+│   ├── core/          (数学库、日志、事件、内存)
+│   ├── platform/      (窗口、输入、文件系统)
+│   ├── physics/       (刚体、碰撞、约束)
+│   ├── render/        (精灵批处理、纹理、字体)
+│   ├── audio/         (混音、3D音效、流式加载)
+│   ├── script/        (Lua集成、热重载、沙箱)
+│   ├── scene/         (场景管理、序列化)
+│   ├── resource/      (资源管理器、资产加载)
+│   └── tools/         (ImGui面板、Profiler、控制台)
+├── game/
+│   ├── main.cpp
+│   ├── game.cpp/.h
+│   └── components/    (游戏特定的组件)
+├── scripts/
+│   ├── enemy_ai.lua
+│   ├── level1.lua
+│   └── config.lua
+├── assets/
+│   ├── textures/
+│   ├── audio/
+│   └── levels/
+└── tests/
+    └── ...
+}
+}

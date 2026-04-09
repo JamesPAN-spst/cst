@@ -1,0 +1,617 @@
+/// 简介
+
+在上一节我们学会了用继承表达"A 是一种 B"的关系（is-a）。但现实中更常见的关系是"A 拥有一个 B"——一辆车拥有引擎，一个游戏角色拥有背包、拥有技能树。这就是**组合（Composition）**的思维方式。
+
+想象你在组装乐高：你不会把所有积木焊死在一起（继承），而是把不同功能模块拼接在一起（组合）。引擎模块坏了？换一个。想加翅膀？插上去就行。组合让你的代码像乐高一样灵活——这正是现代 C++ 和游戏引擎架构的核心设计哲学。
+
+本节将从 has-a 关系出发，逐步深入组合、聚合、委托、依赖注入等关键模式，最后介绍游戏开发中极为流行的 ECS（Entity-Component-System）架构。
+
+/// 知识点列表
+
+\list{
+- has-a（组合）vs is-a（继承）
+- 组合 vs 聚合 vs 关联（Composition vs Aggregation vs Association）——生命周期区别
+- 组合优于继承原则（Composition over Inheritance）
+- 委托模式（Delegation）
+- 依赖注入（Dependency Injection）
+- Mixin 与策略模式（Strategy Pattern）——用组合实现多态
+- ECS（Entity-Component-System）简介
+- 循环依赖（Circular Dependency）与前向声明（Forward Declaration）
+}
+
+/// 知识点详解
+
+// has-a（组合）vs is-a（继承）
+
+**为什么不能什么都用继承？** 假设你在做一款 RPG 游戏，角色需要"能移动""有血量""能攻击""会说话"。如果全用继承：
+
+\code[cpp]{
+// ❌ 继承滥用——"角色是一种移动？角色是一种血量？" 这说不通
+class Character : public Movable, public HasHealth, public Attackable, public Talkable {
+    // 多重继承的噩梦：菱形继承、接口冲突、耦合爆炸
+};
+}
+
+问题在于：角色并不"是"一种移动能力，角色"拥有"移动能力。这就是 **has-a 关系**和 **is-a 关系**的本质区别。
+
+\code[cpp]{
+// ✅ 组合——角色"拥有"各种能力组件
+class Character {
+    MovementSystem movement;   // 角色"有"移动系统
+    HealthSystem health;       // 角色"有"血量系统
+    CombatSystem combat;       // 角色"有"战斗系统
+    DialogueSystem dialogue;   // 角色"有"对话系统
+public:
+    void update(float dt) {
+        movement.update(dt);
+        combat.update(dt);
+    }
+    void takeDamage(int dmg) { health.reduce(dmg); }
+};
+}
+
+\tip{**判断口诀：** 把"是"和"有"代入句子——"角色是一种生物"（is-a，用继承），"角色有一个背包"（has-a，用组合）。如果用"是"读起来别扭，就该用组合。}
+
+// 组合 vs 聚合 vs 关联
+
+三者都是 has-a 关系，区别在于**谁管理谁的生命周期（Lifetime）**。这就像现实中的三种"拥有"方式：
+
+\table{
+关系 | 生命周期 | 现实类比 | 代码表现
+---
+组合（Composition） | 部分与整体同生共死 | 人和心脏——人没了心脏也没了 | 值成员 或 `unique_ptr` 成员
+聚合（Aggregation） | 部分可独立于整体存在 | 球队和球员——球队解散球员还在 | 裸指针/引用/`shared_ptr`
+关联（Association） | 临时使用，无所有权 | 你和出租车——下车就没关系了 | 函数参数
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+class Renderer {  // 被组合持有的部件
+public:
+    Renderer()  { std::cout << "Renderer 创建\n"; }
+    ~Renderer() { std::cout << "Renderer 销毁\n"; }
+};
+
+class Scene {  // 独立生命周期的对象
+    std::string name;
+public:
+    Scene(std::string n) : name(std::move(n)) {
+        std::cout << "Scene[" << name << "] 创建\n";
+    }
+    ~Scene() { std::cout << "Scene[" << name << "] 销毁\n"; }
+    void update() { std::cout << "Scene[" << name << "]::update()\n"; }
+};
+
+class Engine {
+    Renderer renderer;             // 组合：值成员，同生共死
+    Scene* currentScene = nullptr; // 聚合：指针，不负责销毁
+public:
+    void setScene(Scene* s) { currentScene = s; }
+    void update() { if (currentScene) currentScene->update(); }
+    ~Engine() { std::cout << "Engine 销毁（Renderer 随之销毁，Scene 不受影响）\n"; }
+};
+
+int main() {
+    Scene menu("MainMenu");
+    {
+        Engine engine;
+        engine.setScene(&menu);  // 聚合：引擎"借用"场景
+        engine.update();
+    }  // Engine 和 Renderer 销毁，Scene 还活着
+    std::cout << "--- Engine 已销毁 ---\n";
+    menu.update();  // Scene 依然可用！
+}
+}
+
+\diagram[memory]{
+stack:
+  [0x7ff0] Engine engine
+  [0x7fe0]   └─ Renderer renderer (组合，值成员)
+  [0x7fd8]   └─ Scene* currentScene -> 0x7fa0 (聚合，指针)
+  [0x7fa0] Scene menu (独立对象)
+arrow: currentScene -> menu
+}
+
+// 组合优于继承原则
+
+**"组合优于继承（Composition over Inheritance）"**是《设计模式》（GoF）的核心建议，也是现代 C++ 社区的共识。
+
+\list{
+- **继承是编译期绑定**——一旦 `class Dog : public Animal`，Dog 永远是 Animal，运行时无法改变
+- **组合是运行时灵活的**——可以动态添加、删除、替换组件
+- **继承破坏封装**——子类与父类深度耦合，父类改一行，所有子类可能崩溃
+- **组合保持独立**——组件之间互不干扰，改一个不影响其他
+- **继承层次容易膨胀**——3 层以上的继承树几乎无法维护
+}
+
+\compare{
+old: C++98/03 时代受 Java 影响，流行深层继承树：`Entity → Actor → Pawn → Character → PlayerCharacter`。改一层需要检查所有派生类。
+
+new: 现代 C++ / Unreal Engine 5 / Unity ECS 全面拥抱组合。`Entity` 只是一个 ID，通过挂载 `TransformComponent`、`MeshComponent`、`PhysicsComponent` 来定义行为。
+}
+
+\warning{组合并非万能——当确实需要 is-a 关系且满足**里氏替换原则（Liskov Substitution Principle）**时，继承仍正确。例如 `std::ofstream` 继承 `std::ostream`，文件流确实"是一种"输出流。}
+
+// 委托模式
+
+**委托（Delegation）**是组合的核心手法：对象不亲自做某事，而是把工作"委托"给内部持有的另一个对象。你在餐厅点菜——服务员（外层对象）接收请求，但真正做菜的是厨师（被委托对象）。
+
+\steps{
+\step[定义接口]{
+\code[cpp]{
+class ILogger {
+public:
+    virtual void log(std::string_view msg) = 0;
+    virtual ~ILogger() = default;
+};
+}
+}
+\step[实现多个具体类]{
+\code[cpp]{
+class ConsoleLogger : public ILogger {
+public:
+    void log(std::string_view msg) override {
+        std::cout << "[CONSOLE] " << msg << "\n";
+    }
+};
+class FileLogger : public ILogger {
+    std::ofstream file;
+public:
+    FileLogger(const std::string& path) : file(path) {}
+    void log(std::string_view msg) override { file << msg << "\n"; }
+};
+}
+}
+\step[外层对象持有接口指针，委托调用]{
+\code[cpp]{
+class GameEngine {
+    std::unique_ptr<ILogger> logger;
+public:
+    void setLogger(std::unique_ptr<ILogger> l) { logger = std::move(l); }
+    void run() { if (logger) logger->log("Engine started"); }  // 委托！
+};
+}
+}
+}
+
+\tip{委托模式的核心价值：**外层对象的代码不需要修改**，只需注入不同的被委托对象就能改变行为。这正是"开闭原则（Open-Closed Principle）"的体现——对扩展开放，对修改封闭。}
+
+// 依赖注入
+
+**依赖注入（Dependency Injection，简称 DI）**是委托模式的自然延伸。关键区别在于：**依赖不由对象自己创建，而是从外部"注入"**。
+
+\tabs{
+\tab[❌ 硬编码依赖]{
+\code[cpp]{
+class Game {
+    OpenGLRenderer renderer;  // 写死了 OpenGL！
+    FMODAudio audio;          // 写死了 FMOD！
+    // 想换成 Vulkan 或测试用 Mock？得改 Game 的代码
+};
+}
+}
+\tab[✅ 构造函数注入]{
+\code[cpp]{
+class Game {
+    IRenderer& renderer;  // 接口引用
+    IAudio& audio;        // 接口引用
+public:
+    // 依赖从外部注入：Game 不关心具体实现
+    Game(IRenderer& r, IAudio& a) : renderer(r), audio(a) {}
+
+    void run() {
+        renderer.clear();
+        audio.playBGM("theme.ogg");
+    }
+};
+
+// 生产环境
+VulkanRenderer vulkan;
+FMODAudio fmod;
+Game game(vulkan, fmod);
+
+// 单元测试
+MockRenderer mockR;
+MockAudio mockA;
+Game testGame(mockR, mockA);  // 轻松替换！
+}
+}
+}
+
+\note{依赖注入的三种常见方式：**构造函数注入**（最推荐，依赖一目了然）、**setter 注入**（运行时可切换）、**接口注入**（通过特定接口方法传递）。游戏引擎中最常见构造函数注入和 setter 注入。}
+
+// Mixin 与策略模式——用组合实现多态
+
+有时你想给类"混入"一些能力，但不想用继承。**Mixin** 通过组合或模板参数混入功能。**策略模式（Strategy Pattern）**则通过持有可替换的"策略对象"实现运行时多态。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+
+class IMoveStrategy {
+public:
+    virtual void move(float& x, float& y, float dt) = 0;
+    virtual std::string name() const = 0;
+    virtual ~IMoveStrategy() = default;
+};
+
+class WalkStrategy : public IMoveStrategy {
+public:
+    void move(float& x, float& y, float dt) override { x += 2.0f * dt; }
+    std::string name() const override { return "Walk"; }
+};
+
+class FlyStrategy : public IMoveStrategy {
+public:
+    void move(float& x, float& y, float dt) override {
+        x += 8.0f * dt; y += 3.0f * dt;
+    }
+    std::string name() const override { return "Fly"; }
+};
+
+class Character {
+    std::string charName;
+    float x = 0, y = 0;
+    std::unique_ptr<IMoveStrategy> strategy;
+public:
+    Character(std::string n, std::unique_ptr<IMoveStrategy> s)
+        : charName(std::move(n)), strategy(std::move(s)) {}
+    void setStrategy(std::unique_ptr<IMoveStrategy> s) { strategy = std::move(s); }
+    void update(float dt) { if (strategy) strategy->move(x, y, dt); }
+    void status() const {
+        std::cout << charName << " [" << strategy->name()
+                  << "] pos=(" << x << ", " << y << ")\n";
+    }
+};
+
+int main() {
+    Character hero("Knight", std::make_unique<WalkStrategy>());
+    hero.update(1.0f);
+    hero.status();  // Knight [Walk] pos=(2, 0)
+
+    hero.setStrategy(std::make_unique<FlyStrategy>());  // 运行时切换！
+    hero.update(1.0f);
+    hero.status();  // Knight [Fly] pos=(10, 3)
+}
+}
+
+\collapse[🤔 想一想：如果用继承实现会怎样？]{
+如果用继承，你需要 `WalkingCharacter`、`FlyingCharacter` 两个子类。运行时想从行走切换为飞行？做不到——对象的类型在创建时就固定了。你只能销毁旧对象、创建新对象，丢失所有状态。组合+策略模式完美解决了这个问题。
+}
+
+// ECS（Entity-Component-System）简介
+
+**ECS（实体-组件-系统）**是组合思想在游戏引擎中的极致体现，也是 Unity DOTS、Unreal Mass Framework 等现代引擎的核心架构。
+
+\list{
+- **实体（Entity）**：只是一个 ID（通常是整数），本身没有数据也没有行为
+- **组件（Component）**：纯数据结构，描述某方面属性（位置、血量、渲染信息）
+- **系统（System）**：纯逻辑函数，批量处理拥有特定组件组合的实体
+}
+
+\diagram[flow]{
+Entity(ID=42) -- 挂载组件 --> TransformComponent + HealthComponent + SpriteComponent
+所有拥有 Transform 的实体 --> MovementSystem 批量处理
+所有拥有 Health 的实体 --> DamageSystem 批量处理
+所有拥有 Transform+Sprite 的实体 --> RenderSystem 批量处理
+}
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <unordered_map>
+
+struct Position { float x = 0, y = 0; };  // 组件：纯数据
+struct Velocity { float vx = 0, vy = 0; };
+
+class World {
+    int nextId = 0;
+    std::unordered_map<int, Position> pos;
+    std::unordered_map<int, Velocity> vel;
+    std::unordered_map<int, std::string> names;
+public:
+    int createEntity(const std::string& name) {
+        names[nextId] = name; return nextId++;
+    }
+    void addPos(int id, Position p) { pos[id] = p; }
+    void addVel(int id, Velocity v) { vel[id] = v; }
+
+    void movementSystem(float dt) {  // 系统：纯逻辑
+        for (auto& [id, v] : vel)
+            if (pos.count(id)) { pos[id].x += v.vx*dt; pos[id].y += v.vy*dt; }
+    }
+    void print() {
+        for (auto& [id, n] : names) {
+            std::cout << n << ": ";
+            if (pos.count(id)) std::cout << "(" << pos[id].x << "," << pos[id].y << ")";
+            std::cout << "\n";
+        }
+    }
+};
+
+int main() {
+    World w;
+    int player = w.createEntity("Player");
+    w.addPos(player, {0,0}); w.addVel(player, {3,1});
+    int bullet = w.createEntity("Bullet");
+    w.addPos(bullet, {0,5}); w.addVel(bullet, {10,0});
+
+    std::cout << "=== 初始 ===\n"; w.print();
+    w.movementSystem(1.0f);
+    std::cout << "=== 1秒后 ===\n"; w.print();
+}
+}
+
+\note{真实 ECS 框架（如 EnTT、flecs）使用更高效的数据结构（稀疏集合 / archetype），但核心思想完全一致：**实体是 ID，组件是数据，系统是逻辑**。数据与逻辑的分离天然利于缓存友好（Cache Friendly）和并行处理。}
+
+// 循环依赖与前向声明
+
+当两个类互相引用时，会产生**循环依赖（Circular Dependency）**——A 的头文件 include B，B 的头文件 include A，编译器陷入死循环。
+
+\code[cpp]{
+// ❌ 循环 include——编译失败！
+// Player.h               // Weapon.h
+#include "Weapon.h"       #include "Player.h"
+class Player {            class Weapon {
+    Weapon weapon;             Player* owner;
+};                        };
+// 编译器：Player.h → Weapon.h → Player.h → 无限循环！
+}
+
+**解决方案：前向声明（Forward Declaration）+ 指针/引用。**
+
+\code[cpp]{
+// ✅ Weapon.h —— 前向声明打破循环
+class Player;  // "Player 是个类，细节以后再说"
+class Weapon {
+    Player* owner;  // 指针只需知道类名
+public:
+    void setOwner(Player* p) { owner = p; }
+};
+// 在 Weapon.cpp 中 #include "Player.h" 即可使用 Player 成员
+}
+
+\danger{**前向声明的限制：** 只能声明指针或引用成员（`Player*`、`Player&`），不能声明值成员（`Player p;`）。因为值成员需要编译器知道完整的类大小，而前向声明不提供这个信息。}
+
+/// 新版特性（C++17/20/23）
+
+// C++17：std::optional 优雅表达可选组件
+
+\code[cpp]{
+#include <optional>
+class Character {
+    std::optional<Inventory> inventory;  // 有些角色没有背包
+    std::optional<AIController> ai;       // 玩家角色没有AI
+public:
+    void openInventory() {
+        if (inventory) inventory->show();
+    }
+};
+}
+
+\note{`std::optional<T>` 相比指针：语义更清晰（"可能有也可能没有"），无动态分配开销，天然值语义。适合表示组合中的可选子部件。}
+
+// C++20：Concepts 约束组件接口
+
+\code[cpp]{
+#include <concepts>
+template<typename T>
+concept Component = requires(T t, float dt) {
+    { t.update(dt) } -> std::same_as<void>;
+    { t.name() } -> std::convertible_to<std::string_view>;
+};
+
+template<Component C>
+void processComponent(C& comp, float dt) {
+    comp.update(dt);  // 只接受满足 Component 概念的类型
+}
+}
+
+// C++23：deducing this 简化 Mixin
+
+\collapse[C++23 deducing this 与 Mixin]{
+C++23 的**显式对象参数（Explicit Object Parameter）**让 Mixin 模式更简洁。传统 CRTP 需要 `template<typename Derived> class Mixin`，C++23 可以直接推导：
+
+\code[cpp]{
+// C++23 Mixin 写法（概念演示）
+struct Printable {
+    void print(this auto const& self) {
+        // self 会自动推导为实际派生类类型
+        std::cout << self.toString() << "\n";
+    }
+};
+}
+
+这一特性仍在各编译器逐步完善支持中，了解即可。
+}
+
+/// 工程实践
+
+// 实际项目中的组合指南
+
+\table{
+场景 | 推荐做法 | 原因
+---
+拥有子部件，同生共死 | 值成员或 `unique_ptr` | 所有权明确，自动释放
+借用外部资源 | 引用或裸指针 | 不负责生命周期
+运行时替换行为 | `unique_ptr<Interface>` + setter | 委托+策略模式
+可选子部件 | `std::optional<T>` | 语义清晰，无空指针
+共享所有权 | `shared_ptr`（尽量少用） | 有引用计数开销
+}
+
+\tip{**Unreal Engine 做法：** UE5 中 `AActor` 通过组件数组持有 `UStaticMeshComponent`、`UCameraComponent` 等，本质就是组合。添加/移除组件不需要改继承层次。}
+
+\warning{**组合的代价：** 间接层带来轻微性能开销，组件通信需要事件总线等机制。热点路径上值成员（组合）比指针间接更快。}
+
+/// 难点易错点分析
+
+\danger{**易错1：值成员的隐式深拷贝** — 默认拷贝构造会深拷贝所有值成员。大型容器或资源句柄可能产生昂贵的隐式拷贝。解决：显式 `= delete` 拷贝或使用移动语义。}
+
+\danger{**易错2：聚合中的悬空指针** — 裸指针/引用成员不管理生命周期。被引用对象先于宿主销毁 → **悬空指针（Dangling Pointer）** → **未定义行为（UB）**。}
+
+\danger{**易错3：unique_ptr 成员导致类不可复制** — `unique_ptr` 不可复制，包含它的类也不可复制。需要复制语义时必须手动 deep clone。}
+
+\danger{**易错4：循环依赖** — 两个头文件互相 `#include` 导致编译失败。用前向声明 + 指针/引用打破循环，`#include` 放到 `.cpp` 中。}
+
+\quiz[choice]{
+Q: 下面哪种关系最适合用**组合（值成员）**表示？
+A: 游戏角色持有当前所在场景的引用
+B: 游戏角色拥有自己的血量系统（HealthSystem）
+C: 渲染系统临时接收一个待绘制的精灵列表
+D: 多个敌人共享同一个导航网格（NavMesh）
+ANS: B
+EXP: 血量系统与角色同生共死，是典型的组合（值成员）。A 是聚合（场景独立于角色），C 是关联（临时参数），D 是共享聚合（`shared_ptr` 或全局资源）。
+}
+
+\quiz[tf]{
+Q: 前向声明 `class Player;` 之后，可以声明 `Player player;`（值成员）。
+ANS: F
+EXP: 前向声明后编译器不知道 `Player` 的大小，只能声明指针 `Player*` 或引用 `Player&`，不能声明值成员。
+}
+
+\quiz[choice]{
+Q: 在 ECS 架构中，下列哪个说法是**正确**的？
+A: Entity 包含所有数据和行为
+B: Component 是纯数据，System 是纯逻辑
+C: System 继承自 Component
+D: 每个 Entity 必须拥有所有类型的 Component
+ANS: B
+EXP: ECS 的核心分离原则：Entity 是 ID，Component 是纯数据（无逻辑），System 是纯逻辑（无状态），三者职责分明。
+}
+
+/// 实战作业
+
+// 🟢 基础题1：组合关系实现
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+
+struct Transform {
+    float x = 0, y = 0;
+    void moveTo(float nx, float ny) { x = nx; y = ny; }
+    void print() const { std::cout << "位置: (" << x << ", " << y << ")\n"; }
+};
+
+struct Health {
+    int current = 100, max = 100;
+    void takeDamage(int d) { current -= d; if (current < 0) current = 0; }
+    void print() const { std::cout << "血量: " << current << "/" << max << "\n"; }
+};
+
+class GameCharacter {
+    /* TODO: name(string), transform(Transform), health(Health) 成员 */
+public:
+    /* TODO: 构造函数接收角色名 */
+    /* TODO: move(x,y) 委托给 transform */
+    /* TODO: hurt(dmg) 委托给 health */
+    /* TODO: status() 打印名字+位置+血量 */
+};
+
+int main() {
+    GameCharacter hero("Hero");
+    hero.move(10, 20);
+    hero.hurt(35);
+    hero.status();
+    // 期望: [Hero] 位置: (10, 20) 血量: 65/100
+}
+}
+
+// 🟢 基础题2：组合 vs 聚合辨析
+
+\quiz[choice]{
+Q: 游戏中 `Inventory`（背包）持有多个 `Item*` 指针，`Item` 可以从背包转移到商店。这属于什么关系？
+A: 组合（Composition）
+B: 聚合（Aggregation）
+C: 关联（Association）
+D: 继承（Inheritance）
+ANS: B
+EXP: Item 的生命周期独立于 Inventory（可以转移到别处），Inventory 不负责销毁 Item，这是典型的聚合关系。
+}
+
+// 🟡 进阶题1：策略模式——可切换攻击方式
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+
+class IAttackStrategy {
+public:
+    virtual int execute() const = 0;
+    virtual std::string name() const = 0;
+    virtual ~IAttackStrategy() = default;
+};
+/* TODO: MeleeAttack 伤害25, RangedAttack 伤害15, MagicAttack 伤害40 */
+
+class Warrior {
+    std::string charName;
+    /* TODO: unique_ptr<IAttackStrategy> 成员 */
+public:
+    Warrior(std::string n, std::unique_ptr<IAttackStrategy> a)
+        : charName(std::move(n)) /* TODO */ {}
+    /* TODO: setAttack() 切换策略 */
+    void attack() const {
+        /* TODO: 打印 "名字 使用 策略名 造成 X 点伤害" */
+    }
+};
+
+int main() {
+    Warrior w("Arthas", std::make_unique<MeleeAttack>());
+    w.attack();  // Arthas 使用 Melee 造成 25 点伤害
+    w.setAttack(std::make_unique<MagicAttack>());
+    w.attack();  // Arthas 使用 Magic 造成 40 点伤害
+}
+}
+
+// 🟡 进阶题2：依赖注入——可替换的日志系统
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+// 任务：实现依赖注入，让 GameApp 可注入不同的日志实现
+
+class ILogger {
+public:
+    virtual void log(const std::string& msg) = 0;
+    virtual ~ILogger() = default;
+};
+
+/* TODO: 实现 ConsoleLogger —— 输出 "[CONSOLE] msg" 到 cout */
+/* TODO: 实现 BufferLogger —— 存入 vector<string>，提供 getMessages() */
+
+class GameApp {
+    /* TODO: 持有 ILogger 的 unique_ptr，构造函数注入 */
+public:
+    GameApp(std::unique_ptr<ILogger> l) /* TODO */ {}
+    void start() { /* TODO: logger->log("Game started") */ }
+    void update() { /* TODO: logger->log("Frame updated") */ }
+};
+
+int main() {
+    // 生产模式：控制台输出
+    GameApp app1(std::make_unique<ConsoleLogger>());
+    app1.start(); app1.update();
+
+    // 测试模式：缓冲日志可检验
+    auto buf = std::make_unique<BufferLogger>();
+    auto* p = buf.get();
+    GameApp app2(std::move(buf));
+    app2.start(); app2.update();
+    for (auto& m : p->getMessages()) std::cout << "验证: " << m << "\n";
+}
+}
+
+// 🔴 挑战题：迷你 ECS 框架
+
+**要求：** 实现简化 ECS 框架：`World` 类管理实体和组件；`createEntity()` 返回 ID；`addComponent<T>()` / `getComponent<T>()` 模板方法；`MovementSystem` 处理 Position+Velocity 实体；`CollisionSystem` 检测 AABB 碰撞。创建 5+ 实体，运行 3 帧模拟。
+
+\collapse[参考思路]{
+每种组件类型各用一个 `std::unordered_map<int, T>`。`addComponent` / `getComponent` 用模板特化或 `typeid` + `std::any` 区分。系统遍历实体检查组件组合。进阶参考 EnTT 的 sparse set 设计。
+}

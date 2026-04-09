@@ -1,0 +1,553 @@
+﻿/// 简介
+
+上一节我们探索了现代 C++ 的各种语言特性改进，这一节要面对两个 C++20 引入的"重量级变革"：**模块（Modules）** 和 **协程（Coroutines）**。
+
+先说痛点。你写过一个包含几十个 `#include` 的源文件吗？每次修改一个头文件，编译器就要把它和它包含的所有头文件重新展开、重新解析——同一个 `<vector>` 可能被展开上百次。大型项目的编译时间因此长到令人抓狂。**模块**就是为了解决这个问题：编译一次、到处导入，彻底告别"头文件地狱（header hell）"。
+
+再说另一个痛点。游戏里的 AI 需要"巡逻三秒→检测敌人→追击→攻击→返回"，如果用普通函数，你得手动维护一个状态机（state machine），代码全是 `switch-case`，改一个步骤牵一发动全身。**协程**允许你在函数执行到一半时"暂停"，下次再从暂停处继续跑，写出来的代码像线性流程一样清晰，但底层是按需执行的。
+
+这两个特性目前仍在"工具链逐步完善"阶段，但它们代表 C++ 未来十年的编程方式。掌握概念和基本用法，是现代 C++ 开发者的必修课。
+
+/// 知识点列表
+
+\list{
+- C++20 模块基础：`export module`、`import`
+- 模块分区（module partitions）
+- 模块 vs 头文件：编译速度与封装性
+- 协程概述：co_await、co_yield、co_return 三关键字
+- Promise 类型（promise_type）与协程句柄（coroutine_handle）
+- Generator 模式（co_yield 生成值序列）
+- Task / Awaitable 模式基础
+- std::generator（C++23 标准生成器）
+- 游戏中的协程用途：AI 行为树、动画序列、异步加载
+}
+
+/// 知识点详解
+
+// C++20 模块基础
+
+在传统 C++ 中，代码复用靠 `#include` 把头文件的文本"复制粘贴"到当前文件。模块是一种全新的编译单元（compilation unit），编译器把它处理成一个**二进制接口文件（BMI, Binary Module Interface）**，其他文件通过 `import` 直接读取这个已编译的接口，而不是重新解析源码。
+
+**模块接口单元（Module Interface Unit）**——声明哪些内容要"导出"给外部使用：
+
+\code[cpp]{
+// math.cppm — 模块接口单元（后缀因编译器而异：.cppm / .ixx / .mpp）
+export module math;       // ← 声明这是模块 math 的接口
+
+namespace detail {         // 不加 export → 模块内部私有
+    constexpr double PI = 3.14159265358979;
+}
+
+export constexpr double pi = detail::PI;  // 加 export → 外部可见
+
+export double circleArea(double r) {
+    return detail::PI * r * r;
+}
+
+export class Vec2 {
+public:
+    float x, y;
+    float length() const;  // 声明在接口，实现放在实现单元
+};
+}
+
+**模块实现单元（Module Implementation Unit）**——只写实现，不导出新接口：
+
+\code[cpp]{
+// math_impl.cpp — 模块实现单元
+module math;          // ← 没有 export，表示这是实现单元
+#include <cmath>      // 模块实现内部仍可使用 #include
+
+float Vec2::length() const {
+    return std::sqrt(x * x + y * y);
+}
+}
+
+**使用方**——用 `import` 代替 `#include`：
+
+\code[cpp]{
+import math;          // ← 不是 #include！
+#include <iostream>   // 传统头文件仍可混用
+
+int main() {
+    std::cout << "pi = " << pi << "\n";
+    std::cout << "area = " << circleArea(5.0) << "\n";
+    Vec2 v{3.0f, 4.0f};
+    std::cout << "length = " << v.length() << "\n";
+}
+}
+
+\note{**为什么模块示例用 `\code` 而非 `\run`？** 在线编译器（如 Godbolt）对模块的支持仍不完整——模块需要多文件编译。后面的协程示例可在单文件内编写，会使用可运行的 `\run` 块。}
+
+关键语法要点：`export module 名字;` 声明模块接口，`module 名字;` 声明实现，`export` 控制符号可见性，`import 名字;` 导入模块。模块名可用点号分层（如 `math.linear_algebra`），但这只是命名约定，**不**自动建立父子关系。
+
+// 模块分区
+
+当一个模块的接口文件变得太大时，可以用**分区（partition）** 拆分成多个文件，对外仍作为一个整体导出。分区名用冒号 `:` 分隔：
+
+\code[cpp]{
+// 分区 :vec
+export module math:vec;
+export struct Vec3 { float x, y, z; };
+
+// 分区 :matrix
+export module math:matrix;
+export struct Mat4 { float m[4][4]; };
+
+// 主接口，汇总所有分区
+export module math;
+export import :vec;       // ← 重新导出分区
+export import :matrix;
+export Mat4 identity();   // 主接口可以加额外声明
+}
+
+使用方只需 `import math;` 即可访问所有分区的导出内容。分区不能被模块外部单独导入——这比头文件时代的"总头文件"封装性更强。
+
+// 模块 vs 头文件
+
+\compare{
+old: **头文件模型（#include）**
+- 每个 `#include` 都是文本替换，编译器每次重新解析
+- 同一个头文件被 N 个源文件包含，就被解析 N 次
+- 宏（macro）会"泄漏"到包含方，造成命名冲突
+- `#include` 顺序可能影响编译结果
+- 必须用 include guard 或 `#pragma once` 防重复包含
+
+new: **模块（import）**
+- 编译器只编译模块一次，生成二进制接口（BMI）
+- 其他文件导入时读取 BMI，无需重新解析
+- 内部宏和非导出符号对外不可见
+- `import` 顺序不影响编译结果
+- 语言层面避免了重复定义，无需 include guard
+}
+
+\diagram[flow]{
+头文件: a.cpp → #include<vector> → 展开万行 → 编译
+头文件: b.cpp → #include<vector> → 再展开万行 → 编译
+---
+模块: vector模块 → 编译一次 → BMI
+模块: a.cpp → import → 读取BMI → 编译
+模块: b.cpp → import → 读取BMI → 编译
+}
+
+\warning{**工具链现状：** MSVC 对模块支持最成熟，GCC/Clang 持续改进中。CMake 3.28+ 开始支持 C++20 模块。跨编译器项目建议准备头文件回退方案。}
+
+// 协程概述
+
+普通函数的执行是"调用→运行到底→返回"，中间不会暂停。协程则可以在执行途中**挂起（suspend）**，把控制权还给调用方，稍后再**恢复（resume）** 继续执行。C++20 通过三个关键字来支持协程：
+
+\table{
+关键字 | 作用 | 典型场景
+---
+`co_yield` 值 | 暂停协程，产出一个值给调用方 | 生成器（Generator）
+`co_return` 值 | 结束协程，返回最终结果 | 异步任务（Task）
+`co_await` 表达式 | 暂停协程，等待异步操作完成 | 异步 I/O、定时器
+}
+
+**核心规则**：只要函数体里出现了 `co_yield`、`co_return` 或 `co_await` 中任意一个，编译器就把它当作协程处理。协程的返回类型不是普通值，而是一个自定义的**协程对象**（内含 `promise_type`）。
+
+\note{**协程不是线程！** 线程是抢占式的——操作系统随时可能中断你。协程是**协作式（cooperative）** 的——只在 `co_await` / `co_yield` 处主动暂停，一个线程上可以"交替运行"成千上万个协程，没有线程切换开销。}
+
+// Promise 类型与协程句柄
+
+C++20 的协程框架要求你定义 **Promise 类型（promise_type）** 和**协程返回类型**。这是协程最令初学者头疼的地方，但理解了它你就掌握了核心机制。
+
+协程执行时，编译器在堆上分配一个**协程帧（coroutine frame）**，帧里存放局部变量、暂停点、以及 `promise_type` 对象。`promise_type` 告诉编译器：协程开始/结束时做什么（`initial_suspend` / `final_suspend`）、`co_yield` 的值怎么传递（`yield_value`）、`co_return` 怎么处理（`return_value` / `return_void`）、未捕获异常怎么办（`unhandled_exception`）。
+
+**协程句柄（coroutine_handle）** 是指向协程帧的句柄，调用方通过它来恢复（`resume()`）或销毁（`destroy()`）协程。
+
+下面是一个完整可运行的 Generator——理解协程机制的最佳入门示例：
+
+\run[cpp20]{
+#include <coroutine>
+#include <iostream>
+#include <optional>
+
+template<typename T>
+struct Generator {
+    struct promise_type {
+        T current_value;
+        Generator get_return_object() {
+            return Generator{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() { return {}; }   // 创建后先暂停
+        std::suspend_always final_suspend() noexcept { return {}; } // 结束后也暂停
+        void unhandled_exception() { std::terminate(); }
+        void return_void() {}
+        std::suspend_always yield_value(T value) {   // 处理 co_yield
+            current_value = value;
+            return {};  // 暂停协程
+        }
+    };
+
+    std::coroutine_handle<promise_type> handle;
+    explicit Generator(std::coroutine_handle<promise_type> h) : handle(h) {}
+    ~Generator() { if (handle) handle.destroy(); }   // RAII：析构时销毁帧
+    Generator(const Generator&) = delete;
+    Generator& operator=(const Generator&) = delete;
+    Generator(Generator&& o) noexcept : handle(o.handle) { o.handle = nullptr; }
+
+    std::optional<T> next() {
+        if (!handle || handle.done()) return std::nullopt;
+        handle.resume();
+        if (handle.done()) return std::nullopt;
+        return handle.promise().current_value;
+    }
+};
+
+Generator<int> fibonacci() {
+    int a = 0, b = 1;
+    while (true) {
+        co_yield a;
+        int next = a + b;
+        a = b;
+        b = next;
+    }
+}
+
+int main() {
+    auto gen = fibonacci();
+    std::cout << "Fibonacci: ";
+    for (int i = 0; i < 10; ++i) {
+        auto val = gen.next();
+        if (val) std::cout << *val << " ";
+    }
+    std::cout << "\n";
+    // 输出: Fibonacci: 0 1 1 2 3 5 8 13 21 34
+}
+}
+
+每一步职责清晰：`promise_type` 定义协议，`coroutine_handle` 控制生命周期，`co_yield` 暂停并传值。
+
+// Generator 模式
+
+斐波那契就是经典的**生成器模式（Generator Pattern）**：协程每次被恢复时计算并产出一个值，实现**惰性求值（lazy evaluation）**。序列长度可以是无限的，但只有被请求时才计算下一个值，内存占用恒定。
+
+生成器还可以组合——用一个协程消费另一个协程的输出，形成管道（pipeline）：
+
+\code[cpp]{
+Generator<int> range(int start, int end, int step = 1) {
+    for (int i = start; i < end; i += step)
+        co_yield i;
+}
+
+Generator<int> transform(Generator<int> source, int(*func)(int)) {
+    while (auto val = source.next())
+        co_yield func(*val);
+}
+
+// 用法：transform(range(1, 6), square) → 1 4 9 16 25
+}
+
+// Task / Awaitable 模式基础
+
+生成器是"协程产出值给调用方"，**Task 模式**则是"协程等待异步操作的结果"。`co_await` 暂停当前协程，等待某个**可等待体（Awaitable）** 完成后再恢复。一个 Awaitable 需要三个方法：
+
+\table{
+方法 | 作用
+---
+`await_ready()` | 返回 `true` → 结果已就绪，不暂停
+`await_suspend(handle)` | 协程暂停时调用，注册"完成后恢复"的回调
+`await_resume()` | 协程恢复时调用，返回 `co_await` 的结果
+}
+
+标准库提供了两个现成的 Awaitable：`std::suspend_always`（总是暂停）和 `std::suspend_never`（从不暂停），你在 `promise_type` 中已经用过它们。实际项目中，自定义 Awaitable 会在 `await_suspend` 中把恢复操作注册到事件循环或线程池，实现真正的异步调度。
+
+/// 新版特性（C++17/20/23）
+
+// std::generator（C++23）
+
+手写 `Generator` 需要几十行 `promise_type` 样板。C++23 引入了 `std::generator`（`<generator>` 头文件），替你做好了这些工作：
+
+\code[cpp]{
+#include <generator>   // C++23
+#include <iostream>
+#include <ranges>
+
+std::generator<int> fibonacci() {
+    int a = 0, b = 1;
+    while (true) {
+        co_yield a;
+        auto next = a + b;  a = b;  b = next;
+    }
+}
+
+int main() {
+    for (int fib : fibonacci() | std::views::take(10))
+        std::cout << fib << " ";
+    // 输出: 0 1 1 2 3 5 8 13 21 34
+}
+}
+
+`std::generator` 实现了 `range` 概念，支持范围 `for` 和 `std::views` 管道，并自动管理协程帧生命周期。
+
+// import std（C++23）
+
+C++23 还引入了 `import std;`——一行导入整个标准库。编译器只处理一次标准库模块，编译速度比传统 `#include` 快 **2~10 倍**。
+
+\tabs{
+\tab[C++17 及之前]{
+\code[cpp]{
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+int main() {
+    std::vector<std::string> names = {"Alice", "Bob"};
+    std::sort(names.begin(), names.end());
+    for (const auto& n : names) std::cout << n << "\n";
+}
+}
+}
+\tab[C++23 模块]{
+\code[cpp]{
+import std;
+
+int main() {
+    std::vector<std::string> names = {"Alice", "Bob"};
+    std::ranges::sort(names);
+    for (const auto& n : names) std::println("{}", n);
+}
+}
+}
+}
+
+/// 工程实践
+
+// 游戏中的协程用途
+
+协程在游戏开发中有三个典型场景：
+
+**AI 行为序列**——把复杂 AI 写成线性流程，代替手动状态机：
+
+\code[cpp]{
+Task enemyAI(Enemy& enemy) {
+    while (enemy.isAlive()) {
+        co_await patrol(enemy, patrolPath);
+        if (enemy.detectPlayer()) {
+            co_await chase(enemy, player);
+            co_await attack(enemy, player);
+        }
+        co_await waitFrames(60);
+    }
+}
+}
+
+**动画/过场序列**——按时间轴编排动作：
+
+\code[cpp]{
+Task cutscene() {
+    co_await fadeOut(0.5f);
+    co_await moveCamera(targetPos, 2.0f);
+    co_await showDialogue("准备战斗！");
+    co_await fadeIn(0.5f);
+}
+}
+
+**异步资源加载**——后台加载不阻塞主线程：
+
+\code[cpp]{
+Task loadLevel(const std::string& name) {
+    auto meshes = co_await asyncLoadMeshes(name);
+    auto tex    = co_await asyncLoadTextures(name);
+    buildScene(meshes, tex);
+}
+}
+
+\tip{**生产环境协程库：** 标准库只提供底层机制。实际项目常用 **cppcoro**、**libunifex**（Meta）、**Boost.Cobalt**，或引擎自带协程支持（如 UE5）。}
+
+// 模块使用建议
+
+\list{
+- **新项目**：编译器和构建系统都支持时优先用模块
+- **现有项目**：从内部工具库开始逐步迁移，不必一步到位
+- **跨平台**：关注 CMake 3.28+ 支持状态；准备头文件回退方案
+- **命名**：用项目名作前缀，如 `myengine.math`、`myengine.graphics`
+}
+
+/// 难点易错点分析
+
+\danger{**协程中的引用参数陷阱！** 协程可能在调用者返回后才恢复执行，此时引用的局部变量已销毁，导致**悬空引用（dangling reference）**。协程参数应**按值传递**。}
+
+\code[cpp]{
+std::generator<char> bad(const std::string& s) {  // 危险！
+    for (char c : s) co_yield c;
+}
+std::generator<char> good(std::string s) {  // 安全：按值
+    for (char c : s) co_yield c;
+}
+auto gen = bad(std::string("temp"));  // 临时 string 立即销毁，s 悬空！
+}
+
+\danger{**协程帧生命周期管理。** 协程帧默认在堆上分配。如果 Generator 对象析构时没调用 `handle.destroy()`，帧内存会泄漏。`std::generator`（C++23）自动处理此问题，手写类型必须在析构函数中销毁句柄。}
+
+\danger{**`final_suspend` 必须返回 `suspend_always`（对于 Generator）。** 如果返回 `suspend_never`，协程结束后帧被自动销毁，但 Generator 中的 `handle` 变成悬空指针——之后任何访问都是未定义行为。}
+
+\quiz[choice|单选]{
+Q: 以下代码有什么问题？
+\code[cpp]{
+std::generator<char> bad(const std::string& s) {
+    for (char c : s) co_yield c;
+}
+auto gen = bad(std::string("hello"));
+}
+A: 编译错误，协程不能使用引用参数
+B: 临时 `std::string` 在 `bad` 返回后销毁，`s` 变成悬空引用
+C: `co_yield` 不能用于 `char` 类型
+D: 生成器不能使用范围 `for`
+ANS: B
+EXP: 临时 `std::string("hello")` 在调用表达式结束后销毁，但协程是惰性的——后续恢复时 `s` 已经是悬空引用。正确做法是按值传递 `std::string s`。
+}
+
+\quiz[tf|判断]{
+Q: C++20 模块内部的 `#define` 宏不会"泄漏"到 `import` 方。
+ANS: T
+EXP: 模块的导出由 `export` 关键字精确控制，内部的宏定义和非导出符号对 import 方完全不可见。这是模块相比头文件的核心封装优势。
+}
+
+/// 实战作业
+
+// 🟢 基础题：手写 Generator 产出等差数列
+
+完成 `arithmetic_seq` 协程，产出从 `start` 开始、公差为 `step` 的无限等差数列：
+
+\run[cpp20]{
+#include <coroutine>
+#include <iostream>
+#include <optional>
+
+template<typename T>
+struct Generator {
+    struct promise_type {
+        T current_value;
+        Generator get_return_object() {
+            return Generator{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void unhandled_exception() { std::terminate(); }
+        void return_void() {}
+        std::suspend_always yield_value(T value) { current_value = value; return {}; }
+    };
+    std::coroutine_handle<promise_type> handle;
+    explicit Generator(std::coroutine_handle<promise_type> h) : handle(h) {}
+    ~Generator() { if (handle) handle.destroy(); }
+    Generator(const Generator&) = delete;
+    Generator(Generator&& o) noexcept : handle(o.handle) { o.handle = nullptr; }
+    std::optional<T> next() {
+        if (!handle || handle.done()) return std::nullopt;
+        handle.resume();
+        if (handle.done()) return std::nullopt;
+        return handle.promise().current_value;
+    }
+};
+
+// TODO: 实现 arithmetic_seq 协程
+Generator<int> arithmetic_seq(int start, int step) {
+    /* TODO: 你的代码 */
+}
+
+int main() {
+    auto seq = arithmetic_seq(10, 3);
+    // 期望输出: 10 13 16 19 22 25 28 31 34 37
+    for (int i = 0; i < 10; ++i) {
+        auto val = seq.next();
+        if (val) std::cout << *val << " ";
+    }
+    std::cout << "\n";
+}
+}
+
+// 🟡 进阶题：实现 filter 生成器
+
+实现 `filter` 协程，从一个 `Generator<int>` 中只产出满足谓词的值：
+
+\run[cpp20]{
+#include <coroutine>
+#include <iostream>
+#include <optional>
+#include <functional>
+
+template<typename T>
+struct Generator {
+    struct promise_type {
+        T current_value;
+        Generator get_return_object() {
+            return Generator{std::coroutine_handle<promise_type>::from_promise(*this)};
+        }
+        std::suspend_always initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        void unhandled_exception() { std::terminate(); }
+        void return_void() {}
+        std::suspend_always yield_value(T value) { current_value = value; return {}; }
+    };
+    std::coroutine_handle<promise_type> handle;
+    explicit Generator(std::coroutine_handle<promise_type> h) : handle(h) {}
+    ~Generator() { if (handle) handle.destroy(); }
+    Generator(const Generator&) = delete;
+    Generator(Generator&& o) noexcept : handle(o.handle) { o.handle = nullptr; }
+    std::optional<T> next() {
+        if (!handle || handle.done()) return std::nullopt;
+        handle.resume();
+        if (handle.done()) return std::nullopt;
+        return handle.promise().current_value;
+    }
+};
+
+Generator<int> range(int start, int end) {
+    for (int i = start; i < end; ++i) co_yield i;
+}
+
+// TODO: 实现 filter —— 只 co_yield 满足 pred 的值
+Generator<int> filter(Generator<int> source, std::function<bool(int)> pred) {
+    /* TODO: 你的代码 */
+}
+
+int main() {
+    auto evens = filter(range(1, 21), [](int x) { return x % 2 == 0; });
+    // 期望输出: 2 4 6 8 10 12 14 16 18 20
+    while (auto v = evens.next()) std::cout << *v << " ";
+    std::cout << "\n";
+}
+}
+
+// 🔴 挑战题：协程调度器
+
+设计一个简易**协程调度器（Coroutine Scheduler）**，管理多个 Task 协程并轮流执行：
+
+**需求：**
+1. 定义 `ScheduledTask` 协程类型，支持 `co_await Yield{}` 暂停自己
+2. 实现 `Scheduler` 类，维护就绪队列（ready queue），每次取队首协程恢复
+3. `Yield::await_suspend` 中把当前协程重新加入就绪队列
+4. 提供 `spawn()` 添加任务，`run_all()` 循环到全部完成
+
+**验收标准：** 至少 3 个 Task 交替打印输出，证明调度器实现了公平轮转。
+
+\collapse[参考思路]{
+核心：`std::queue<std::coroutine_handle<>>` 作为就绪队列。
+
+\code[cpp]{
+struct Scheduler {
+    std::queue<std::coroutine_handle<>> ready;
+    void schedule(std::coroutine_handle<> h) { ready.push(h); }
+    void run_all() {
+        while (!ready.empty()) {
+            auto h = ready.front(); ready.pop();
+            if (!h.done()) h.resume();
+        }
+    }
+};
+
+struct Yield {
+    Scheduler& sched;
+    bool await_ready() { return false; }
+    void await_suspend(std::coroutine_handle<> h) {
+        sched.schedule(h);  // 暂停时重新排队
+    }
+    void await_resume() {}
+};
+}
+
+`ScheduledTask` 的 `initial_suspend` 返回 `suspend_always`（让调度器决定何时开始），`final_suspend` 也返回 `suspend_always`（析构时手动 `destroy`）。
+}

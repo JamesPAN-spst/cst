@@ -1,0 +1,478 @@
+/// 简介
+
+经典 GoF 模式源自通用软件工程，而游戏开发有一套独特的架构模式——它们直接回应帧循环、实时性能和海量对象管理等游戏特有约束。本节以 Robert Nystrom 的《游戏编程模式（Game Programming Patterns）》为参考框架，讲解九种游戏专用模式的动机、实现与性能权衡。每种模式都标注了它解决的核心问题和在引擎中的典型位置。
+
+/// 知识点列表
+
+\list{
+- 游戏循环（Game Loop）— 固定时间步长 + 渲染插值
+- 更新方法（Update Method）— 统一的每帧回调
+- 组件模式（Component / ECS）— 组合优于继承
+- 事件队列（Event Queue）— 异步解耦的消息传递
+- 服务定位器（Service Locator）— 可替换的全局服务
+- 对象池（Object Pool）— 避免频繁分配/释放
+- 空间分区（Spatial Partition）— 加速碰撞与查询
+- 双缓冲（Double Buffer）— 避免读写冲突
+- 数据局部性（Data Locality）— 缓存友好的内存布局
+}
+
+/// 知识点详解
+
+// 游戏循环
+
+游戏不是请求-响应式程序，而是**持续运行的循环**：每帧处理输入→更新逻辑→渲染画面。核心难题是物理模拟需要**固定时间步长（Fixed Timestep）** 保证确定性，而渲染帧率应尽量高且可变。解决方案：累积器（Accumulator）+ 物理插值。
+
+\run[cpp]{
+#include <iostream>
+#include <chrono>
+
+class GameLoop {
+    static constexpr double FIXED_DT = 1.0 / 60.0;  // 物理 60Hz
+    double accumulator_ = 0.0;
+    int physicsSteps_ = 0;
+    int renderFrames_ = 0;
+public:
+    void simulateFrames(int count) {
+        for (int f = 0; f < count; ++f) {
+            // 模拟不同的帧耗时
+            double frameTime = (f % 3 == 0) ? 0.032 : 0.016;
+            if (frameTime > 0.25) frameTime = 0.25;  // 防止死亡螺旋
+
+            accumulator_ += frameTime;
+
+            while (accumulator_ >= FIXED_DT) {
+                // update(FIXED_DT);  // 物理更新：固定 dt
+                accumulator_ -= FIXED_DT;
+                ++physicsSteps_;
+            }
+
+            double alpha = accumulator_ / FIXED_DT;
+            // render(alpha);  // 渲染：用 alpha 插值
+            ++renderFrames_;
+        }
+        std::cout << "After " << count << " frames:\n"
+                  << "  Physics steps: " << physicsSteps_ << "\n"
+                  << "  Render frames: " << renderFrames_ << "\n"
+                  << "  Ratio: " << (double)physicsSteps_ / renderFrames_ << " physics/render\n";
+    }
+};
+
+int main() {
+    GameLoop loop;
+    loop.simulateFrames(100);
+}
+}
+
+\danger{**死亡螺旋（Spiral of Death）：** 如果一帧逻辑耗时超过固定步长，累积器持续增长→下一帧需要执行更多次物理更新→更慢→更多累积。**必须**限制 `frameTime` 上限（如 0.25 秒 = 最多 15 次物理步）来打破循环。}
+
+// 更新方法
+
+所有活跃的游戏对象每帧都需要 `update(dt)`。**更新方法（Update Method）** 将所有需要每帧执行逻辑的对象注册到一个列表中，游戏循环遍历调用。这将"谁需要更新"的管理集中到一处。
+
+\code[cpp]{
+class IUpdatable {
+public:
+    virtual void update(float dt) = 0;
+    virtual bool isAlive() const = 0;
+    virtual ~IUpdatable() = default;
+};
+
+class World {
+    std::vector<std::unique_ptr<IUpdatable>> objects_;
+public:
+    void add(std::unique_ptr<IUpdatable> obj) {
+        objects_.push_back(std::move(obj));
+    }
+    void updateAll(float dt) {
+        // 先更新，再移除已死亡对象——避免遍历中删除
+        for (auto& o : objects_) o->update(dt);
+        std::erase_if(objects_, [](auto& o) { return !o->isAlive(); });
+    }
+};
+}
+
+\warning{**更新顺序依赖：** 如果 A 的 update 依赖 B 当前帧的状态，但 B 还没更新，A 读到的是上一帧的数据。解决方案：分阶段更新（物理阶段→逻辑阶段→渲染准备阶段），或使用双缓冲。}
+
+// 组件模式 / ECS
+
+用继承构建角色层级（`Character → Player → Mage`），层级越深越僵化——一个会飞的、可以拾取的、发光的宝箱该继承谁？**组件模式（Component）** 将行为分解为独立组件，用**组合（Composition）** 替代**继承（Inheritance）**。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <vector>
+#include <string>
+#include <typeinfo>
+
+class IComponent {
+public:
+    virtual void update(float dt) = 0;
+    virtual ~IComponent() = default;
+};
+
+class GameObject {
+    std::string name_;
+    std::vector<std::unique_ptr<IComponent>> comps_;
+public:
+    explicit GameObject(std::string n) : name_(std::move(n)) {}
+
+    template<typename T, typename... Args>
+    T& add(Args&&... args) {
+        auto c = std::make_unique<T>(std::forward<Args>(args)...);
+        T& ref = *c;
+        comps_.push_back(std::move(c));
+        return ref;
+    }
+
+    template<typename T>
+    T* get() {
+        for (auto& c : comps_)
+            if (auto* p = dynamic_cast<T*>(c.get())) return p;
+        return nullptr;
+    }
+
+    void update(float dt) {
+        for (auto& c : comps_) c->update(dt);
+    }
+    const std::string& name() const { return name_; }
+};
+
+// 具体组件
+class Health : public IComponent {
+    int hp_;
+public:
+    explicit Health(int hp) : hp_(hp) {}
+    void update(float) override {}
+    int get() const { return hp_; }
+    void takeDamage(int d) { hp_ -= d; }
+};
+
+class Mover : public IComponent {
+    float speed_;
+    float pos_ = 0;
+public:
+    explicit Mover(float s) : speed_(s) {}
+    void update(float dt) override { pos_ += speed_ * dt; }
+    float pos() const { return pos_; }
+};
+
+int main() {
+    GameObject player("Hero");
+    player.add<Health>(100);
+    player.add<Mover>(5.0f);
+
+    for (int i = 0; i < 3; ++i) player.update(0.016f);
+
+    auto* hp = player.get<Health>();
+    auto* mv = player.get<Mover>();
+    std::cout << player.name() << " HP:" << hp->get()
+              << " Pos:" << mv->pos() << "\n";
+
+    // 组合的灵活性：树只需要位置，不需要血量
+    GameObject tree("Tree");
+    tree.add<Mover>(0.0f);  // 不动的位置
+}
+}
+
+\note{**OOP 组件 vs ECS：** 上例是 OOP 风格的组件系统（`dynamic_cast` 查找、对象持有组件）。真正的 **ECS（Entity-Component-System）** 用 ID 代替对象、组件存储在连续数组中、System 批量处理同类组件——缓存友好且适合并行。后者是数据驱动设计的极致体现。}
+
+// 事件队列
+
+直接调用回调（同步 Observer）会导致调用栈嵌套过深、处理顺序不可控。**事件队列（Event Queue）** 将事件存入缓冲区，在合适的时机（如帧末）统一处理——实现**时间解耦（Temporal Decoupling）**。
+
+\code[cpp]{
+struct Event {
+    enum Type { Damage, Death, Sound } type;
+    int data;
+};
+
+class EventQueue {
+    static constexpr int MAX = 256;
+    Event buffer_[MAX];
+    int head_ = 0, count_ = 0;
+public:
+    void push(Event e) {
+        if (count_ >= MAX) return;  // 队列满则丢弃（或扩容）
+        buffer_[(head_ + count_) % MAX] = e;
+        ++count_;
+    }
+    void processAll() {
+        while (count_ > 0) {
+            Event& e = buffer_[head_];
+            // dispatch(e);  // 根据 type 分发
+            head_ = (head_ + 1) % MAX;
+            --count_;
+        }
+    }
+};
+}
+
+\tip{**同步 Observer vs 事件队列：** Observer 是立即通知（同步），事件队列是延迟处理（异步）。音效播放、日志输出等不紧急的通知用队列更安全——避免在物理更新中途触发渲染逻辑。}
+
+// 服务定位器
+
+全局访问某个服务（日志、音频、配置），Singleton 过于僵化——无法替换实现、不利测试。**服务定位器（Service Locator）** 是 Singleton 的可替换版本：通过一个集中的注册点获取服务，但服务的具体实现可以随时替换。
+
+\code[cpp]{
+class ILogger {
+public:
+    virtual void log(const std::string& msg) = 0;
+    virtual ~ILogger() = default;
+};
+
+class ServiceLocator {
+    static inline ILogger* logger_ = nullptr;
+public:
+    static void provide(ILogger* svc) { logger_ = svc; }
+    static ILogger& logger() { return *logger_; }  // 断言非空
+};
+
+// 生产环境
+struct FileLogger : ILogger { void log(const std::string& m) override { /*...*/ } };
+FileLogger realLogger;
+ServiceLocator::provide(&realLogger);
+
+// 测试环境——替换为 NullLogger
+struct NullLogger : ILogger { void log(const std::string&) override {} };
+NullLogger nullLog;
+ServiceLocator::provide(&nullLog);  // 静默，不影响测试断言
+}
+
+// 对象池
+
+子弹、粒子等每帧大量创建/销毁的对象，频繁 `new`/`delete` 造成内存碎片和分配器开销。**对象池（Object Pool）** 预分配一组对象，"创建"时从池中取出，"销毁"时归还池中。
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+#include <cassert>
+
+struct Particle {
+    float x = 0, y = 0, life = 0;
+    bool active = false;
+};
+
+template<size_t N>
+class ParticlePool {
+    std::array<Particle, N> pool_{};
+public:
+    Particle* spawn(float x, float y, float life) {
+        for (auto& p : pool_) {
+            if (!p.active) {
+                p = {x, y, life, true};
+                return &p;
+            }
+        }
+        return nullptr;  // 池满
+    }
+
+    void update(float dt) {
+        int alive = 0;
+        for (auto& p : pool_) {
+            if (!p.active) continue;
+            p.life -= dt;
+            p.x += 0.1f;
+            if (p.life <= 0) p.active = false;  // 归还到池
+            else ++alive;
+        }
+        std::cout << "Active particles: " << alive << "\n";
+    }
+};
+
+int main() {
+    ParticlePool<100> pool;
+    for (int i = 0; i < 20; ++i)
+        pool.spawn(i * 0.5f, 0.0f, 0.5f + i * 0.1f);
+
+    for (int frame = 0; frame < 5; ++frame) {
+        std::cout << "Frame " << frame << ": ";
+        pool.update(0.3f);
+    }
+}
+}
+
+// 空间分区
+
+N 个对象的暴力碰撞检测是 O(N²)。**空间分区（Spatial Partition）** 将空间划分为网格/四叉树/八叉树，每个对象只需检测同一格子及邻近格子中的对象，将复杂度降至 O(N·K)，K 为平均格子密度。
+
+\code[cpp]{
+template<typename T>
+class SpatialGrid {
+    float cellSize_;
+    int cols_, rows_;
+    std::vector<std::vector<T*>> cells_;
+
+    int index(float x, float y) const {
+        int cx = std::clamp(int(x / cellSize_), 0, cols_ - 1);
+        int cy = std::clamp(int(y / cellSize_), 0, rows_ - 1);
+        return cy * cols_ + cx;
+    }
+public:
+    SpatialGrid(float w, float h, float cell)
+        : cellSize_(cell)
+        , cols_(int(w / cell) + 1)
+        , rows_(int(h / cell) + 1)
+        , cells_(cols_ * rows_) {}
+
+    void insert(T* obj, float x, float y) { cells_[index(x, y)].push_back(obj); }
+
+    std::vector<T*> queryNear(float x, float y, float radius) const {
+        std::vector<T*> result;
+        int minC = int((x - radius) / cellSize_), maxC = int((x + radius) / cellSize_);
+        int minR = int((y - radius) / cellSize_), maxR = int((y + radius) / cellSize_);
+        for (int r = std::max(0, minR); r <= std::min(rows_-1, maxR); ++r)
+            for (int c = std::max(0, minC); c <= std::min(cols_-1, maxC); ++c)
+                for (auto* p : cells_[r * cols_ + c])
+                    result.push_back(p);
+        return result;
+    }
+
+    void clear() { for (auto& cell : cells_) cell.clear(); }
+};
+// 每帧：clear() → 重新 insert 所有对象 → queryNear 做碰撞
+}
+
+\diagram[flow]{
+暴力 O(N²) --[N>100]--> 空间网格 O(N·K) --[对象分布不均]--> 四叉树 --[3D]--> 八叉树/BVH
+}
+
+// 双缓冲
+
+当多个对象在同一帧内互相读写状态时，更新顺序会影响结果——A 先更新读到了 B 的旧状态，C 后更新读到了 A 的新状态。**双缓冲（Double Buffer）** 维护两份状态：读旧缓冲、写新缓冲，帧末交换。
+
+\code[cpp]{
+class Cell {
+    bool current_ = false;  // 读缓冲
+    bool next_ = false;     // 写缓冲
+public:
+    bool alive() const { return current_; }
+    void setNext(bool v) { next_ = v; }
+    void swap() { current_ = next_; }
+};
+// 康威生命游戏：所有 cell 先根据 current_ 计算 next_，再统一 swap
+// 保证同一帧内所有 cell 看到的是上一帧的一致状态
+}
+
+// 数据局部性
+
+现代 CPU 的瓶颈往往不是计算而是**缓存未命中（Cache Miss）**。**数据局部性（Data Locality）** 通过将频繁一起访问的数据放在连续内存中，最大化缓存命中率。核心技巧：**SoA（Structure of Arrays）** 替代 **AoS（Array of Structures）**。
+
+\tabs{
+\tab[AoS（缓存不友好）]{
+\code[cpp]{
+struct Particle {
+    float x, y, z;    // 更新位置时用
+    float r, g, b;    // 渲染时用
+    float lifetime;   // 生命周期检查用
+};
+std::vector<Particle> particles;
+// 更新位置时加载了 r,g,b,lifetime——浪费缓存行
+}
+}
+\tab[SoA（缓存友好）]{
+\code[cpp]{
+struct Particles {
+    std::vector<float> x, y, z;         // 连续存储
+    std::vector<float> r, g, b;         // 连续存储
+    std::vector<float> lifetime;        // 连续存储
+};
+// 更新位置时只遍历 x,y,z——每次加载的缓存行都是有用数据
+}
+}
+}
+
+\note{**AoS vs SoA 的选择不是绝对的：** 如果一个操作需要同时访问对象的所有字段（如序列化），AoS 更合适。SoA 的优势在于批量处理单一属性（如物理更新所有位置）。ECS 架构天然采用 SoA 布局。}
+
+/// 工程实践
+
+\list{
+- Game Loop：先做固定步长 + 帧时间限制，再考虑多线程架构
+- 组件查找：`dynamic_cast` 在热路径中太慢，用类型 ID + 位掩码实现 O(1) 查找
+- 事件队列容量需要监控——满队列丢弃事件是严重 bug，应有日志告警
+- Service Locator 的 provide 必须在任何 logger()/audio() 调用之前完成——使用断言保护
+- 对象池的大小应基于分析（Profiling）确定，而非猜测——过小导致分配失败，过大浪费内存
+- 空间分区的格子大小应约等于最大对象的直径——太小导致大对象跨多个格子
+}
+
+/// 难点易错点分析
+
+\danger{**组件间的通信耦合：** `PlayerController` 需要读 `Physics` 的速度，如果直接 `getComponent<Physics>()` 互相查找——组件间形成隐式依赖图。解决方案：通过事件队列或共享的 Entity 上下文间接通信。}
+
+\danger{**对象池的悬空引用：** 外部持有一个已归还池中的粒子指针，下次该位置被重新分配给新粒子——外部引用变成另一个对象。解决方案：使用代际（Generation）计数器，每次重用递增版本号。}
+
+\quiz[choice]{
+Q: 以下哪种技术可以有效防止游戏循环的"死亡螺旋"？
+A: 提高物理更新频率
+B: 限制每帧的最大 frameTime（如 0.25 秒）
+C: 使用双缓冲
+D: 增大对象池容量
+ANS: B
+EXP: 限制 frameTime 上限意味着即使实际帧耗时更长，累积器也不会无限增长——最多执行固定次数的物理步，保证循环可以退出。
+}
+
+\quiz[tf]{
+Q: SoA（Structure of Arrays）在所有场景下都比 AoS（Array of Structures）性能更好。
+ANS: F
+EXP: SoA 在批量处理单一属性时缓存更友好，但如果操作需要同时访问对象的所有字段（如序列化、深拷贝），AoS 因为属性在内存中相邻反而更优。
+}
+
+/// 实战作业
+
+// 🟢 基础：对象池
+
+完成下面的 `BulletPool` 实现：`spawn` 从池中取出一个空闲子弹并初始化，`update` 更新所有活跃子弹并回收超出范围的。
+
+\run[cpp]{
+#include <iostream>
+#include <array>
+
+struct Bullet {
+    float x = 0, y = 0, speed = 0;
+    bool active = false;
+};
+
+template<size_t N>
+class BulletPool {
+    std::array<Bullet, N> pool_{};
+public:
+    /* TODO: spawn(x, y, speed) —— 找到第一个 !active 的位置，初始化并标记 active */
+
+    void update(float dt) {
+        int count = 0;
+        for (auto& b : pool_) {
+            if (!b.active) continue;
+            b.x += b.speed * dt;
+            if (b.x > 100.0f) b.active = false;  // 超出范围回收
+            else ++count;
+        }
+        std::cout << "Active bullets: " << count << "\n";
+    }
+};
+
+int main() {
+    BulletPool<50> pool;
+    for (int i = 0; i < 10; ++i)
+        pool.spawn(0.0f, i * 1.0f, 20.0f + i * 5.0f);
+
+    for (int f = 0; f < 8; ++f) {
+        std::cout << "Frame " << f << ": ";
+        pool.update(0.5f);
+    }
+}
+}
+
+// 🟡 进阶：事件队列系统
+
+实现固定大小环形缓冲区的事件队列，支持 `push(Event)`、`processAll(handler)` 和满队列检测。事件类型用枚举区分，handler 为 `std::function<void(const Event&)>`。
+
+// 🔴 挑战：微型 ECS 框架
+
+实现一个简化的 ECS：`EntityManager` 管理实体 ID，`ComponentArray<T>` 以连续数组存储同类组件（SoA 布局），`System` 批量处理指定组件组合的所有实体。要求：组件存储是连续内存（无 `dynamic_cast`），支持至少 `Position`、`Velocity`、`Health` 三种组件。
+
+\collapse[🔴 参考思路]{
+每个组件类型分配一个唯一 ID（编译期用 `typeid` 或计数器）。`ComponentArray<T>` 内部是 `std::vector<T>`，外加一个 `entityToIndex` 映射。`System::update()` 遍历同时拥有 Position 和 Velocity 的实体（通过位掩码 `Signature` 确定），直接操作连续数组——无虚函数、缓存友好。
+}
+
+// 🔴 挑战：综合引擎原型
+
+将 Game Loop + Component + Object Pool + Spatial Partition + Event Queue 组合，实现一个 50 个弹跳球的终端模拟：固定步长物理更新、空间网格碰撞检测、球消亡时通过事件队列通知计分系统。

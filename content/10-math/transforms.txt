@@ -1,0 +1,329 @@
+/// 简介
+
+前三节分别掌握了向量（位置/方向）、矩阵（变换运算）、四元数（旋转表示）。现在把它们组装在一起：**变换系统（Transform System）** 是游戏引擎中管理每个对象"在哪里、朝哪个方向、多大"的核心组件。
+
+真实游戏世界中，变换不是孤立的——角色的武器跟随角色的手，手跟随角色的骨骼，骨骼跟随角色的根节点。这种**父子层次（Parent-Child Hierarchy）**要求变换可以组合、分解、在不同坐标空间之间自由转换。本节设计一套完整的 Transform 组件。
+
+/// 知识点列表
+
+\list{
+- 局部空间（Local Space）vs 世界空间（World Space）
+- Transform 组件设计（Position + Rotation + Scale）
+- 变换层次与父子关系
+- 局部 ↔ 世界坐标转换
+- 坐标系变换（右手系 / 左手系）
+- 屏幕坐标 ↔ 世界坐标（Unproject / Project）
+}
+
+/// 知识点详解
+
+// 局部空间 vs 世界空间
+
+游戏中的每个对象有两套坐标：
+
+\table{
+空间 | 含义 | 典型用途
+---
+局部空间（Local Space）| 以自身为原点的坐标系 | 模型顶点、碰撞体定义
+世界空间（World Space）| 以场景原点为基准的坐标系 | 物理模拟、碰撞检测、渲染
+}
+
+\code[cpp]{
+// 将局部坐标转换为世界坐标：应用变换矩阵
+Vec3 localToWorld(const Mat4& modelMatrix, Vec3 localPos) {
+    Vec4 world = modelMatrix * Vec4{localPos.x, localPos.y, localPos.z, 1.0f};
+    return {world.x, world.y, world.z};
+}
+
+// 将世界坐标转换为局部坐标：应用逆矩阵
+Vec3 worldToLocal(const Mat4& inverseModel, Vec3 worldPos) {
+    Vec4 local = inverseModel * Vec4{worldPos.x, worldPos.y, worldPos.z, 1.0f};
+    return {local.x, local.y, local.z};
+}
+}
+
+\note{**方向向量**的空间转换使用 w=0（不受平移影响）：`modelMatrix * Vec4{dir.x, dir.y, dir.z, 0}` 。如果矩阵含非均匀缩放，方向/法线需用逆转置矩阵变换。}
+
+// Transform 组件设计
+
+游戏引擎中 Transform 组件的标准设计——**TRS 分解**：
+
+\code[cpp]{
+struct Transform {
+    Vec3 position = {0, 0, 0};
+    Quat rotation = Quat::identity();  // 四元数存储旋转
+    Vec3 scale    = {1, 1, 1};
+
+    // 组合成 4x4 变换矩阵：T * R * S
+    Mat4 toMatrix() const {
+        Mat4 t = translate(position.x, position.y, position.z);
+        Mat4 r = quatToMatrix(rotation);
+        Mat4 s = scaleMat(scale.x, scale.y, scale.z);
+        return t * r * s;
+    }
+
+    // 从矩阵分解回 TRS（用于导入外部数据）
+    static Transform fromMatrix(const Mat4& m) {
+        Transform t;
+        // 提取位置：第四列
+        t.position = {m.m[0][3], m.m[1][3], m.m[2][3]};
+        // 提取缩放：每列的长度
+        float sx = length(Vec3{m.m[0][0], m.m[1][0], m.m[2][0]});
+        float sy = length(Vec3{m.m[0][1], m.m[1][1], m.m[2][1]});
+        float sz = length(Vec3{m.m[0][2], m.m[1][2], m.m[2][2]});
+        t.scale = {sx, sy, sz};
+        // 提取旋转：去除缩放后的 3x3 子矩阵转四元数
+        // (matrixToQuat 实现较长，此处省略细节)
+        return t;
+    }
+
+    // 常用方向查询
+    Vec3 forward() const { return rotate(rotation, Vec3{0, 0, -1}); }
+    Vec3 right()   const { return rotate(rotation, Vec3{1, 0, 0}); }
+    Vec3 up()      const { return rotate(rotation, Vec3{0, 1, 0}); }
+};
+}
+
+\tip{**为什么分别存 TRS 而不直接存 Mat4？** 1）四元数 Slerp 无法在矩阵上直接做 2）分别修改位置/旋转/缩放更方便 3）减少冗余（Mat4 有 16 个 float，TRS 只需 10 个）4）避免矩阵漂移（累积误差使矩阵不再是合法的 TRS）。}
+
+// 变换层次与父子关系
+
+游戏世界的对象组成树形层次。子对象的变换定义在**父对象的局部空间**中：
+
+\code[cpp]{
+struct SceneNode {
+    Transform localTransform;        // 相对于父节点的变换
+    SceneNode* parent = nullptr;
+    std::vector<SceneNode*> children;
+
+    // 递归计算世界变换矩阵
+    Mat4 worldMatrix() const {
+        Mat4 local = localTransform.toMatrix();
+        if (parent) {
+            return parent->worldMatrix() * local;
+        }
+        return local;
+    }
+
+    // 将世界坐标点转换到此节点的局部空间
+    Vec3 worldToLocal(Vec3 worldPos) const {
+        Mat4 invWorld = inverse(worldMatrix());
+        Vec4 local = invWorld * Vec4{worldPos.x, worldPos.y, worldPos.z, 1};
+        return {local.x, local.y, local.z};
+    }
+};
+}
+
+\diagram[tree]{
+root: 角色(世界坐标)
+  L: 躯干(相对角色)
+    L: 左手(相对躯干)
+      L: 武器(相对左手)
+    R: 右手(相对躯干)
+  R: 腿部(相对角色)
+}
+
+\warning{**递归 `worldMatrix()` 在深层次时性能差。** 每次查询从叶节点遍历到根节点。生产代码中应缓存世界矩阵（**脏标记模式 Dirty Flag Pattern**）：仅当变换被修改时标记为"脏"，下次查询时才重新计算并缓存。}
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+#include <vector>
+
+struct Vec3 { float x,y,z; };
+struct Vec4 { float x,y,z,w; };
+struct Mat4 {
+    float m[4][4]={};
+    static Mat4 identity(){Mat4 r; r.m[0][0]=r.m[1][1]=r.m[2][2]=r.m[3][3]=1; return r;}
+    Mat4 operator*(const Mat4& b)const{
+        Mat4 r; for(int i=0;i<4;++i) for(int j=0;j<4;++j)
+            for(int k=0;k<4;++k) r.m[i][j]+=m[i][k]*b.m[k][j]; return r;
+    }
+    Vec4 operator*(const Vec4& v)const{
+        return {m[0][0]*v.x+m[0][1]*v.y+m[0][2]*v.z+m[0][3]*v.w,
+                m[1][0]*v.x+m[1][1]*v.y+m[1][2]*v.z+m[1][3]*v.w,
+                m[2][0]*v.x+m[2][1]*v.y+m[2][2]*v.z+m[2][3]*v.w,
+                m[3][0]*v.x+m[3][1]*v.y+m[3][2]*v.z+m[3][3]*v.w};
+    }
+};
+Mat4 translate(float tx,float ty,float tz){
+    Mat4 m=Mat4::identity(); m.m[0][3]=tx;m.m[1][3]=ty;m.m[2][3]=tz; return m;
+}
+Mat4 rotateY(float a){
+    float c=std::cos(a),s=std::sin(a);
+    Mat4 m=Mat4::identity(); m.m[0][0]=c;m.m[0][2]=s;m.m[2][0]=-s;m.m[2][2]=c; return m;
+}
+
+struct Node {
+    Mat4 localMat;
+    Node* parent = nullptr;
+    Mat4 worldMat() const {
+        return parent ? parent->worldMat() * localMat : localMat;
+    }
+};
+
+int main() {
+    // 角色在 (10,0,0)，旋转45°
+    Node character;
+    character.localMat = translate(10,0,0) * rotateY(3.14159f/4);
+
+    // 武器在角色局部空间 (0,1,0.5)
+    Node weapon;
+    weapon.parent = &character;
+    weapon.localMat = translate(0, 1, 0.5f);
+
+    Vec4 weaponWorld = weapon.worldMat() * Vec4{0,0,0,1};
+    std::cout << "武器世界坐标: (" << weaponWorld.x << ", "
+              << weaponWorld.y << ", " << weaponWorld.z << ")\n";
+    // 武器位置 = 角色世界矩阵 × 武器局部位置
+}
+}
+
+// 坐标系约定
+
+\table{
+约定 | 右手系（OpenGL/Vulkan）| 左手系（DirectX/Unity）
+---
+前方 | -Z | +Z
+上方 | +Y | +Y
+右方 | +X | +X
+叉积 | right × up = forward | up × right = forward
+}
+
+\note{**坐标系不影响数学本身**，但影响叉积方向、旋转正方向（逆时针/顺时针）、摄像机朝向。团队必须在项目开始前统一约定，并在数学库头文件中用注释或常量标明。}
+
+// 屏幕坐标 ↔ 世界坐标
+
+**投影（Project）** 将世界坐标转换为屏幕像素坐标。**反投影（Unproject）** 做逆运算，常用于鼠标拾取（Mouse Picking）：
+
+\code[cpp]{
+// Project: 世界坐标 → 屏幕坐标
+Vec2 worldToScreen(Vec3 worldPos, const Mat4& viewProj,
+                   float screenW, float screenH) {
+    Vec4 clip = viewProj * Vec4{worldPos.x, worldPos.y, worldPos.z, 1};
+    // 透视除法 → NDC [-1, 1]
+    float ndcX = clip.x / clip.w;
+    float ndcY = clip.y / clip.w;
+    // NDC → 像素坐标
+    float sx = (ndcX * 0.5f + 0.5f) * screenW;
+    float sy = (1.0f - (ndcY * 0.5f + 0.5f)) * screenH; // Y翻转
+    return {sx, sy};
+}
+
+// Unproject: 屏幕坐标 → 世界射线（用于鼠标拾取）
+Ray screenToRay(float screenX, float screenY,
+                const Mat4& invViewProj,
+                float screenW, float screenH) {
+    // 像素 → NDC
+    float ndcX = (screenX / screenW) * 2.0f - 1.0f;
+    float ndcY = 1.0f - (screenY / screenH) * 2.0f;
+
+    // NDC → 世界空间（近平面和远平面各一个点）
+    Vec4 nearH = invViewProj * Vec4{ndcX, ndcY, -1.0f, 1.0f};
+    Vec4 farH  = invViewProj * Vec4{ndcX, ndcY,  1.0f, 1.0f};
+    Vec3 nearW = {nearH.x/nearH.w, nearH.y/nearH.w, nearH.z/nearH.w};
+    Vec3 farW  = {farH.x/farH.w,  farH.y/farH.w,  farH.z/farH.w};
+
+    return {nearW, normalize(farW - nearW)};
+}
+}
+
+\tip{**鼠标拾取流程：** 屏幕坐标 → Unproject 得到射线 → 射线与场景物体做碰撞检测 → 命中最近物体。这是 RTS 选中单位、FPS 瞄准、编辑器拖拽对象的核心机制。}
+
+/// 工程实践
+
+\collapse[🔧 Transform 系统性能优化]{
+\list{
+- **脏标记（Dirty Flag）**：变换修改时标记，查询时懒计算世界矩阵。避免每帧递归重算
+- **缓存层（Cache Layer）**：将所有节点的世界矩阵存在连续数组中，按层次顺序更新（BFS），缓存友好
+- **避免深层次嵌套**：超过 5-6 层的父子链会放大浮点误差。考虑扁平化结构
+- **并行更新**：无父子关系的子树可以并行计算世界矩阵
+}
+}
+
+/// 难点易错点分析
+
+\danger{**修改子节点世界坐标时忘记转换为局部坐标。** 直接设 `child.position = worldPos` 是错误的——必须先用 `parent.worldToLocal(worldPos)` 转换到父节点的局部空间。}
+
+\danger{**父节点含非均匀缩放时子节点旋转会扭曲。** 如果父节点 `scale = {2, 1, 1}`，子节点的圆形碰撞体会变成椭圆。最佳实践：仅根节点/独立节点使用非均匀缩放。}
+
+\warning{**不同 API 的 NDC 范围不同。** OpenGL Z 范围 [-1, 1]，Vulkan/DirectX Z 范围 [0, 1]。Unproject 时必须匹配 API 约定，否则射线方向偏移。}
+
+\quiz[choice]{
+Q: 角色在世界坐标 (10, 0, 0) 旋转 90°，武器在角色的局部坐标 (0, 0, 1)。武器的世界坐标是？
+A: (10, 0, 1)
+B: (11, 0, 0)
+C: (9, 0, 0)
+D: (10, 0, -1)
+ANS: B
+EXP: 局部 (0,0,1) 先被角色的旋转变换（绕 Y 轴旋转 90° 将 Z 轴映射到 X 轴方向），变为 (1,0,0)，再加上角色平移 (10,0,0)，最终为 (11,0,0)。具体取决于旋转方向约定。
+}
+
+\quiz[tf]{
+Q: 一个对象的世界矩阵等于其所有祖先节点的局部矩阵与自身局部矩阵的连续乘积。
+ANS: T
+EXP: worldMatrix = root.local * ... * parent.local * self.local。从根到叶依次左乘局部矩阵。
+}
+
+/// 实战作业
+
+// 🟢 基础题：变换层次计算
+
+\run[cpp]{
+#include <iostream>
+#include <cmath>
+
+struct Vec4{float x,y,z,w;};
+struct Mat4{
+    float m[4][4]={};
+    static Mat4 identity(){Mat4 r;r.m[0][0]=r.m[1][1]=r.m[2][2]=r.m[3][3]=1;return r;}
+    Mat4 operator*(const Mat4& b)const{
+        Mat4 r;for(int i=0;i<4;++i)for(int j=0;j<4;++j)
+            for(int k=0;k<4;++k)r.m[i][j]+=m[i][k]*b.m[k][j];return r;
+    }
+    Vec4 operator*(const Vec4& v)const{
+        return{m[0][0]*v.x+m[0][1]*v.y+m[0][2]*v.z+m[0][3]*v.w,
+               m[1][0]*v.x+m[1][1]*v.y+m[1][2]*v.z+m[1][3]*v.w,
+               m[2][0]*v.x+m[2][1]*v.y+m[2][2]*v.z+m[2][3]*v.w,
+               m[3][0]*v.x+m[3][1]*v.y+m[3][2]*v.z+m[3][3]*v.w};
+    }
+};
+Mat4 translate(float tx,float ty,float tz){
+    Mat4 m=Mat4::identity();m.m[0][3]=tx;m.m[1][3]=ty;m.m[2][3]=tz;return m;
+}
+
+struct Node {
+    Mat4 localMat = Mat4::identity();
+    Node* parent = nullptr;
+    /* TODO: 实现 worldMatrix()，递归累积父节点变换 */
+    Mat4 worldMatrix() const { return Mat4::identity(); }
+};
+
+int main() {
+    Node root;  root.localMat = translate(5, 0, 0);
+    Node child; child.localMat = translate(0, 3, 0); child.parent = &root;
+    Node leaf;  leaf.localMat = translate(0, 0, 2);  leaf.parent = &child;
+
+    Vec4 origin = leaf.worldMatrix() * Vec4{0,0,0,1};
+    std::cout << "leaf 世界坐标: (" << origin.x << ", "
+              << origin.y << ", " << origin.z << ")\n";
+    std::cout << "期望: (5, 3, 2)\n";
+}
+}
+
+// 🟡 进阶题：脏标记缓存
+
+为 `SceneNode` 增加脏标记机制：当 `localTransform` 被修改时标记为脏，查询 `worldMatrix()` 时才重算并缓存。修改父节点时级联标记所有子节点为脏。
+
+// 🔴 挑战题：鼠标拾取系统
+
+实现完整的屏幕坐标到世界射线的 Unproject 流程。给定一组 AABB 物体和一个"鼠标点击坐标"，输出被点中的物体编号。要求正确处理透视投影下的 Z 排序（返回最近的命中物体）。
+
+\collapse[🤔 参考思路]{
+1. 构造 View 和 Projection 矩阵 → 计算 invViewProj
+2. 屏幕坐标 → NDC → 乘 invViewProj → 得到射线 origin + direction
+3. 射线与每个 AABB 做 Slab Method 碰撞检测（见 collision.txt）
+4. 取最小 t（最近命中）对应的物体
+}
+
+变换系统将数学和引擎架构连接起来——下一节我们用碰撞检测让游戏对象之间产生物理交互。

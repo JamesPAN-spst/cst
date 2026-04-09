@@ -1,0 +1,683 @@
+/// 简介
+
+上一节我们学习了分配器（Allocator）的原理与 PMR 框架。分配器解决的是"如何从大块内存中快速分配"的问题，但有些场景需要更专用的方案——当你有大量**相同大小**的对象需要反复创建和销毁时（粒子系统中的粒子、ECS 中的组件、网络连接中的消息包），**内存池（Memory Pool）** 是最佳选择。
+
+内存池的核心思想：预先分配一大块内存，划分成等大的槽位，用**空闲链表（Free List）**管理回收。分配和释放都是 O(1)，零碎片，缓存友好。本节从"为什么需要内存池"出发，逐步构建从简单到高级的多种内存池实现。
+
+/// 知识点列表
+
+\list{
+- 为什么需要内存池（性能瓶颈与碎片化问题）
+- 固定大小内存池（Free List Pool 实现）
+- 侵入式空闲链表的原理
+- 对象池模式（Object Pool Pattern）
+- Slab 分配器概念
+- 内存池的线程安全策略
+- 内存池 vs std::pmr
+- 游戏引擎中的实体池与粒子池
+}
+
+/// 知识点详解
+
+// 为什么需要内存池
+
+假设一个粒子系统每帧需要创建 500 个粒子、销毁 300 个粒子。如果每个粒子都通过 `new`/`delete` 分配：
+
+\code[cpp]{
+// 性能问题演示（伪代码）
+for (int frame = 0; frame < 60; ++frame) { // 每秒60帧
+    // 创建500个粒子 → 500次 malloc
+    for (int i = 0; i < 500; ++i)
+        particles.push_back(new Particle(...));
+
+    // 销毁300个粒子 → 300次 free
+    for (int i = 0; i < 300; ++i) {
+        delete particles[deadIndex];
+        // free后的小块散落堆中 → 碎片化
+    }
+}
+// 一秒：30000次malloc + 18000次free
+// 一分钟：180万次malloc → 严重碎片化 + 缓存失效
+}
+
+\table{
+问题 | 默认 new/delete | 内存池
+---
+分配速度 | 搜索空闲链表，不确定耗时 | 从池头取一块，O(1)
+释放速度 | 合并相邻块，可能系统调用 | 归还到池头，O(1)
+碎片化 | 长时间运行后严重 | 零碎片（都是等大的块）
+缓存局部性 | 分散在堆各处 | 连续内存，缓存友好
+内存追踪 | 需要全局工具（Valgrind） | 池本身知道用了多少
+}
+
+// 固定大小内存池（Free List Pool）
+
+**空闲链表池（Free List Pool）** 是最经典的内存池实现。核心设计：预分配 N 个等大的内存块，空闲块通过**侵入式链表（Intrusive Linked List）**串联——利用空闲块本身的空间存储 `next` 指针，不需要额外的链表节点内存。
+
+\diagram[memory]{
+FreeListPool (5 slots, each 32B):
+  [slot 0] 已使用: Particle{x=1.0, y=2.0, ...}
+  [slot 1] 空闲 → next = slot 3
+  [slot 2] 已使用: Particle{x=5.0, y=0.0, ...}
+  [slot 3] 空闲 → next = slot 4
+  [slot 4] 空闲 → next = nullptr
+arrow: freeHead -> slot 1
+}
+
+\run[cpp]{
+#include <iostream>
+#include <cstdlib>
+#include <cstdint>
+#include <new>
+#include <utility>
+
+template<typename T, std::size_t BlockCount>
+class FreeListPool {
+    // 联合体：空闲时存 next 指针，使用时存 T 对象
+    union Block {
+        T object;
+        Block* next;
+        Block() {}   // 不初始化
+        ~Block() {}  // 不析构（由池管理生命周期）
+    };
+
+    alignas(T) unsigned char storage_[sizeof(Block) * BlockCount];
+    Block* blocks_ = reinterpret_cast<Block*>(storage_);
+    Block* freeHead_ = nullptr;
+    std::size_t allocCount_ = 0;
+
+public:
+    FreeListPool() {
+        // 初始化空闲链表：所有块串成链表
+        for (std::size_t i = 0; i < BlockCount - 1; ++i) {
+            blocks_[i].next = &blocks_[i + 1];
+        }
+        blocks_[BlockCount - 1].next = nullptr;
+        freeHead_ = &blocks_[0];
+    }
+
+    ~FreeListPool() {
+        // 注意：不析构存活对象——使用者应在池销毁前 destroy 所有对象
+    }
+
+    // 分配一个原始槽位：O(1)
+    T* allocate() {
+        if (!freeHead_) return nullptr;
+        Block* block = freeHead_;
+        freeHead_ = freeHead_->next;
+        ++allocCount_;
+        return reinterpret_cast<T*>(block);
+    }
+
+    // 释放一个槽位：O(1)
+    void deallocate(T* ptr) {
+        Block* block = reinterpret_cast<Block*>(ptr);
+        block->next = freeHead_;
+        freeHead_ = block;
+        --allocCount_;
+    }
+
+    // 分配 + 构造
+    template<typename... Args>
+    T* create(Args&&... args) {
+        T* ptr = allocate();
+        if (!ptr) return nullptr;
+        return new (ptr) T(std::forward<Args>(args)...);
+    }
+
+    // 析构 + 释放
+    void destroy(T* ptr) {
+        ptr->~T();
+        deallocate(ptr);
+    }
+
+    std::size_t used() const { return allocCount_; }
+    std::size_t capacity() const { return BlockCount; }
+    bool full() const { return freeHead_ == nullptr; }
+};
+
+struct Particle {
+    float x, y, vx, vy;
+    int life;
+    Particle(float x, float y, int life)
+        : x(x), y(y), vx(0), vy(0), life(life) {}
+};
+
+int main() {
+    FreeListPool<Particle, 1000> pool;
+
+    auto* p1 = pool.create(1.0f, 2.0f, 60);
+    auto* p2 = pool.create(3.0f, 4.0f, 30);
+    auto* p3 = pool.create(5.0f, 6.0f, 90);
+
+    std::cout << "used: " << pool.used() << " / " << pool.capacity() << "\n";
+
+    pool.destroy(p2);
+    std::cout << "after destroy p2, used: " << pool.used() << "\n";
+
+    // p2 的槽位被回收，下次分配会重用
+    auto* p4 = pool.create(7.0f, 8.0f, 45);
+    std::cout << "p4 reused p2's slot? " << (p4 == p2 ? "yes" : "no") << "\n";
+
+    pool.destroy(p1);
+    pool.destroy(p3);
+    pool.destroy(p4);
+    return 0;
+}
+}
+
+\danger{**侵入式空闲链表的致命隐患：**释放后的块被重新解释为链表节点存储 next 指针。如果释放后仍通过旧指针写入数据（**use-after-free**），会破坏空闲链表结构，导致后续分配返回错误地址甚至崩溃。调试版本应该在释放时填充特殊值（如 `0xDEADBEEF`）检测此类问题。}
+
+// 对象池模式（Object Pool Pattern）
+
+基础的 `FreeListPool` 有一个安全隐患：池返回的是裸指针，你无法判断一个指针指向的对象是否仍然存活。**版本化句柄（Versioned Handle）**模式解决了这个问题。
+
+每个槽位维护一个**版本号（Generation Counter）**，每次释放时版本号递增。句柄同时记录槽位索引和分配时的版本号。访问时对比版本号——如果不匹配，说明对象已被销毁并重用。
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+#include <new>
+#include <utility>
+
+template<typename T, std::size_t Capacity>
+class ObjectPool {
+    struct Slot {
+        alignas(T) unsigned char data[sizeof(T)];
+        uint32_t generation = 0;  // 版本号
+        uint32_t nextFree = 0;
+        bool alive = false;
+    };
+
+    Slot slots_[Capacity];
+    uint32_t freeHead_ = 0;
+    std::size_t count_ = 0;
+
+public:
+    struct Handle {
+        uint32_t index;
+        uint32_t generation;
+    };
+    static constexpr Handle Null{UINT32_MAX, 0};
+
+    ObjectPool() {
+        for (uint32_t i = 0; i < Capacity - 1; ++i)
+            slots_[i].nextFree = i + 1;
+        slots_[Capacity - 1].nextFree = UINT32_MAX;
+    }
+
+    template<typename... Args>
+    Handle create(Args&&... args) {
+        if (freeHead_ == UINT32_MAX) return Null;
+        uint32_t idx = freeHead_;
+        freeHead_ = slots_[idx].nextFree;
+        new (slots_[idx].data) T(std::forward<Args>(args)...);
+        slots_[idx].alive = true;
+        ++count_;
+        return Handle{idx, slots_[idx].generation};
+    }
+
+    void destroy(Handle h) {
+        if (!isValid(h)) return;
+        reinterpret_cast<T*>(slots_[h.index].data)->~T();
+        slots_[h.index].alive = false;
+        slots_[h.index].generation++;   // 版本号递增！
+        slots_[h.index].nextFree = freeHead_;
+        freeHead_ = h.index;
+        --count_;
+    }
+
+    bool isValid(Handle h) const {
+        return h.index < Capacity
+            && slots_[h.index].alive
+            && slots_[h.index].generation == h.generation;
+    }
+
+    T* get(Handle h) {
+        if (!isValid(h)) return nullptr;
+        return reinterpret_cast<T*>(slots_[h.index].data);
+    }
+
+    std::size_t activeCount() const { return count_; }
+};
+
+struct Enemy {
+    int hp;
+    float x, y;
+    Enemy(int hp, float x, float y) : hp(hp), x(x), y(y) {}
+};
+
+int main() {
+    ObjectPool<Enemy, 100> pool;
+
+    auto h1 = pool.create(100, 1.0f, 2.0f);
+    auto h2 = pool.create(80, 3.0f, 4.0f);
+
+    std::cout << "active: " << pool.activeCount() << "\n";
+    std::cout << "h1 valid: " << pool.isValid(h1) << "\n";
+
+    pool.destroy(h1);
+    std::cout << "after destroy h1:\n";
+    std::cout << "  h1 valid: " << pool.isValid(h1) << "\n"; // false!
+    std::cout << "  h2 valid: " << pool.isValid(h2) << "\n"; // true
+
+    // 槽位被重用，但旧句柄检测到版本不匹配
+    auto h3 = pool.create(120, 5.0f, 6.0f);
+    std::cout << "h3 reused h1's slot? "
+              << (h3.index == h1.index ? "yes" : "no") << "\n";
+    std::cout << "h1 still valid? " << pool.isValid(h1) << "\n"; // false!
+
+    pool.destroy(h2);
+    pool.destroy(h3);
+    return 0;
+}
+}
+
+\tip{**版本化句柄是游戏引擎管理对象生命周期的标准模式。** 它替代了裸指针和裸索引，解决了"无法检测对象是否仍存活"的根本问题。主流 ECS 框架（EnTT、Flecs）的 Entity ID 内部都是版本化句柄。}
+
+// Slab 分配器概念
+
+**Slab 分配器（Slab Allocator）** 最早由 Sun Microsystems 的 Jeff Bonwick 为 Solaris 内核设计。它的核心思想：为每种大小的对象维护一组预分配的**页（Slab）**，每个 Slab 内部用空闲链表管理等大的槽位。
+
+\table{
+层次 | 概念 | 说明
+---
+Cache | 缓存 | 为特定大小/类型的对象维护的池。例如 "32字节 Cache"
+Slab | 页 | 一块连续内存（通常 4KB~64KB），被划分成等大的槽位
+Slot | 槽位 | Slab 内的一个对象位置
+}
+
+\code[cpp]{
+// Slab 分配器的概念模型（简化）
+class SlabAllocator {
+    struct Slab {
+        void* memory;         // 连续的大块内存
+        int freeCount;        // 空闲槽位数
+        Slab* next;           // 链接到下一个 Slab
+        // 内部空闲链表管理各槽位
+    };
+
+    struct Cache {
+        std::size_t objectSize;  // 每个对象的大小
+        Slab* partialSlabs;      // 部分使用的 Slab（优先从这里分配）
+        Slab* fullSlabs;         // 完全使用的 Slab
+        Slab* emptySlabs;        // 完全空闲的 Slab（可归还给系统）
+    };
+
+    // 分配流程：
+    // 1. 根据请求大小找到对应的 Cache
+    // 2. 从 partialSlabs 中找到一个有空位的 Slab
+    // 3. 从该 Slab 的空闲链表中取一个槽位
+    // 4. 如果没有 partial Slab，创建新 Slab 或从 empty 中取
+};
+}
+
+\note{**Slab 分配器在游戏引擎中的意义：** 大多数游戏引擎不会直接实现 Slab 分配器（那是操作系统内核的事），但理解 Slab 思想有助于设计多级分配器体系。`std::pmr::pool_resource` 的内部实现就接近 Slab 的思路——按大小分桶，每个桶内部用空闲链表。}
+
+// 内存池的线程安全
+
+上面的所有实现都不是**线程安全（Thread-Safe）**的。多线程环境下的常见策略：
+
+\tabs{
+\tab[方案1：每线程独立池]{
+\code[cpp]{
+// 每个线程拥有自己的池，无需加锁
+thread_local FreeListPool<Particle, 5000> particlePool;
+
+// 线程A和线程B各自在自己的池中分配
+// 优点：零竞争，最快
+// 缺点：线程间不能传递对象指针（指向不同池的内存）
+}
+}
+\tab[方案2：互斥锁保护]{
+\code[cpp]{
+// 共享池 + 互斥锁
+template<typename T, std::size_t N>
+class ThreadSafePool {
+    FreeListPool<T, N> pool_;
+    std::mutex mtx_;
+
+public:
+    template<typename... Args>
+    T* create(Args&&... args) {
+        std::lock_guard lock(mtx_);
+        return pool_.create(std::forward<Args>(args)...);
+    }
+
+    void destroy(T* ptr) {
+        std::lock_guard lock(mtx_);
+        pool_.destroy(ptr);
+    }
+};
+// 简单但有锁竞争——高并发时成为瓶颈
+}
+}
+\tab[方案3：无锁空闲链表]{
+\code[cpp]{
+// 用 atomic CAS 实现无锁 free list
+#include <atomic>
+
+struct FreeNode { FreeNode* next; };
+
+class LockFreePool {
+    std::atomic<FreeNode*> freeHead_{nullptr};
+
+    void push(FreeNode* node) {
+        node->next = freeHead_.load(std::memory_order_relaxed);
+        while (!freeHead_.compare_exchange_weak(
+            node->next, node,
+            std::memory_order_release,
+            std::memory_order_relaxed));
+    }
+    // 分配类似——pop from head with CAS
+};
+// 无锁但实现复杂，需处理 ABA 问题
+}
+}
+}
+
+\warning{**大多数游戏引擎选择方案 1（每线程独立池）。** 因为游戏中的对象通常只在一个子系统中创建和销毁（粒子归渲染线程、物理体归物理线程），跨线程传递对象的需求很少。只有在确实需要跨线程共享时，才考虑方案 2 或 3。}
+
+// 内存池 vs std::pmr
+
+\table{
+维度 | 自己实现的内存池 | std::pmr::pool_resource
+---
+灵活性 | 完全控制（对齐、调试填充、版本号） | 受标准接口约束
+性能 | 可针对特定场景极致优化 | 通用实现，性能良好但非极致
+与 STL | 需要写适配器 | 天然与 pmr 容器配合
+线程安全 | 自行实现 | `synchronized_pool_resource` 可用
+调试支持 | 自由添加（哨兵、填充、泄漏检测） | 依赖实现
+维护成本 | 高——需要大量测试 | 零——标准库负责
+}
+
+\note{**选择建议：** 如果你的项目是一般应用或中小规模游戏，优先使用 `std::pmr::pool_resource`——够用且免维护。如果是高性能游戏引擎或对延迟极其敏感的系统，自己实现内存池以获得极致控制。}
+
+// 游戏中的实体池与粒子池
+
+游戏引擎中最典型的两个内存池应用场景：
+
+**粒子池：** 粒子系统每帧产生大量粒子、销毁大量粒子。粒子大小固定、生命周期短。用 `FreeListPool` 存储，分配释放都是 O(1)，连续内存利于 SIMD 批量更新。
+
+**实体池/组件池：** ECS 架构中，Entity 本身只是一个 ID（版本化句柄），而各种 Component 存储在独立的池中。这样同类组件在内存中连续排列，迭代时缓存命中率极高。
+
+\code[cpp]{
+// ECS 中的组件池概念
+struct Position { float x, y, z; };
+struct Velocity { float dx, dy, dz; };
+struct Health   { int hp, maxHp; };
+
+// 每种组件一个池
+ObjectPool<Position, 10000> positionPool;
+ObjectPool<Velocity, 10000> velocityPool;
+ObjectPool<Health,   5000>  healthPool;
+
+// 创建实体时：
+auto posHandle = positionPool.create(0, 0, 0);
+auto velHandle = velocityPool.create(1, 0, 0);
+auto hpHandle  = healthPool.create(100, 100);
+
+// 更新系统——遍历连续的 Position 和 Velocity 数据
+// 内存连续 → 缓存友好 → 高性能
+}
+
+\collapse[深入：Data-Oriented Design 与内存池]{
+**面向数据设计（Data-Oriented Design, DOD）**是游戏引擎的核心理念之一。它的核心原则是：按数据的访问模式组织内存布局，而非按对象的概念层次。
+
+传统 OOP 中，一个 `GameObject` 把 Position、Velocity、Render、Physics 全部聚合在一起。遍历所有对象更新 Position 时，每次访问都要跳过不需要的 Render/Physics 数据——cache miss 大幅增加。
+
+DOD（以及 ECS）将同类数据放入连续池内。更新 Position 时只遍历 Position 池——数据密集排列，cache line 利用率接近 100%。
+
+内存池是实现 DOD 的基础设施。
+}
+
+/// 新版特性（C++17/20/23）
+
+\tabs{
+\tab[C++17]{
+- `std::pmr::pool_resource`：标准库提供的按大小分池的内存资源
+- `std::pmr::synchronized_pool_resource`：线程安全版本
+- `std::pmr::monotonic_buffer_resource` 可作为 pool 的上游
+- 实际效果接近自定义 Slab 分配器
+}
+\tab[C++20]{
+- `std::atomic<std::shared_ptr>` 让无锁池的智能指针版本成为可能
+- `std::jthread` 简化了线程管理，间接利好每线程池方案
+- Ranges 便于对池内存活对象的过滤与变换
+}
+\tab[C++23]{
+- `std::flat_map` / `std::flat_set` 使用连续内存，与池分配器配合更好
+- `std::expected` 可替代 nullptr 返回值表达分配失败
+}
+}
+
+/// 工程实践
+
+\list{
+- **池的容量要基于实测数据设定。** 开发阶段统计峰值使用量，设为 1.2~1.5 倍余量。
+- **调试模式下在释放时填充特殊字节。** `0xDEADBEEF` 或 `0xFEEEFEEE`，帮助发现 use-after-free。
+- **池满时的策略要提前设计。** 可以返回 nullptr、断言崩溃、或动态扩展（增加新 Slab）。
+- **优先使用版本化句柄而非裸指针。** 裸指针无法检测对象是否已被回收。
+- **销毁池之前必须析构所有存活对象。** 如果对象持有其他资源（文件句柄、GPU 对象），只释放内存不够。
+}
+
+/// 难点易错点分析
+
+\danger{**池析构时必须处理存活对象。**如果直接释放底层内存而不逐个析构存活对象，那些持有资源的对象（`std::string`、文件句柄等）会导致资源泄漏。}
+
+\code[cpp]{
+// 错误：直接释放 buffer
+~FreeListPool() {
+    std::free(buffer); // 存活对象的析构函数没被调用！
+}
+
+// 正确：先析构存活对象
+~FreeListPool() {
+    for (std::size_t i = 0; i < Capacity; ++i) {
+        if (isAlive(i)) {
+            getObject(i)->~T(); // 显式析构
+        }
+    }
+    std::free(buffer);
+}
+}
+
+\warning{**线性分配器中的非平凡对象必须在 reset 前手动析构。** `reset()` 只归零 offset，不调用任何析构函数。对于 POD 类型没问题，但 `std::string`、`std::vector` 等必须先析构。}
+
+\danger{**版本号溢出问题。** `uint32_t` 的版本号最大约 42 亿。如果单个槽位被反复创建/销毁超过 42 亿次，版本号回绕（wrap around）可能导致旧句柄误判为有效。在实践中这几乎不会发生（一个槽位每帧创建/销毁一次，42 亿帧需要约 2.2 年 @ 60fps），但极端情况下可用 `uint64_t`。}
+
+\quiz[choice]{
+Q: 空闲链表池（Free List Pool）把 `next` 指针存在哪里？
+A: 在每个槽位的头部额外添加一个指针字段
+B: 在一个独立的数组中按索引记录
+C: 直接利用空闲槽位本身的内存空间存储
+D: 在池的尾部统一存储所有指针
+ANS: C
+EXP: 这就是"侵入式（Intrusive）"链表的含义——空闲块没有存储有效数据，利用这块空间存 next 指针。使用联合体（union）让同一块内存在空闲时存指针、使用时存对象。
+}
+
+\quiz[tf]{
+Q: 使用版本化句柄（Versioned Handle）的对象池中，当一个对象被销毁后其槽位被新对象重用时，旧句柄调用 `isValid()` 会返回 `false`。
+ANS: T
+EXP: 销毁时版本号递增，旧句柄记录的是旧版本号，对比时不匹配，因此 isValid() 返回 false。这正是版本化句柄的安全机制。
+}
+
+\quiz[choice]{
+Q: 在多线程游戏引擎中，管理粒子内存池的最佳策略通常是？
+A: 所有线程共享一个全局池，用互斥锁保护
+B: 每个线程拥有独立的粒子池，无需加锁
+C: 使用 std::shared_ptr 管理每个粒子
+D: 每次分配都用 new，由垃圾回收器自动释放
+ANS: B
+EXP: 粒子通常只在渲染线程中创建和销毁，不需要跨线程共享。每线程独立池完全避免锁竞争，是游戏引擎最常用的策略。共享池的互斥锁在高频分配场景下会成为性能瓶颈。
+}
+
+\quiz[tf]{
+Q: `std::pmr::pool_resource` 的功能完全可以替代自定义的 `FreeListPool`，两者性能相同。
+ANS: F
+EXP: `pool_resource` 是通用实现，支持多种大小的分配。自定义 FreeListPool 针对固定大小对象可以做极致优化（如编译期大小、版本化句柄、调试填充），通常在特定场景下更快。但 pool_resource 的优势是零维护成本和标准兼容性。
+}
+
+/// 实战作业
+
+// 🟢 基础题：实现简单的固定大小内存池
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+
+template<typename T, std::size_t N>
+class SimplePool {
+    union Block {
+        T value;
+        Block* next;
+        Block() {}
+        ~Block() {}
+    };
+
+    alignas(T) unsigned char storage_[sizeof(Block) * N];
+    Block* blocks_ = reinterpret_cast<Block*>(storage_);
+    Block* freeHead_ = nullptr;
+    std::size_t count_ = 0;
+
+public:
+    SimplePool() {
+        // TODO: 初始化空闲链表
+        //   将所有 N 个 Block 串成链表
+        //   blocks_[0].next = &blocks_[1], ...
+        //   最后一个的 next = nullptr
+        //   freeHead_ = &blocks_[0]
+        /* TODO: 你的代码 */
+    }
+
+    T* allocate() {
+        // TODO: 从链表头取出一个块
+        //   如果 freeHead_ 为 nullptr 返回 nullptr
+        //   否则取出 freeHead_ 并更新链表
+        /* TODO: 你的代码 */
+        return nullptr;
+    }
+
+    void deallocate(T* ptr) {
+        // TODO: 将块归还到链表头
+        /* TODO: 你的代码 */
+    }
+
+    std::size_t used() const { return count_; }
+};
+
+int main() {
+    SimplePool<int, 5> pool;
+
+    int* a = pool.allocate();
+    int* b = pool.allocate();
+    if (a) *a = 42;
+    if (b) *b = 99;
+
+    std::cout << "used: " << pool.used() << "\n"; // 应输出 2
+    std::cout << "*a = " << *a << ", *b = " << *b << "\n";
+
+    pool.deallocate(a);
+    std::cout << "after free a, used: " << pool.used() << "\n"; // 应输出 1
+
+    int* c = pool.allocate();
+    std::cout << "c reused a's slot? " << (c == a ? "yes" : "no") << "\n";
+
+    pool.deallocate(b);
+    pool.deallocate(c);
+    return 0;
+}
+}
+
+// 🟡 进阶题：版本化句柄对象池
+
+在基础池的基础上，实现 `Handle`（含索引 + 版本号）、`create()`、`destroy()`、`isValid()`、`get()` 五个核心操作。用测试代码验证：销毁对象后旧句柄变为无效；槽位重用后旧句柄仍返回无效。
+
+\run[cpp]{
+#include <iostream>
+#include <cstdint>
+#include <new>
+#include <utility>
+
+template<typename T, std::size_t Cap>
+class VersionedPool {
+    struct Slot {
+        alignas(T) unsigned char data[sizeof(T)];
+        uint32_t generation = 0;
+        uint32_t nextFree = 0;
+        bool alive = false;
+    };
+
+    Slot slots_[Cap];
+    uint32_t freeHead_ = 0;
+    std::size_t count_ = 0;
+
+public:
+    struct Handle {
+        uint32_t index;
+        uint32_t generation;
+    };
+
+    VersionedPool() {
+        for (uint32_t i = 0; i < Cap - 1; ++i)
+            slots_[i].nextFree = i + 1;
+        slots_[Cap - 1].nextFree = UINT32_MAX;
+    }
+
+    // TODO: 实现 create() → 返回 Handle
+    // TODO: 实现 destroy(Handle) → 析构对象，版本号++
+    // TODO: 实现 isValid(Handle) → 检查存活 + 版本匹配
+    // TODO: 实现 get(Handle) → 返回 T* 或 nullptr
+
+    std::size_t activeCount() const { return count_; }
+};
+
+struct Bullet {
+    float x, y, speed;
+    Bullet(float x, float y, float s) : x(x), y(y), speed(s) {}
+};
+
+int main() {
+    VersionedPool<Bullet, 100> pool;
+
+    /* TODO: 测试以下场景：
+       1. 创建两个 Bullet，验证句柄有效
+       2. 销毁第一个，验证其句柄变为无效
+       3. 创建第三个（重用被销毁的槽位），验证旧句柄仍无效
+       4. 输出每步的 activeCount
+    */
+
+    return 0;
+}
+}
+
+// 🟡 进阶题：添加调试填充检测
+
+为 `FreeListPool` 的 `deallocate()` 添加调试功能：释放时将整个槽位填充 `0xDE` 字节。在 `allocate()` 返回前，检查即将使用的块是否仍然是 `0xDE` 填充—— 如果不是，说明有 use-after-free 破坏了空闲块数据，打印警告。
+
+\collapse[参考思路]{
+1. `deallocate()` 中，在设置 next 指针之前，用 `std::memset(ptr, 0xDE, sizeof(T))` 填充
+2. 但 next 指针存在块的前 `sizeof(Block*)` 字节，所以只能填充 `sizeof(Block*)`之后的部分
+3. 或者更精确的方式：填充整块后再写入 next 指针（next 指针覆盖前几个字节）
+4. `allocate()` 时检查 next 指针之后的字节是否仍为 `0xDE`
+5. 用 `#ifndef NDEBUG` 包裹调试代码，Release 模式不执行
+}
+
+// 🔴 挑战题：粒子系统完整实现
+
+设计一个完整的粒子系统，包含：
+1. `FreeListPool<Particle, 10000>` 管理粒子内存
+2. 每帧随机创建 100~500 个粒子，每个粒子有随机初速和寿命
+3. 每帧更新所有存活粒子的位置，寿命减一，寿命归零时销毁
+4. 每 60 帧输出一次统计：当前存活数、池使用率、峰值使用量
+5. 运行 600 帧（模拟 10 秒 @ 60fps）后输出总结报告
+
+\collapse[参考思路]{
+- 用 `std::vector<Particle*>` 或 `Handle` 记录存活粒子列表
+- 每帧遍历存活列表更新位置、检查寿命，死亡时从列表移除并 destroy
+- 用 `<random>` 生成随机参数
+- 池满时停止创建（或打印警告）
+- 峰值统计只需在每次 create 成功后检查 `pool.used() > peak`
+}
+
+下一节是本章的综合项目——构建一个完整的游戏导向内存分配器系统，综合运用线性分配器、对象池和栈分配器。

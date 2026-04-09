@@ -1,0 +1,415 @@
+/// 简介
+
+并发 bug 是软件开发中最阴险的缺陷——它们**不可稳定复现**、**时序依赖**、在调试器中可能消失（**海森堡 bug / Heisenbug**）。前面几节学了工具和模式，本节反过来聚焦**陷阱**：哪些看似正确的代码会在生产环境爆炸，以及如何检测和修复它们。
+
+核心态度：**并发代码默认是错的，直到被证明是对的。**
+
+/// 知识点列表
+
+\list{
+- 数据竞争（Data Race）vs 竞态条件（Race Condition）
+- ABA 问题
+- 伪共享（False Sharing）
+- 饥饿（Starvation）与活锁（Livelock）
+- 异常安全与并发
+- volatile 不是线程同步
+- TSan（Thread Sanitizer）使用
+- Clang Thread Safety Analysis（编译期检测）
+- 调试并发 bug 的策略
+}
+
+/// 知识点详解
+
+// 数据竞争 vs 竞态条件
+
+这两个术语常被混用，但含义完全不同。
+
+\table{
+| 数据竞争（Data Race） | 竞态条件（Race Condition）
+---
+定义 | 多线程无同步地访问同一内存，至少一个写 | 程序行为取决于线程执行顺序
+性质 | **未定义行为（UB）** | 逻辑 bug（可能合法）
+检测 | TSan 可检测 | TSan **不能**检测
+修复 | 加锁 / atomic | 修改逻辑（如合并 check-then-act）
+}
+
+\code[cpp]{
+// 数据竞争——UB
+int x = 0;
+// Thread A: x = 1;
+// Thread B: x = 2;
+// 无同步→即使"不在乎结果"也是 UB
+
+// 竞态条件——逻辑 bug，但不是 UB
+std::mutex mtx;
+int balance = 100;
+
+void withdraw(int amount) {
+    {
+        std::lock_guard lock(mtx);
+        if (balance >= amount) { /* 检查OK */ }
+    }
+    // 锁释放了！另一个线程可能在此刻修改 balance
+    {
+        std::lock_guard lock(mtx);
+        balance -= amount; // 可能透支！
+    }
+}
+
+// 修复：check-then-act 在同一临界区
+void withdrawFixed(int amount) {
+    std::lock_guard lock(mtx);
+    if (balance >= amount) balance -= amount;
+}
+}
+
+\quiz[choice|单选]{
+Q: 以下代码修复了数据竞争，但仍然有竞态条件。问题出在哪里？
+```cpp
+std::atomic<int> stock{10};
+void purchase() {
+    if (stock.load() > 0)     // 步骤1: 检查
+        stock.fetch_sub(1);    // 步骤2: 扣减
+}
+```
+A: stock 不是原子变量
+B: load 和 fetch_sub 之间其他线程可能先扣完
+C: 缺少 mutex 保护
+D: 内存序不正确
+ANS: B
+EXP: 每个操作都是原子的（无数据竞争），但 check-then-act 不是原子的组合。两个线程都可能看到 `stock > 0`，然后各自 `fetch_sub`→stock 变负。修复：`while (true) { int s = stock.load(); if (s <= 0) return; if (stock.compare_exchange_weak(s, s-1)) break; }` 用 CAS 将检查和修改合并为一步。
+}
+
+// ABA 问题
+
+无锁编程中的经典陷阱。CAS 只比较"值"——如果值经历了 A→B→A，CAS 认为"没变过"。
+
+\diagram[flow]{
+Thread1: read head=A (A->next=B) -> 被挂起
+Thread2: pop A, pop B, push A back (A->next=C)
+Thread1: 恢复, CAS(head, A, B) 成功!
+结果: head 指向已删除的 B -> 数据结构损坏
+}
+
+\code[cpp]{
+// ABA 发生在无锁栈/队列的 pop 操作中：
+// 1. 线程1 读 head=A, next=B，准备 CAS(head, A, B)
+// 2. 线程1 挂起
+// 3. 线程2 pop A, pop B, push A'（A 被回收后重新使用，next=C）
+// 4. 线程1 恢复，CAS 看到 head 仍是 A（地址相同），成功将 head 设为 B
+// 5. 但 B 已经不在栈中→损坏
+}
+
+\table{
+解决方案 | 原理 | 复杂度
+---
+Tagged Pointer（版本号指针） | 指针低位/高位附带版本号，每次修改递增 | 中等
+Hazard Pointer | 每线程声明"正在使用"的指针，延迟回收 | 高
+Epoch-based Reclamation (EBR) | 全局 epoch 计数器，旧 epoch 的节点安全回收 | 中等
+RCU (Read-Copy-Update) | 读不加锁，写创建副本替换、延迟回收旧版本 | 高
+}
+
+\note{**实践建议：** 除非你是无锁数据结构专家，否则不要自己实现——使用经过验证的库（如 Folly、libcds、moodycamel）。}
+
+// 伪共享（False Sharing）
+
+两个线程修改**不同变量**，但这两个变量恰好在同一**缓存行（Cache Line，通常 64 字节）**上。每次写操作都会导致另一个核的缓存行失效→严重性能下降。
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+struct BadLayout {
+    std::atomic<int> a{0}; // offset 0
+    std::atomic<int> b{0}; // offset 4 — 同一缓存行！
+};
+
+struct GoodLayout {
+    alignas(64) std::atomic<int> a{0}; // 独占缓存行
+    alignas(64) std::atomic<int> b{0}; // 独占缓存行
+};
+
+template<typename T>
+long long benchmark(T& layout, int iters) {
+    auto start = std::chrono::steady_clock::now();
+    std::thread t1([&]{ for (int i = 0; i < iters; ++i) layout.a.fetch_add(1, std::memory_order_relaxed); });
+    std::thread t2([&]{ for (int i = 0; i < iters; ++i) layout.b.fetch_add(1, std::memory_order_relaxed); });
+    t1.join(); t2.join();
+    auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+}
+
+int main() {
+    constexpr int N = 10'000'000;
+    BadLayout bad;
+    GoodLayout good;
+    auto t_bad  = benchmark(bad, N);
+    auto t_good = benchmark(good, N);
+    std::cout << "Bad (false sharing):  " << t_bad  << " us\n";
+    std::cout << "Good (no sharing):    " << t_good << " us\n";
+    std::cout << "Speedup: " << (double)t_bad / t_good << "x\n";
+    return 0;
+}
+}
+
+\tip{**C++17 提供了 `std::hardware_destructive_interference_size`**（通常 64），用它替代硬编码的 `alignas(64)` 更可移植：`alignas(std::hardware_destructive_interference_size) std::atomic<int> a;`}
+
+// 饥饿与活锁
+
+\table{
+问题 | 表现 | 原因 | 解决
+---
+饥饿（Starvation） | 某个线程长期得不到资源 | 不公平的锁/调度策略 | 公平锁、优先级调整
+活锁（Livelock） | 线程都在执行，但状态不断变化谁也完不成 | 过于激进的重试/让步 | 随机退让（exponential backoff）
+}
+
+\code[cpp]{
+// 活锁示例：两个线程互相让步
+void polite(std::mutex& a, std::mutex& b) {
+    while (true) {
+        a.lock();
+        if (!b.try_lock()) {
+            a.unlock();       // 让给对方
+            continue;         // 对方也在让→循环往复
+        }
+        // 做工作
+        b.unlock(); a.unlock();
+        break;
+    }
+}
+// 修复：用 scoped_lock，或在重试中加随机延迟
+}
+
+// volatile 不是线程同步
+
+\code[cpp]{
+volatile int flag = 0; // C++ 中不保证线程安全！
+
+// volatile 只告诉编译器"每次都从内存读取，不优化掉"
+// 但不保证：原子性、内存序、线程间可见性
+
+// volatile 在 C++ 中的正当用途：
+// 1. 内存映射 I/O（MMIO）
+// 2. signal handler 中的变量（sig_atomic_t）
+// 3. setjmp/longjmp 相关
+
+// 线程同步必须用 std::atomic
+std::atomic<int> correct_flag{0}; // 这才对
+}
+
+\quiz[tf|判断]{
+Q: C++ 中的 `volatile` 关键字可以保证变量在多线程间的可见性。
+ANS: F
+EXP: C++ 的 `volatile` 只阻止编译器优化（每次从内存读取），但**不保证原子性、内存序和线程可见性**。Java 的 `volatile` 有线程安全语义，但 C++ 的没有。线程间共享变量必须用 `std::atomic`。
+}
+
+// TSan（Thread Sanitizer）使用
+
+**ThreadSanitizer** 是检测数据竞争的最有效工具——编译时插桩，运行时检测。
+
+\code[bash]{
+# 编译：加上 -fsanitize=thread
+g++ -fsanitize=thread -g -O1 -o my_prog my_prog.cpp
+# 或
+clang++ -fsanitize=thread -g -O1 -o my_prog my_prog.cpp
+
+# 运行
+./my_prog
+# TSan 在检测到数据竞争时输出详细报告：访问位置、线程ID、调用栈
+}
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+
+int shared = 0; // 故意的数据竞争
+
+void writer() { shared = 42; }
+void reader() { std::cout << shared << "\n"; }
+
+int main() {
+    std::thread t1(writer);
+    std::thread t2(reader);
+    t1.join();
+    t2.join();
+    return 0;
+}
+}
+
+\note{**用 `-fsanitize=thread` 编译上面的代码运行**，TSan 会报告 `shared` 上的数据竞争，精确到行号和两个线程的调用栈。这应该成为并发代码的标准测试流程。}
+
+// Clang Thread Safety Analysis
+
+编译期静态分析——通过注解（annotation）让编译器检查锁的正确使用。
+
+\code[cpp]{
+#include <mutex>
+
+class Account {
+    std::mutex mu_;
+    int balance_ __attribute__((guarded_by(mu_))) = 0;
+
+public:
+    void deposit(int amount) {
+        std::lock_guard lock(mu_);
+        balance_ += amount; // OK：持有 mu_
+    }
+
+    int getBalance() const {
+        return balance_;    // 编译警告！访问 balance_ 未持有 mu_
+    }
+};
+// 编译：clang++ -Wthread-safety -std=c++20
+}
+
+\collapse[Thread Safety Annotations 常用标注]{
+\code[cpp]{
+// __attribute__((guarded_by(mu)))       变量被 mu 保护
+// __attribute__((requires_capability(mu)))  函数调用前必须持有 mu
+// __attribute__((acquire_capability(mu)))   函数获取 mu
+// __attribute__((release_capability(mu)))   函数释放 mu
+// __attribute__((excludes_capability(mu)))  函数调用时不能持有 mu
+
+// Google、Abseil 大量使用这些注解
+// 在几乎零运行时开销下捕获锁错误
+}
+}
+
+// 调试并发 bug 的策略
+
+\table{
+方法 | 适用阶段 | 说明
+---
+TSan（Thread Sanitizer） | 开发/CI | 运行时检测数据竞争，必备
+Clang Thread Safety | 编译期 | 静态检查锁注解
+rr（Record & Replay） | 调试 | 完整记录执行过程，可倒放回放
+日志 + 时间戳 + 线程ID | 生产环境 | 分析执行顺序
+减速注入（Sleep injection） | 调试 | 在可疑点插入 sleep 放大竞态窗口
+压力测试 | 上线前 | 高并发长时间运行暴露低概率 bug
+Helgrind（Valgrind） | 开发 | 检测锁序和数据竞争（比 TSan 慢）
+}
+
+\warning{**调试器会改变线程时序——bug 可能"消失"（Heisenbug）。** 不要依赖调试器确认并发 bug 是否修复。用 TSan 自动化检测才可靠。}
+
+/// 工程实践
+
+\list{
+- **零容忍数据竞争**：它们是 UB，不是"偶尔乱一下"。CI 必须集成 TSan
+- 最小化共享状态：能不共享就不共享。能用 thread_local 就用
+- 不可变数据天然线程安全——设计时优先考虑 immutable
+- check-then-act 必须在同一原子操作或同一临界区内完成
+- 每个类/结构都要在注释中声明线程安全策略：thread-safe / thread-compatible / thread-hostile
+- 无锁代码必须在 ARM 平台交叉测试——x86 的强内存模型会掩盖错误
+}
+
+/// 常用方法速查
+
+\table{
+工具 | 类型 | 检测目标
+---
+TSan (ThreadSanitizer) | 运行时 | 数据竞争
+ASan (AddressSanitizer) | 运行时 | 内存错误（与 TSan 不可同时用）
+Clang Thread Safety | 编译期 | 锁注解违反
+Helgrind (Valgrind) | 运行时 | 数据竞争 + 锁序
+rr | 调试 | 确定性回放
+perf / VTune | 性能 | 锁竞争、false sharing
+}
+
+/// 新版特性（C++17/20/23）
+
+\compare{
+old: C++11 定义了数据竞争为 UB，但没有标准检测工具。TSan 由 Google 开发，需要编译器支持。Clang Thread Safety Annotations 是 Clang 扩展，不是标准。
+
+new: C++17 的 `std::hardware_destructive_interference_size` 帮助避免 false sharing。C++20 的 `jthread` 减少了"异常路径忘 join"的陷阱。标准中 `[[no_unique_address]]` 可减少对象大小从而影响缓存行对齐。TSan 和 Clang Safety 已成为行业标准实践。
+}
+
+/// 难点易错点分析
+
+\danger{**TOCTOU（Time-of-check to time-of-use）：** `if (file.exists()) file.open()` ——检查和使用之间文件可能被删除。并发版：`if (queue.size() > 0) queue.pop()` ——检查和操作之间另一个线程可能已清空队列。必须原子化或在一个锁内完成。}
+
+\danger{**看似安全的 double-checked locking：** 在 C++11 之前，经典双重检查初始化是 UB。C++11 之后，`static` 局部变量的初始化是线程安全的——不需要双重检查。需要的场景使用 `std::call_once`。}
+
+\danger{**锁序不一致导致的间歇性死锁：** 这种 bug 可能运行一周才触发一次。修复后用压力测试验证——单次通过不代表修复成功。}
+
+/// 实战作业
+
+🟢 **基础：False Sharing 测量**
+
+\run[cpp]{
+#include <iostream>
+#include <thread>
+#include <atomic>
+#include <chrono>
+
+struct Packed {
+    std::atomic<long long> a{0}, b{0};
+};
+
+struct Padded {
+    alignas(64) std::atomic<long long> a{0};
+    alignas(64) std::atomic<long long> b{0};
+};
+
+int main() {
+    constexpr int N = 50'000'000;
+    auto test = [N](auto& s) {
+        auto t0 = std::chrono::steady_clock::now();
+        std::thread t1([&]{ for(int i=0;i<N;++i) s.a.fetch_add(1,std::memory_order_relaxed); });
+        std::thread t2([&]{ for(int i=0;i<N;++i) s.b.fetch_add(1,std::memory_order_relaxed); });
+        t1.join(); t2.join();
+        auto t1_ = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(t1_ - t0).count();
+    };
+    Packed p; Padded g;
+    std::cout << "Packed:  " << test(p) << " ms\n";
+    std::cout << "Padded:  " << test(g) << " ms\n";
+    return 0;
+}
+}
+
+🟡 **进阶：Bug 猎人**
+
+编写一个包含以下 5 种并发 bug 的程序（每种一个函数），然后修复它们：
+1. 数据竞争
+2. 死锁
+3. TOCTOU 竞态条件
+4. false sharing（性能 bug）
+5. 遗忘 join 导致 terminate
+
+用 TSan 验证数据竞争的检测和修复。
+
+🔴 **挑战：并发 Bug 检测器**
+
+实现一个简易的运行时"锁序检测器"：
+- 用 `thread_local` 跟踪每个线程当前持有的锁集合
+- 每次加锁时检查是否违反了全局锁序（用 mutex 地址排序）
+- 违反时打印调用栈提示（可用 `__builtin_return_address`）
+- 用 RAII 包装，提供 `TrackedLockGuard<std::mutex>` 替代 `lock_guard`
+
+\collapse[锁序检测器核心思路]{
+\code[cpp]{
+// thread_local 记录当前线程的锁持有栈
+thread_local std::vector<void*> held_locks;
+
+// 全局锁序图（lock_a 在 lock_b 之前获取 → edge(a,b)）
+// 如果尝试添加 edge 时发现环路→报告死锁风险
+
+template<typename Mutex>
+class TrackedLockGuard {
+    Mutex& mtx;
+public:
+    TrackedLockGuard(Mutex& m) : mtx(m) {
+        void* addr = static_cast<void*>(&m);
+        // 检查 held_locks 中是否有比 addr 更大的地址→锁序违反
+        held_locks.push_back(addr);
+        mtx.lock();
+    }
+    ~TrackedLockGuard() {
+        mtx.unlock();
+        held_locks.pop_back();
+    }
+};
+}
+}

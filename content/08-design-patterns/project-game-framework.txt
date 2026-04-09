@@ -1,0 +1,221 @@
+/// 简介
+
+本实战项目综合运用设计模式板块全部知识，构建一个**模式驱动的迷你游戏框架（MiniEngine）**。项目实现一个终端 RPG 战斗演示——无需图形渲染，重点在架构设计。要求至少运用 8 种设计模式，每种模式必须有明确的设计动机而非"为用而用"。
+
+/// 项目需求
+
+\list{
+- 实现终端文字版 RPG 回合制战斗系统
+- 角色系统：Builder 构建、组件化属性
+- 技能系统：注册式工厂创建、装饰器增强
+- 战斗系统：命令模式管理操作、状态机管理阶段
+- AI 系统：策略模式实现不同 AI 行为
+- 事件系统：观察者模式连接各子系统
+- 服务系统：Service Locator 提供全局服务
+- 支持完整一场战斗流程和战斗回放
+}
+
+// 架构总览
+
+\diagram[tree]{
+root: MiniEngine
+  L: 核心架构
+    L: Game Loop（回合制循环）
+    R: Event Bus（事件系统）
+  R: 子系统
+    L: 角色系统
+      L: Builder（角色构建）
+      R: Component（属性组件）
+    R: 战斗系统
+      L: Command（操作+回放）
+      R: State Machine（阶段管理）
+}
+
+// 模式使用清单
+
+\table{
+模式 | 分类 | 在项目中的职责
+---
+注册式工厂 | 创建型 | 从字符串名称创建技能和敌人
+Builder | 创建型 | 分步构建复杂角色（名字/职业/属性/技能列表）
+装饰器 | 结构型 | 技能增强：增伤、AOE、吸血、附加状态
+组合 | 结构型 | 装备/buff 的效果叠加
+命令 | 行为型 | 每个战斗操作封装为对象，支持回放
+状态机 | 行为型 | 战斗阶段流转（玩家回合→敌人回合→结算→检查胜负）
+策略 | 行为型 | AI 行为可切换（攻击型/防守型/随机型）
+观察者 | 行为型 | 事件总线通知 UI/日志/计分
+Service Locator | 游戏模式 | 提供 Logger、Random、Config 全局服务
+ScopeGuard | 现代模式 | buff 过期自动移除
+}
+
+/// 技术要求
+
+\list{
+- C++17 或更高标准
+- 使用 `std::unique_ptr` 管理所有动态分配对象，禁止裸 `new`/`delete`
+- 使用 `std::function` 或模板实现事件回调
+- 角色属性使用强类型别名（`HP`、`MP`、`Attack`、`Defense` 不能混用）
+- 至少 8 种模式正确使用且有意义
+- 代码文件组织清晰：每个模式/子系统一个头文件
+- 终端输出完整的战斗过程
+}
+
+/// 实现提示
+
+// 阶段一：基础架构
+
+\code[cpp]{
+// 强类型别名
+template<typename Tag>
+struct StrongInt {
+    int value;
+    explicit StrongInt(int v) : value(v) {}
+    StrongInt& operator+=(StrongInt o) { value += o.value; return *this; }
+    StrongInt& operator-=(StrongInt o) { value -= o.value; return *this; }
+    bool operator<=(StrongInt o) const { return value <= o.value; }
+    // ... 其他运算符
+};
+
+using HP = StrongInt<struct HPTag>;
+using MP = StrongInt<struct MPTag>;
+using Attack = StrongInt<struct AtkTag>;
+using Defense = StrongInt<struct DefTag>;
+// HP(100) - Defense(10) → 编译错误！类型不匹配
+}
+
+// 阶段二：角色系统
+
+\code[cpp]{
+// Builder + Component 构建角色
+struct Character {
+    std::string name;
+    std::string role;
+    HP hp; MP mp; Attack atk; Defense def;
+    std::vector<std::string> skills;
+};
+
+class CharacterBuilder {
+    // ... Builder 链式方法
+    Character build();
+};
+
+auto mage = CharacterBuilder()
+    .name("Gandalf").role("mage")
+    .hp(HP{60}).mp(MP{200}).atk(Attack{25}).def(Defense{3})
+    .skill("fireball").skill("iceblast")
+    .build();
+}
+
+// 阶段三：技能与战斗
+
+\code[cpp]{
+// 工厂 + 装饰器
+auto skill = SkillFactory::create("fireball");         // 基础技能
+skill = std::make_unique<FireEnhance>(std::move(skill));  // +增伤
+skill = std::make_unique<Lifesteal>(std::move(skill));    // +吸血
+
+// 命令模式
+class AttackCommand : public ICommand {
+    Character& attacker_;
+    Character& target_;
+    std::unique_ptr<ISkill> skill_;
+public:
+    void execute() override;   // 计算伤害、应用效果
+    void undo() override;      // 恢复状态（用于回放/调试）
+    std::string desc() const override;
+};
+}
+
+// 阶段四：战斗状态机
+
+\diagram[flow]{
+BattleStart --> PlayerTurn --> EnemyTurn --> ResolveEffects --> CheckWin
+CheckWin --[未分胜负]--> PlayerTurn
+CheckWin --[胜利/失败]--> BattleEnd
+}
+
+// 输出示例
+
+\code[text]{
+=== Battle Start ===
+Player: Gandalf (Mage, HP:60, MP:200, ATK:25, DEF:3)
+Enemy:  Fire Dragon (HP:200, ATK:30, DEF:10)
+
+[Round 1 - Player Turn]
+> Gandalf casts Fireball (+Fire +Lifesteal) → Dragon takes 38 damage (HP:162)
+  Lifesteal: Gandalf heals 7 HP (HP:67)
+  [Event] DamageEvent: Dragon -38
+  [Event] HealEvent: Gandalf +7
+
+[Round 1 - Enemy Turn]
+> Dragon uses Flame Breath → Gandalf takes 22 damage (HP:45)
+  Dragon AI: Aggressive (HP > 50%)
+
+[Round 2 - Player Turn]
+> Gandalf casts Ice Blast (+AOE) → Dragon takes 30 damage (HP:132)
+
+[Round 2 - Enemy Turn]
+> Dragon uses Tail Sweep → Gandalf takes 18 damage (HP:27)
+  Dragon switches to Defensive strategy (HP < 70%)
+
+...
+
+=== Battle End: Player Wins ===
+
+[Battle Replay]
+1. Gandalf: Fireball(+Fire+Lifesteal) → Dragon -38
+2. Dragon: Flame Breath → Gandalf -22
+3. Gandalf: Ice Blast(+AOE) → Dragon -30
+4. Dragon: Tail Sweep → Gandalf -18
+...
+}
+
+/// 评分标准
+
+\table{
+评分项 | 分值 | 标准
+---
+模式运用 | 30 分 | 至少 8 种模式正确使用且有明确设计动机
+架构设计 | 20 分 | 模块间低耦合、职责清晰、接口设计合理
+代码质量 | 20 分 | 现代 C++ 风格、智能指针、无裸指针、RAII
+功能完整 | 15 分 | 完整一场战斗流程、战斗回放、AI 策略切换
+可扩展性 | 15 分 | 添加新敌人/技能/AI 策略不需要修改现有代码
+}
+
+// 评分细项说明
+
+\collapse[模式运用 30 分细项]{
+\table{
+模式 | 正确使用 | 有意义 | 小计
+---
+注册式工厂 | 2 | 2 | 4
+Builder | 2 | 2 | 4
+装饰器 | 2 | 2 | 4
+命令 | 2 | 2 | 4
+状态机 | 2 | 2 | 4
+策略 | 2 | 2 | 4
+观察者 | 2 | 2 | 4
+Service Locator/ScopeGuard/其他 | 1 | 1 | 2
+}
+"正确使用"=实现正确且无 bug，"有意义"=该模式解决了实际问题而非牵强套用。
+}
+
+/// 扩展挑战
+
+\list{
+- 添加装备系统：武器和防具可以通过装饰器模式叠加属性加成
+- 实现多敌人战斗：3v3 队伍战，技能可以选择 AOE 或单体
+- 序列化/反序列化：将战斗回放序列化为 JSON，可以回放
+- 网络对战：Command 序列化后通过网络传输，实现回合制同步
+- 剧情系统：用责任链模式处理对话选项和触发条件
+}
+
+/// 参考资源
+
+\list{
+- Robert Nystrom,《Game Programming Patterns》— 游戏专用模式
+- Erich Gamma 等,《Design Patterns: Elements of Reusable Object-Oriented Software》— GoF 经典
+- Andrei Alexandrescu,《Modern C++ Design》— Policy-Based Design、类型擦除
+- C++ Core Guidelines — NVI、RAII、智能指针最佳实践
+- Sean Parent, "Inheritance Is The Base Class of Evil" (Talk) — 值语义多态
+}

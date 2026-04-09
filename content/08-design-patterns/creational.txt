@@ -1,0 +1,340 @@
+/// 简介
+
+上一章掌握了并发编程的底层机制，本章开始进入**设计模式（Design Patterns）**——面向对象架构的核心工具箱。创建型模式（Creational Patterns）解决一个根本问题：**如何把对象的创建逻辑与使用逻辑解耦？** 当系统需要在运行时决定创建哪种类型、用何种参数组合构造、或复用已有对象时，直接 `new` 硬编码类名是脆弱的。本节用现代 C++ 智能指针、变参模板和 Concepts 重新实现五种经典创建型模式，并分析各自的适用场景与权衡。
+
+/// 知识点列表
+
+\list{
+- 工厂方法（Factory Method）— 将对象创建延迟到子类或注册表
+- 抽象工厂（Abstract Factory）— 创建产品族的一致接口
+- 建造者（Builder）— 分步构建复杂对象
+- 原型（Prototype）— 通过克隆已有对象创建新对象
+- 单例回顾（Singleton Revisited）— 线程安全实现与替代方案
+}
+
+/// 知识点详解
+
+// 工厂方法
+
+没有工厂时，创建逻辑散落在业务代码各处——每新增一种敌人就要改所有 `if-else` 分支。**工厂方法（Factory Method）** 把"创建什么"的决策封装到独立函数或类中，调用方只依赖基类接口。
+
+现代 C++ 中最实用的变体是**注册式工厂（Self-Registering Factory）**：用 `std::unordered_map` 将字符串映射到创建函数，新增类型只需注册一行，无需修改工厂本身——这正是**开放-封闭原则（Open-Closed Principle）** 的体现。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <functional>
+
+struct Enemy {
+    virtual void describe() const = 0;
+    virtual ~Enemy() = default;
+};
+
+struct Goblin : Enemy {
+    void describe() const override { std::cout << "Goblin (HP:30, melee)\n"; }
+};
+
+struct Dragon : Enemy {
+    void describe() const override { std::cout << "Dragon (HP:500, fire)\n"; }
+};
+
+class EnemyFactory {
+    using Creator = std::function<std::unique_ptr<Enemy>()>;
+    std::unordered_map<std::string, Creator> registry_;
+public:
+    void reg(const std::string& name, Creator fn) {
+        registry_[name] = std::move(fn);
+    }
+    std::unique_ptr<Enemy> create(const std::string& name) const {
+        auto it = registry_.find(name);
+        if (it == registry_.end()) return nullptr;  // 未注册类型返回空
+        return it->second();
+    }
+};
+
+int main() {
+    EnemyFactory factory;
+    factory.reg("goblin", [] { return std::make_unique<Goblin>(); });
+    factory.reg("dragon", [] { return std::make_unique<Dragon>(); });
+
+    for (auto& name : {"goblin", "dragon", "unknown"}) {
+        if (auto e = factory.create(name))
+            e->describe();
+        else
+            std::cout << name << ": not registered\n";
+    }
+}
+}
+
+\tip{工厂返回 `std::unique_ptr` 而非裸指针——调用方获得明确的**所有权转移语义（Ownership Transfer）**，无需猜测谁负责 `delete`。这是现代 C++ 工厂的惯例。}
+
+// 抽象工厂
+
+当系统需要同时创建**一组相关对象（产品族，Product Family）** 时，单个工厂方法不够。**抽象工厂（Abstract Factory）** 定义一个接口，每个具体工厂实现负责创建一整套配套产品。典型场景：不同渲染后端（OpenGL / Vulkan / DirectX）各自需要配套的 Texture、Shader、Buffer。
+
+\code[cpp]{
+struct ITexture { virtual ~ITexture() = default; };
+struct IShader  { virtual ~IShader() = default; };
+
+struct IRenderFactory {
+    virtual std::unique_ptr<ITexture> createTexture(const std::string& path) = 0;
+    virtual std::unique_ptr<IShader>  createShader(const std::string& src) = 0;
+    virtual ~IRenderFactory() = default;
+};
+
+// 具体工厂——每个后端一套完整产品
+struct VulkanFactory : IRenderFactory {
+    std::unique_ptr<ITexture> createTexture(const std::string& p) override { /*...*/ }
+    std::unique_ptr<IShader>  createShader(const std::string& s) override { /*...*/ }
+};
+
+struct OpenGLFactory : IRenderFactory {
+    std::unique_ptr<ITexture> createTexture(const std::string& p) override { /*...*/ }
+    std::unique_ptr<IShader>  createShader(const std::string& s) override { /*...*/ }
+};
+// 客户端只持有 IRenderFactory*，切换后端时替换工厂即可
+}
+
+\note{**Factory Method vs Abstract Factory：** Factory Method 关注**单个产品**的创建多态，用函数或 Lambda 即可实现；Abstract Factory 关注**产品族的一致性**——Vulkan Texture 必须搭配 Vulkan Shader。前者轻量，后者保证跨产品兼容。}
+
+// 建造者
+
+当构造函数参数超过 4-5 个、且多数有默认值时，`Player("Pan", 100, 50, 10, 5, true, "warrior")` 的可读性极差——第 4 个参数到底是攻击还是防御？**建造者（Builder）** 用链式调用替代长参数列表，提升可读性并支持分步构建与参数验证。
+
+\run[cpp]{
+#include <iostream>
+#include <string>
+#include <optional>
+
+struct Character {
+    std::string name;
+    int hp, mp, attack, defense;
+    std::string role;
+    void show() const {
+        std::cout << name << " [" << role << "] HP:" << hp
+                  << " MP:" << mp << " ATK:" << attack
+                  << " DEF:" << defense << "\n";
+    }
+};
+
+class CharacterBuilder {
+    Character c_{"Unknown", 100, 50, 10, 5, "warrior"};
+public:
+    CharacterBuilder& name(std::string n)  { c_.name = std::move(n); return *this; }
+    CharacterBuilder& hp(int v)            { c_.hp = v; return *this; }
+    CharacterBuilder& mp(int v)            { c_.mp = v; return *this; }
+    CharacterBuilder& attack(int v)        { c_.attack = v; return *this; }
+    CharacterBuilder& defense(int v)       { c_.defense = v; return *this; }
+    CharacterBuilder& role(std::string r)  { c_.role = std::move(r); return *this; }
+
+    std::optional<Character> build() {
+        if (c_.name.empty() || c_.hp <= 0) return std::nullopt;  // 验证
+        return std::move(c_);
+    }
+};
+
+int main() {
+    auto mage = CharacterBuilder()
+        .name("Gandalf").role("mage")
+        .hp(60).mp(200).attack(25).defense(3)
+        .build();
+
+    if (mage) mage->show();
+
+    auto invalid = CharacterBuilder().name("").build();  // 验证失败
+    std::cout << "Invalid build: " << (invalid ? "ok" : "rejected") << "\n";
+}
+}
+
+\compare{
+old: C++98 的 Builder 需要编写大量 setter 方法，且无法在编译期校验构建完整性。Java 中 Builder 几乎是唯一可读的多参数方案。
+
+new: C++20 的**指定初始化器（Designated Initializers）** 对聚合类型可直接 `{.name="x", .hp=100}` 构造。简单 DTO 不再需要 Builder，但 Builder 在需要**验证逻辑、分步构建、流式 API**的场景下仍有独特价值。
+}
+
+// 原型
+
+**原型（Prototype）** 通过 `clone()` 复制已有对象来创建新实例——当对象的初始化依赖复杂搜集过程（从文件加载、随机生成、组合配置）时，克隆已有"模板"比从头构造高效得多。游戏中的**预制体（Prefab）** 系统就是 Prototype 的经典应用。
+
+\code[cpp]{
+struct Prefab {
+    virtual std::unique_ptr<Prefab> clone() const = 0;
+    virtual ~Prefab() = default;
+};
+
+struct EnemyPrefab : Prefab {
+    int hp; float speed; std::string model;
+    EnemyPrefab(int h, float s, std::string m)
+        : hp(h), speed(s), model(std::move(m)) {}
+    std::unique_ptr<Prefab> clone() const override {
+        return std::make_unique<EnemyPrefab>(*this);  // 拷贝构造
+    }
+};
+
+// 预制体注册表：加载一次，克隆多次
+std::unordered_map<std::string, std::unique_ptr<Prefab>> prefabs;
+prefabs["fast_goblin"] = std::make_unique<EnemyPrefab>(30, 2.5f, "goblin.obj");
+auto e = prefabs["fast_goblin"]->clone();  // 无需再次解析配置
+}
+
+\warning{**clone 必须执行深拷贝。** 如果对象持有裸指针或 `unique_ptr` 成员，默认拷贝构造只做浅拷贝（或编译失败）。在 `clone()` 中对 `unique_ptr` 成员递归调用 `clone()`，对 `shared_ptr` 的不可变数据则可以直接共享。}
+
+// 单例回顾
+
+**单例（Singleton）** 在 OOP 和并发章节中已接触过。C++11 保证函数局部 `static` 变量的线程安全初始化，因此 **Meyer's Singleton** 是最简实现。但单例的真正难题不在实现，而在**隐藏依赖（Hidden Dependency）和测试困难**。
+
+\tabs{
+\tab[Meyer's Singleton]{
+\code[cpp]{
+class Logger {
+public:
+    static Logger& instance() {
+        static Logger inst;  // C++11 线程安全
+        return inst;
+    }
+    void log(std::string_view msg) { /* ... */ }
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+private:
+    Logger() = default;
+};
+// 问题：所有调用者对 Logger 形成了隐式依赖
+}
+}
+\tab[替代：依赖注入]{
+\code[cpp]{
+// 将依赖通过构造函数显式传入
+class GameEngine {
+    ILogger& logger_;  // 接口引用，非具体类型
+public:
+    explicit GameEngine(ILogger& log) : logger_(log) {}
+    void run() { logger_.log("Engine started"); }
+};
+// 测试时传入 MockLogger，生产环境传入 FileLogger
+}
+}
+}
+
+\diagram[tree]{
+root: 创建型模式选择指南
+  L: 创建单个产品？
+    L: 运行时决定类型 → Factory Method
+    R: 克隆现有对象 → Prototype
+  R: 更复杂需求？
+    L: 创建一族配套产品 → Abstract Factory
+    R: 多参数分步构建 → Builder
+}
+
+/// 新版特性（C++17/20/23）
+
+\list{
+- C++17 `std::optional` — 工厂 / Builder 返回 `std::optional<T>` 替代 nullptr 表示创建失败
+- C++17 `std::any` — 通用工厂可返回 `std::any`，在类型安全的前提下擦除产品类型
+- C++20 Concepts — 约束工厂注册的类型必须满足接口要求（如 `Updatable`）
+- C++20 指定初始化器 — 简单聚合类型的轻量 Builder 替代
+- C++23 `std::expected` — 工厂返回 `std::expected<Product, Error>` 携带创建失败原因
+}
+
+/// 工程实践
+
+\list{
+- 工厂返回 `unique_ptr`，调用方自行决定是否转成 `shared_ptr`——不要在工厂内部使用 `shared_ptr`
+- 注册式工厂的注册通常在启动阶段完成，运行时动态注册需要考虑线程安全（加锁或使用 `concurrent_unordered_map`）
+- Builder 的 `build()` 应执行参数验证——返回 `std::optional` 或 `std::expected` 而非静默构造无效对象
+- Prototype 的 clone 在基类中声明为 `virtual unique_ptr<Base> clone() const = 0`
+- 单例替代方案优先级：依赖注入 > Service Locator > Singleton
+}
+
+/// 难点易错点分析
+
+\danger{**注册式工厂的键冲突：** 两个模块分别注册同名类型会**静默覆盖**已有注册——这是极难调试的 bug。在 `reg()` 中用 `assert` 或异常检测重复键。}
+
+\danger{**Singleton 的析构顺序问题（Static Destruction Order Fiasco）：** 多个 Singleton 互相依赖时，析构顺序可能导致一个 Singleton 在另一个仍需要它时已被销毁。解决方案：使用 Nifty Counter 手法或将 Singleton 改为显式生命周期管理。}
+
+\quiz[choice]{
+Q: 以下哪种场景最适合使用 **Abstract Factory** 而非 Factory Method？
+A: 需要根据配置字符串创建单个敌人对象
+B: 需要同时创建配套的 Texture、Shader、Buffer 对象
+C: 需要从 JSON 文件加载对象的属性配置
+D: 需要复制已有对象的完整状态
+ANS: B
+EXP: Abstract Factory 的核心价值是保证**产品族的一致性**——OpenGL 的 Texture 必须配 OpenGL 的 Shader。单产品创建选 Factory Method（A/C），复制已有对象选 Prototype（D）。
+}
+
+\quiz[tf]{
+Q: C++20 的指定初始化器可以完全替代 Builder 模式。
+ANS: F
+EXP: 指定初始化器仅适用于聚合类型，不支持构建过程中的验证逻辑和分步操作。当需要参数校验、构建有副作用、或流式 API 时，Builder 仍不可替代。
+}
+
+/// 实战作业
+
+// 🟢 基础：注册式工厂
+
+实现一个通用注册式工厂，支持注册和创建任意继承自 `IEntity` 的类型。完成 `reg()` 和 `create()` 两个方法。
+
+\run[cpp]{
+#include <iostream>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <functional>
+
+struct IEntity {
+    virtual void info() const = 0;
+    virtual ~IEntity() = default;
+};
+
+struct Player : IEntity {
+    void info() const override { std::cout << "Player entity\n"; }
+};
+
+struct NPC : IEntity {
+    void info() const override { std::cout << "NPC entity\n"; }
+};
+
+class EntityFactory {
+    using Creator = std::function<std::unique_ptr<IEntity>()>;
+    std::unordered_map<std::string, Creator> registry_;
+public:
+    /* TODO: 实现 reg(name, creator) —— 将名称和创建函数存入 registry_ */
+
+    /* TODO: 实现 create(name) —— 查找并调用创建函数，未找到返回 nullptr */
+};
+
+int main() {
+    EntityFactory factory;
+    factory.reg("player", [] { return std::make_unique<Player>(); });
+    factory.reg("npc",    [] { return std::make_unique<NPC>(); });
+
+    auto e1 = factory.create("player");
+    auto e2 = factory.create("npc");
+    auto e3 = factory.create("boss");  // 未注册
+
+    if (e1) e1->info();   // Player entity
+    if (e2) e2->info();   // NPC entity
+    if (!e3) std::cout << "boss: not registered\n";
+}
+}
+
+// 🟡 进阶：Builder + 验证 + optional
+
+实现带验证逻辑的 `WeaponBuilder`：名字不能为空、攻击力范围 [1,999]、`build()` 在验证失败时返回 `std::nullopt`。链式调用设置名称、攻击力、属性类型和附魔等级。
+
+// 🟡 进阶：Prototype 预制体系统
+
+实现基于 `clone()` 的预制体注册表。`PrefabRegistry` 支持 `registerPrefab(name, obj)` 和 `spawn(name)` 接口，`spawn` 返回克隆后的独立对象。额外提供 `spawnAt(name, position)` 支持克隆后立即设置位置。
+
+// 🔴 挑战：Concepts 约束的类型安全工厂
+
+用 C++20 Concepts 约束工厂只接受满足 `Updatable` Concept 的类型（必须有 `update(float)` 和 `render()` 方法）。工厂做成模板类 `Factory<Concept>`，编译期拒绝不满足要求的类型注册。
+
+\collapse[🔴 参考思路]{
+定义 `template<typename T> concept Updatable = requires(T t) { t.update(0.0f); t.render(); };`，然后工厂的 `reg<T>` 方法用 `requires Updatable<T>` 约束。内部仍用类型擦除（`std::function<unique_ptr<Base>()>`）存储创建函数。关键是让约束在注册时而非使用时生效。
+}
+
+// 🔴 挑战：Abstract Factory + 配置驱动
+
+实现一个配置驱动的 Abstract Factory 系统：从配置字符串（如 `"vulkan"` / `"opengl"`）选择对应工厂，每个工厂创建配套的 `IWindow`、`IRenderer`、`IAudio` 三个产品。系统启动时根据配置自动选择工厂并创建全部服务。
