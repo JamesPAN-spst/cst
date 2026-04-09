@@ -282,7 +282,13 @@ body { font-family:var(--font); background:var(--bg); color:var(--text-1); overf
 .ws-panel.collapsed { width:0; min-width:0; transform:translateX(-100%); }
 
 /* WS Header */
-.ws-hdr { display:flex; align-items:center; gap:0; padding:0; border-bottom:1px solid rgba(255,255,255,0.08); flex-shrink:0; background:rgba(0,0,0,0.25); height:44px; }
+.ws-hdr { display:flex; align-items:center; gap:0; padding:0; border-bottom:1px solid rgba(255,255,255,0.08); flex-shrink:0; background:rgba(0,0,0,0.25); height:44px; position:relative; }
+.ws-close { position:absolute; right:6px; top:50%; transform:translateY(-50%); width:28px; height:28px; border:none; background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.45); border-radius:6px; cursor:pointer; font-size:14px; display:flex; align-items:center; justify-content:center; transition:all 0.15s; z-index:2; }
+.ws-close:hover { background:rgba(255,255,255,0.14); color:#fff; }
+.ws-open { padding:4px 10px; border:none; border-radius:6px; background:rgba(94,92,230,0.12); color:#5e5ce6; font-size:10px; font-weight:600; cursor:pointer; font-family:var(--font); transition:all 0.15s; margin-left:8px; flex-shrink:0; }
+.ws-open:hover { background:rgba(94,92,230,0.22); }
+.ws-panel.closed { display:none; }
+.ws-panel.closed + .viewer .ws-open { display:inline-flex; }
 .ws-tab { flex:1; padding:11px 0; text-align:center; font-size:11.5px; font-weight:600; letter-spacing:0.04em; color:rgba(255,255,255,0.45); cursor:pointer; border:none; background:none; font-family:var(--font); transition:all 0.2s; border-bottom:2px solid transparent; }
 .ws-tab:hover { color:rgba(255,255,255,0.7); }
 .ws-tab.active { color:#fff; border-bottom-color:var(--blue); }
@@ -920,6 +926,7 @@ code:not(.v-code code) { background:var(--bg); padding:1.5px 5px; border-radius:
       <button class="ws-tab active" data-ws="run">▶ 快速运行</button>
       <button class="ws-tab" data-ws="ide">🔧 Godbolt</button>
       <button class="ws-tab" data-ws="diagrams">📊 图例</button>
+      <button class="ws-close" onclick="wsClosePanel()" title="关闭工作区">✕</button>
     </div>
     <div class="ws-body" id="wsBody">
       <!-- Run mode -->
@@ -953,6 +960,7 @@ code:not(.v-code code) { background:var(--bg); padding:1.5px 5px; border-radius:
       <button class="viewer-x" id="vClose">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
+      <button class="ws-open" id="wsOpenBtn" onclick="wsOpenPanel()" title="打开工作区" style="display:none">◀ 工作区</button>
       <div class="viewer-crumb" id="vCrumb"></div>
       <div class="viewer-ttl" id="vTitle"></div>
     </div>
@@ -1406,6 +1414,17 @@ document.querySelectorAll('.ws-tab').forEach(tab=>{
 function wsTogglePanel(){
   const c=wsPanel.classList.toggle('collapsed');
   document.getElementById('wsToggle').textContent=c?'▶':'◀';
+}
+function wsClosePanel(){
+  wsPanel.classList.add('closed');
+  document.getElementById('wsOpenBtn').style.display='inline-flex';
+  document.getElementById('wsToggle').style.display='none';
+}
+function wsOpenPanel(){
+  wsPanel.classList.remove('closed','collapsed');
+  document.getElementById('wsOpenBtn').style.display='none';
+  document.getElementById('wsToggle').style.display='flex';
+  document.getElementById('wsToggle').textContent='◀';
 }
 
 /* Send code from content viewer to workspace editor */
