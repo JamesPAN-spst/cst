@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>C++ Mastery — 章节</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cpp.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/cmake.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<style>
+/* =============================================
+   C++ MASTERY — Chapter Page (template.html)
+   Apple HIG Refined Aesthetic — Canvas Mode
+   ============================================= */
+:root {
+  --bg: #F5F5F7;
+  --surface: #FFFFFF;
+  --glass-bg: rgba(255,255,255,0.72);
+  --glass-border: rgba(0,0,0,0.06);
+  --blue: #007AFF;
+  --blue-light: rgba(0,122,255,0.08);
+  --blue-glow: rgba(0,122,255,0.15);
+  --green: #34C759;
+  --orange: #FF9500;
+  --red: #FF3B30;
+  --purple: #AF52DE;
+  --teal: #00C7BE;
+  --pink: #FF2D55;
+  --text-1: #1C1C1E;
+  --text-2: #3A3A3C;
+  --text-3: #8E8E93;
+  --text-4: #AEAEB2;
+  --border: rgba(0,0,0,0.04);
+  --border-2: rgba(0,0,0,0.08);
+  --shadow-s: 0 2px 12px rgba(0,0,0,0.04), 0 1px 3px rgba(0,0,0,0.03);
+  --shadow-m: 0 4px 24px -4px rgba(0,0,0,0.08);
+  --shadow-l: 0 12px 40px -8px rgba(0,0,0,0.12);
+  --r-s: 10px; --r-m: 14px; --r-l: 18px; --r-xl: 22px;
+  --ease: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --topbar-h: 52px;
+  --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'PingFang SC', 'Helvetica Neue', sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+}
+
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+html { font-size:16px; -webkit-font-smoothing:antialiased; }
+body { font-family:var(--font); background:var(--bg); color:var(--text-1); min-height:100vh; }
+::-webkit-scrollbar { width:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:rgba(0,0,0,0.1); border-radius:3px; }
+
+/* ===== Glass Utility ===== */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--glass-border);
+}
+
+/* ===== Top Bar ===== */
+.topbar {
+  position: fixed; top:0; left:0; right:0; height: var(--topbar-h);
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px; z-index: 100;
+}
+.topbar-left { display: flex; align-items: center; gap: 12px; flex: 1; }
+.topbar-center { position: absolute; left: 50%; transform: translateX(-50%); }
+.topbar-right { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+
+.logo { display:flex; align-items:center; gap:9px; font-weight:600; font-size:15px; letter-spacing:-0.02em; text-decoration:none; color:var(--text-1); }
+.logo svg { color:var(--blue); flex-shrink:0; }
+
+.back-btn {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 12px; border: none; border-radius: 8px;
+  background: rgba(118,118,128,0.1); color: var(--text-2);
+  font-size: 13px; font-weight: 500; cursor: pointer;
+  text-decoration: none; transition: all 0.2s var(--ease);
+  font-family: var(--font);
+}
+.back-btn:hover { background: rgba(118,118,128,0.18); color: var(--text-1); }
+.back-btn svg { width: 14px; height: 14px; }
+
+.breadcrumb {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 13px; color: var(--text-3); font-weight: 400;
+}
+.breadcrumb-unit { color: var(--text-3); }
+.breadcrumb-sep { opacity: 0.4; }
+.breadcrumb-chapter { color: var(--text-2); font-weight: 500; }
+
+.nav-arrows { display: flex; gap: 4px; }
+.nav-arrow {
+  width: 32px; height: 32px; border: none; border-radius: 8px;
+  background: rgba(118,118,128,0.1); color: var(--text-2);
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  transition: all 0.2s var(--ease); font-size: 14px;
+}
+.nav-arrow:hover { background: rgba(118,118,128,0.18); color: var(--text-1); }
+.nav-arrow:disabled { opacity: 0.3; cursor: not-allowed; }
+.nav-arrow svg { width: 14px; height: 14px; }
+
+/* ===== Progress Bar ===== */
+.reading-progress {
+  position: fixed; top: var(--topbar-h); left: 0; right: 0;
+  height: 2px; background: rgba(0,0,0,0.04); z-index: 99;
+}
+.reading-progress-fill {
+  height: 100%; background: var(--blue);
+  width: 0%; transition: width 0.1s linear;
+}
+
+/* ===== Main Content ===== */
+.content-wrap {
+  max-width: 860px; margin: 0 auto;
+  padding: calc(var(--topbar-h) + 32px) 32px 80px;
+}
+
+/* chapter header */
+.chapter-header {
+  margin-bottom: 32px;
+}
+.chapter-unit-tag {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 6px;
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em;
+  margin-bottom: 12px;
+  background: rgba(0,122,255,0.08); color: var(--blue);
+}
+.chapter-title {
+  font-size: 28px; font-weight: 700; letter-spacing: -0.03em;
+  color: var(--text-1); line-height: 1.25; margin-bottom: 6px;
+}
+.chapter-desc {
+  font-size: 14px; color: var(--text-3); line-height: 1.5;
+}
+.chapter-meta {
+  display: flex; align-items: center; gap: 12px; margin-top: 14px;
+  padding-top: 14px; border-top: 1px solid var(--border-2);
+}
+.chapter-meta-item {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-4);
+}
+
+/* ===== Content Loading ===== */
+.loading-state {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; min-height: 40vh; gap: 14px;
+  color: var(--text-3); font-size: 14px;
+}
+.loading-spinner {
+  width: 32px; height: 32px; border: 2.5px solid rgba(0,122,255,0.2);
+  border-top-color: var(--blue); border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.error-state {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; min-height: 40vh; gap: 10px;
+  color: var(--text-3); text-align: center;
+}
+.error-state h3 { font-size: 16px; color: var(--text-2); }
+.error-state p { font-size: 13px; max-width: 360px; line-height: 1.6; }
+
+/* ===== Content Rendering ===== */
+.chapter-body { animation: fadeIn 0.3s var(--ease); }
+@keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+
+.v-h2 { font-size:20px; font-weight:700; color:var(--text-1); letter-spacing:-0.02em; margin-bottom:14px; margin-top:36px; padding-bottom:10px; border-bottom:2px solid var(--border-2); }
+.v-h2:first-child { margin-top:0; }
+.v-h3 { font-size:15.5px; font-weight:600; color:var(--text-1); margin-bottom:8px; margin-top:22px; }
+.v-p { font-size:14.5px; line-height:1.78; color:var(--text-2); margin-bottom:12px; }
+
+.v-note { background:var(--bg); border-left:3px solid var(--blue); border-radius:0 var(--r-s) var(--r-s) 0; padding:12px 16px; margin:14px 0; font-size:13.5px; color:var(--text-2); line-height:1.65; }
+.v-note.warn { border-left-color:var(--orange); background:rgba(255,149,0,0.05); }
+.v-note.danger { border-left-color:var(--red); background:rgba(255,59,48,0.05); }
+.v-note.tip { border-left-color:var(--green); background:rgba(52,199,89,0.05); }
+
+.v-code {
+  background:#1C1C1E; color:#F2F2F7; border-radius:var(--r-m);
+  margin:14px 0; overflow-x:auto; position:relative;
+}
+.v-code pre { margin:0; padding:16px 20px; }
+.v-code pre code { font-family:var(--mono); font-size:13px; line-height:1.65; background:transparent !important; padding:0 !important; }
+.v-code pre code.hljs { background:transparent !important; padding:0 !important; }
+.v-code-lang { position:absolute; top:10px; right:14px; font-size:10px; color:#636366; text-transform:uppercase; letter-spacing:0.05em; z-index:1; }
+
+.v-table { width:100%; border-collapse:collapse; margin:14px 0; font-size:13.5px; }
+.v-table th { background:var(--bg); font-weight:600; text-align:left; padding:10px 14px; border-bottom:2px solid var(--border-2); font-size:11.5px; text-transform:uppercase; letter-spacing:0.04em; color:var(--text-3); }
+.v-table td { padding:10px 14px; border-bottom:1px solid var(--border); color:var(--text-2); }
+.v-table tr:hover td { background:rgba(0,0,0,0.015); }
+
+.v-cmp { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin:14px 0; }
+.v-cmp-side { border-radius:var(--r-s); padding:14px 16px; }
+.v-cmp-old { background:rgba(255,59,48,0.04); border:1px solid rgba(255,59,48,0.12); }
+.v-cmp-new { background:rgba(52,199,89,0.04); border:1px solid rgba(52,199,89,0.12); }
+.v-cmp-label { font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:8px; }
+.v-cmp-old .v-cmp-label { color:var(--red); }
+.v-cmp-new .v-cmp-label { color:var(--green); }
+
+.v-list { list-style:none; padding:0; margin:8px 0; }
+.v-list li { position:relative; padding:7px 0 7px 22px; font-size:14px; line-height:1.6; color:var(--text-2); }
+.v-list li::before { content:''; position:absolute; left:3px; top:15px; width:7px; height:7px; border-radius:50%; background:var(--blue); opacity:0.35; }
+
+.v-project {
+  background:linear-gradient(135deg, var(--blue-light) 0%, rgba(175,82,222,0.05) 100%);
+  border:1px solid rgba(0,122,255,0.1); border-radius:var(--r-m);
+  padding:20px 24px; margin:24px 0;
+}
+.v-project-ttl { font-size:15px; font-weight:600; color:var(--blue); margin-bottom:8px; }
+.v-project-ttl::before { content:'\1F6E0\0020'; }
+
+code:not(.v-code code):not(pre code) { background:var(--bg); padding:2px 6px; border-radius:4px; font-family:var(--mono); font-size:0.87em; color:var(--pink); }
+
+/* ===== Interactive: Run Block ===== */
+.v-run { position:relative; margin:14px 0; }
+.v-run .v-code { margin:0; }
+.v-run-btns { position:absolute; top:10px; right:14px; display:flex; gap:6px; z-index:2; }
+.v-run-btn { padding:4px 13px; border:none; border-radius:100px; font-size:10.5px; font-weight:600; letter-spacing:0.05em; cursor:pointer; transition:all 0.2s; font-family:var(--font); }
+.v-run-btn.run { background:#34C759; color:#fff; }
+.v-run-btn.run:hover { background:#2db84d; transform:scale(1.05); box-shadow:0 2px 10px rgba(52,199,89,0.35); }
+.v-run-btn.copy { background:rgba(255,255,255,0.15); color:rgba(255,255,255,0.7); backdrop-filter:blur(4px); }
+.v-run-btn.copy:hover { background:rgba(255,255,255,0.25); color:#fff; }
+.v-run-btn.copied { background:rgba(52,199,89,0.3); color:#34C759; }
+.v-run-btn.asm { background:rgba(255,149,0,0.12); color:#ff9500; font-size:9.5px; padding:4px 9px; }
+.v-run-btn.asm:hover { background:rgba(255,149,0,0.22); }
+.v-run-btn.run.running { pointer-events:none; opacity:0.6; }
+.v-run-output { display:none; margin:-4px 0 14px 0; padding:12px 16px; background:#1a1a1e; border:1px solid rgba(52,199,89,0.15); border-top:1px dashed rgba(52,199,89,0.1); border-radius:0 0 var(--r-m) var(--r-m); font-family:var(--mono); font-size:12.5px; color:#d4d4d4; line-height:1.6; max-height:220px; overflow-y:auto; white-space:pre-wrap; word-break:break-all; }
+.v-run-output.show { display:block; }
+.v-run-output .run-err { color:#ff6b6b; }
+.v-run-output .run-warn { color:#ffb340; }
+.v-run-output .run-ok { color:#34c759; }
+.v-run-output .run-fb { display:inline-block; margin-top:6px; padding:3px 10px; background:rgba(255,149,0,0.12); color:#ff9500; border-radius:4px; font-size:11px; cursor:pointer; border:none; font-family:var(--font); }
+
+/* ===== Interactive: Quiz ===== */
+.v-quiz { background:rgba(0,122,255,0.04); border:1px solid rgba(0,122,255,0.12); border-radius:var(--r-m); padding:18px 20px; margin:18px 0; }
+.v-quiz-q { font-size:14.5px; font-weight:600; color:var(--text-1); margin-bottom:14px; line-height:1.55; }
+.v-quiz-opts { display:flex; flex-direction:column; gap:7px; margin-bottom:6px; }
+.v-quiz-opt { padding:11px 15px; border-radius:var(--r-s); border:1px solid var(--border-2); background:var(--surface); cursor:pointer; font-size:13.5px; color:var(--text-2); transition:all 0.2s; display:flex; align-items:center; gap:10px; }
+.v-quiz-opt:hover { border-color:var(--blue); background:var(--blue-light); }
+.v-quiz-opt.correct { border-color:var(--green); background:rgba(52,199,89,0.08); color:#1a7a34; pointer-events:none; }
+.v-quiz-opt.wrong { border-color:var(--red); background:rgba(255,59,48,0.05); color:var(--red); pointer-events:none; }
+.v-quiz-opt.disabled { pointer-events:none; opacity:0.5; }
+.v-quiz-opt .opt-label { font-weight:700; flex-shrink:0; min-width:18px; }
+.v-quiz-exp { display:none; padding:13px 15px; background:rgba(52,199,89,0.06); border-radius:var(--r-s); font-size:13px; color:var(--text-2); line-height:1.6; margin-top:10px; }
+.v-quiz-exp.show { display:block; }
+
+/* ===== Interactive: Diagram ===== */
+.v-diagram { background:rgba(0,199,190,0.04); border:1px solid rgba(0,199,190,0.15); border-radius:var(--r-m); padding:16px 20px; margin:14px 0; font-size:13.5px; color:var(--text-2); line-height:1.7; overflow-x:auto; }
+.v-diagram-badge { display:inline-block; padding:2px 9px; background:rgba(0,199,190,0.12); color:var(--teal); font-size:10.5px; font-weight:600; border-radius:4px; margin-bottom:12px; text-transform:uppercase; letter-spacing:0.04em; }
+/* flow diagram */
+.dg-flow-path { display:flex; align-items:center; flex-wrap:wrap; gap:4px 0; margin:7px 0; }
+.dg-flow-node { display:inline-flex; align-items:center; padding:6px 13px; background:rgba(0,199,190,0.10); border:1px solid rgba(0,199,190,0.25); border-radius:6px; font-size:12.5px; font-weight:500; color:var(--text-1); white-space:nowrap; }
+.dg-flow-node.decision { border-radius:2px; background:rgba(255,179,64,0.12); border-color:rgba(255,179,64,0.35); }
+.dg-flow-arrow { display:inline-flex; align-items:center; color:var(--teal); font-size:11px; padding:0 2px; white-space:nowrap; flex-shrink:0; }
+.dg-flow-arrow svg { width:20px; height:12px; flex-shrink:0; }
+.dg-flow-arrow .arrow-label { font-size:10px; color:var(--orange); font-weight:600; margin:0 2px; background:rgba(255,149,0,0.08); padding:1px 5px; border-radius:3px; }
+.dg-flow-sep { width:100%; height:1px; background:rgba(0,199,190,0.12); margin:7px 0; }
+.dg-flow-title { font-size:12px; font-weight:600; color:var(--text-2); margin-bottom:5px; }
+/* memory diagram */
+.dg-mem { display:flex; gap:16px; flex-wrap:wrap; margin-top:6px; }
+.dg-mem-section { flex:1; min-width:180px; }
+.dg-mem-label { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:6px; padding:3px 8px; border-radius:4px; display:inline-block; }
+.dg-mem-label.stack-label { background:rgba(52,199,89,0.12); color:#34c759; }
+.dg-mem-label.heap-label { background:rgba(255,149,0,0.12); color:#ff9500; }
+.dg-mem-row { display:flex; align-items:center; gap:8px; padding:5px 9px; margin:2px 0; border-radius:4px; font-size:12px; font-family:var(--mono); background:rgba(0,0,0,0.025); border-left:3px solid rgba(0,199,190,0.3); }
+.dg-mem-row .mem-addr { color:var(--teal); font-size:11px; opacity:0.7; min-width:60px; }
+.dg-mem-row .mem-val { color:var(--text-1); font-weight:500; }
+.dg-mem-row.separator { background:none; border-left:3px dashed rgba(0,199,190,0.2); color:var(--text-3); font-style:italic; font-family:var(--font); }
+.dg-mem-arrow { font-size:11px; color:var(--orange); padding:3px 8px; margin:3px 0; }
+.dg-mem-note { font-size:11px; color:var(--text-3); font-style:italic; padding:4px 8px; margin-top:4px; border-left:2px solid rgba(0,199,190,0.2); }
+/* tree diagram */
+.dg-tree { margin-top:6px; }
+.dg-tree ul { list-style:none; padding-left:20px; margin:0; position:relative; }
+.dg-tree ul::before { content:''; position:absolute; left:8px; top:0; bottom:12px; width:1px; background:rgba(0,199,190,0.2); }
+.dg-tree > ul { padding-left:0; }
+.dg-tree > ul::before { display:none; }
+.dg-tree li { position:relative; padding:3px 0; }
+.dg-tree ul > li::before { content:''; position:absolute; left:-12px; top:14px; width:12px; height:1px; background:rgba(0,199,190,0.25); }
+.dg-tree .tree-node { display:inline-flex; align-items:center; padding:3px 11px; background:rgba(0,199,190,0.08); border:1px solid rgba(0,199,190,0.18); border-radius:5px; font-size:12.5px; font-weight:500; color:var(--text-1); }
+.dg-tree .tree-node.root-node { background:rgba(0,199,190,0.15); border-color:rgba(0,199,190,0.35); font-weight:600; }
+/* compare diagram */
+.dg-compare { display:flex; gap:12px; margin-top:6px; }
+.dg-compare-col { flex:1; min-width:0; }
+.dg-compare-title { font-size:12px; font-weight:700; color:var(--text-2); margin-bottom:6px; padding:4px 10px; background:rgba(0,0,0,0.03); border-radius:5px; text-align:center; }
+.dg-compare-col.highlight-col .dg-compare-title { background:rgba(0,199,190,0.12); color:var(--teal); }
+.dg-compare-body { font-size:12px; font-family:var(--mono); line-height:1.8; padding:8px 10px; background:rgba(0,0,0,0.02); border-radius:5px; border:1px solid var(--border); }
+.dg-compare-item { padding:2px 6px; margin:2px 0; border-radius:3px; }
+.dg-compare-item.hl { background:rgba(0,199,190,0.10); border:1px solid rgba(0,199,190,0.2); }
+
+/* ===== Collapse / Tabs / Steps ===== */
+.v-collapse { margin:14px 0; border:1px solid var(--border-2); border-radius:var(--r-m); overflow:hidden; }
+.v-collapse-hdr { padding:11px 15px; font-size:13.5px; font-weight:500; color:var(--text-2); cursor:pointer; background:rgba(0,0,0,0.015); display:flex; align-items:center; gap:8px; transition:background 0.15s; }
+.v-collapse-hdr:hover { background:rgba(0,0,0,0.03); }
+.v-collapse-hdr::before { content:'▸'; transition:transform 0.2s; flex-shrink:0; }
+.v-collapse.open .v-collapse-hdr::before { transform:rotate(90deg); }
+.v-collapse-body { display:none; padding:14px 18px; font-size:13.5px; color:var(--text-2); line-height:1.65; border-top:1px solid var(--border); }
+.v-collapse.open .v-collapse-body { display:block; }
+
+.v-tabs { margin:14px 0; }
+.v-tab-btns { display:flex; gap:2px; background:rgba(118,118,128,0.08); border-radius:8px; padding:2px; margin-bottom:12px; overflow-x:auto; }
+.v-tab-btn { padding:7px 15px; font-size:12.5px; font-weight:500; border-radius:6px; border:none; background:transparent; color:var(--text-3); cursor:pointer; transition:all 0.2s; font-family:var(--font); white-space:nowrap; }
+.v-tab-btn.active { background:var(--surface); color:var(--text-1); box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+.v-tab-panel { display:none; font-size:13.5px; color:var(--text-2); line-height:1.65; }
+.v-tab-panel.active { display:block; }
+
+.v-steps { margin:14px 0; display:flex; flex-direction:column; gap:12px; }
+.v-step { border:1px solid var(--border-2); border-radius:var(--r-m); overflow:hidden; }
+.v-step-hdr { padding:10px 15px; font-size:12.5px; font-weight:600; color:var(--blue); background:var(--blue-light); display:flex; align-items:center; gap:9px; }
+.v-step-num { width:24px; height:24px; border-radius:50%; background:var(--blue); color:#fff; display:flex; align-items:center; justify-content:center; font-size:11.5px; flex-shrink:0; }
+.v-step-body { padding:14px 18px; font-size:13.5px; color:var(--text-2); line-height:1.65; }
+
+/* ===== Bottom Nav ===== */
+.bottom-nav {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 56px; padding-top: 24px; border-top: 1px solid var(--border-2);
+  gap: 12px;
+}
+.bottom-nav-btn {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 18px; border-radius: var(--r-m);
+  background: var(--surface); border: 1px solid var(--border-2);
+  color: var(--text-2); font-size: 13px; font-weight: 500;
+  cursor: pointer; text-decoration: none; transition: all 0.2s var(--ease);
+  font-family: var(--font); flex: 1; max-width: 260px;
+  box-shadow: var(--shadow-s);
+}
+.bottom-nav-btn:hover { border-color: var(--blue); color: var(--blue); box-shadow: var(--shadow-m); transform: translateY(-1px); }
+.bottom-nav-btn.prev { justify-content: flex-start; }
+.bottom-nav-btn.next { justify-content: flex-end; flex-direction: row-reverse; }
+.bottom-nav-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+.bnb-title { font-size: 12px; opacity: 0.7; }
+.bnb-name { font-size: 13px; font-weight: 600; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ===== Table of Contents Floating ===== */
+.toc-float {
+  position: fixed; right: 24px; top: 50%; transform: translateY(-50%);
+  display: flex; flex-direction: column; gap: 6px;
+  z-index: 50; max-width: 200px;
+}
+.toc-item {
+  font-size: 11px; color: var(--text-4); cursor: pointer;
+  padding: 3px 8px; border-radius: 4px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 180px;
+  transition: color 0.2s, background 0.2s;
+}
+.toc-item:hover { color: var(--text-2); background: rgba(0,0,0,0.04); }
+.toc-item.active { color: var(--blue); }
+@media (max-width: 1200px) { .toc-float { display:none; } }
+
+/* ===== Responsive ===== */
+@media (max-width: 768px) {
+  .content-wrap { padding: calc(var(--topbar-h) + 20px) 20px 60px; }
+  .chapter-title { font-size: 22px; }
+  .topbar { padding: 0 14px; }
+  .v-cmp { grid-template-columns: 1fr; }
+  .dg-compare { flex-direction: column; }
+  .breadcrumb-chapter { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- Top Bar -->
+<nav class="topbar glass">
+  <div class="topbar-left">
+    <a href="index.html" class="back-btn" id="backHome" title="返回首页">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+      返回
+    </a>
+    <a href="index.html" class="logo">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
+      C++ Mastery
+    </a>
+  </div>
+  <div class="topbar-center">
+    <div class="breadcrumb" id="breadcrumb">
+      <span class="breadcrumb-unit" id="bcUnit">—</span>
+      <span class="breadcrumb-sep">›</span>
+      <span class="breadcrumb-chapter" id="bcChapter">加载中…</span>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="nav-arrows">
+      <button class="nav-arrow" id="prevBtn" title="上一章" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+      </button>
+      <button class="nav-arrow" id="nextBtn" title="下一章" disabled>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </button>
+    </div>
+  </div>
+</nav>
+
+<!-- Reading Progress Bar -->
+<div class="reading-progress"><div class="reading-progress-fill" id="progressFill"></div></div>
+
+<!-- Main Content -->
+<main class="content-wrap" id="contentWrap">
+  <!-- Chapter Header (populated dynamically) -->
+  <header class="chapter-header" id="chapterHeader" style="display:none">
+    <div class="chapter-unit-tag" id="unitTag"></div>
+    <h1 class="chapter-title" id="chapterTitle"></h1>
+    <p class="chapter-desc" id="chapterDesc"></p>
+  </header>
+
+  <!-- Loading State -->
+  <div class="loading-state" id="loadingState">
+    <div class="loading-spinner"></div>
+    <span>正在加载章节内容…</span>
+  </div>
+
+  <!-- Content Body -->
+  <article class="chapter-body" id="chapterBody" style="display:none"></article>
+
+  <!-- Error State -->
+  <div class="error-state" id="errorState" style="display:none">
+    <div style="font-size:36px">📄</div>
+    <h3>内容文件未找到</h3>
+    <p id="errorMsg">对应的 .txt 文件尚未创建。请将内容文件放入正确目录后刷新页面。</p>
+    <a href="index.html" style="margin-top:16px;padding:10px 20px;background:var(--blue);color:#fff;border-radius:10px;text-decoration:none;font-size:14px;font-weight:500;">返回首页</a>
+  </div>
+
+  <!-- Bottom Navigation -->
+  <nav class="bottom-nav" id="bottomNav" style="display:none">
+    <a class="bottom-nav-btn prev" id="prevBtnBottom" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="15 18 9 12 15 6"/></svg>
+      <div>
+        <div class="bnb-title">上一章</div>
+        <div class="bnb-name" id="prevName">—</div>
+      </div>
+    </a>
+    <a class="bottom-nav-btn next" id="nextBtnBottom" href="#">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      <div style="text-align:right">
+        <div class="bnb-title">下一章</div>
+        <div class="bnb-name" id="nextName">—</div>
+      </div>
+    </a>
+  </nav>
+</main>
+
+<!-- Table of Contents -->
+<div class="toc-float" id="tocFloat"></div>
+
+<script>
+/* =============================================
+   COURSE TREE DATA
+   ============================================= */
+const TREE = [
+  {
+    id:'basics', title:'C++ 基础', sub:'Fundamentals', icon:'📦', color:'#007AFF', folder:'01-basics',
+    nodes:[
+      {id:'basics-env',title:'开发环境搭建',desc:'编译器、IDE、构建工具',file:'env-setup.txt'},
+      {id:'basics-hello',title:'第一个程序',desc:'main()、编译流程、链接',file:'hello-world.txt'},
+      {id:'basics-types',title:'基本数据类型',desc:'整型、浮点、字符、布尔',file:'data-types.txt'},
+      {id:'basics-vars',title:'变量与常量',desc:'auto、const、constexpr',file:'variables.txt'},
+      {id:'basics-ops',title:'运算符与表达式',desc:'算术、逻辑、位运算',file:'operators.txt'},
+      {id:'basics-ctrl',title:'流程控制',desc:'if/switch/for/while/range-for',file:'control-flow.txt'},
+      {id:'basics-func',title:'函数',desc:'声明、重载、默认参数、内联',file:'functions.txt'},
+      {id:'basics-arr',title:'数组与字符串',desc:'C数组、std::array、std::string',file:'arrays-strings.txt'},
+      {id:'basics-ptr',title:'指针与引用',desc:'地址、解引用、引用语义',file:'pointers-refs.txt'},
+      {id:'basics-struct',title:'结构体与枚举',desc:'struct、enum、enum class',file:'structs-enums.txt'},
+      {id:'basics-io',title:'输入输出与文件',desc:'iostream、fstream、格式化',file:'io-files.txt'},
+      {id:'basics-pre',title:'预处理器与头文件',desc:'#include、#define、头文件守卫',file:'preprocessor.txt'},
+      {id:'basics-proj',title:'🛠 实战：控制台工具',desc:'综合练习项目',file:'project-console.txt'},
+    ]
+  },
+  {
+    id:'oop', title:'面向对象编程', sub:'Object-Oriented', icon:'🏗', color:'#5856D6', folder:'02-oop',
+    nodes:[
+      {id:'oop-class',title:'类与对象',desc:'成员变量、成员函数、this',file:'classes.txt'},
+      {id:'oop-ctor',title:'构造与析构',desc:'构造函数、析构函数、RAII',file:'ctor-dtor.txt'},
+      {id:'oop-access',title:'访问控制与封装',desc:'public/private/protected/friend',file:'access-control.txt'},
+      {id:'oop-inherit',title:'继承与多态',desc:'虚函数、override、抽象类',file:'inheritance.txt'},
+      {id:'oop-copy',title:'拷贝与移动语义',desc:'拷贝构造、移动构造、Rule of 5',file:'copy-move.txt'},
+      {id:'oop-op',title:'运算符重载',desc:'<<、[]、()、类型转换',file:'operator-overload.txt'},
+      {id:'oop-static',title:'静态成员与单例',desc:'static成员、Meyers单例',file:'static-singleton.txt'},
+      {id:'oop-comp',title:'组合与聚合',desc:'has-a vs is-a、委托',file:'composition.txt'},
+      {id:'oop-proj',title:'🛠 实战：ECS原型',desc:'简易实体组件系统',file:'project-ecs.txt'},
+    ]
+  },
+  {
+    id:'stl', title:'标准模板库', sub:'STL & Algorithms', icon:'📚', color:'#34C759', folder:'03-stl',
+    nodes:[
+      {id:'stl-seq',title:'序列容器',desc:'vector、deque、list、array',file:'seq-containers.txt'},
+      {id:'stl-assoc',title:'关联容器',desc:'map、set、unordered_*',file:'assoc-containers.txt'},
+      {id:'stl-iter',title:'迭代器',desc:'五类迭代器、适配器',file:'iterators.txt'},
+      {id:'stl-algo',title:'算法库',desc:'sort、find、transform、ranges',file:'algorithms.txt'},
+      {id:'stl-func',title:'函数对象与lambda',desc:'std::function、闭包、绑定',file:'functional.txt'},
+      {id:'stl-str',title:'字符串处理',desc:'string_view、regex、格式化',file:'strings-advanced.txt'},
+      {id:'stl-util',title:'工具库',desc:'optional、variant、tuple、any',file:'utility.txt'},
+      {id:'stl-ranges',title:'Ranges库 (C++20/23)',desc:'views、actions、管道操作',file:'ranges.txt'},
+      {id:'stl-proj',title:'🛠 实战：数据处理器',desc:'使用STL实现小型数据管线',file:'project-pipeline.txt'},
+    ]
+  },
+  {
+    id:'modern', title:'现代C++特性', sub:'C++11~23', icon:'✨', color:'#FF9500', folder:'04-modern-cpp',
+    nodes:[
+      {id:'mod-auto',title:'auto与类型推导',desc:'auto、decltype、CTAD',file:'auto-deduction.txt'},
+      {id:'mod-move',title:'右值引用与移动',desc:'std::move、完美转发',file:'rvalue-move.txt'},
+      {id:'mod-smart',title:'智能指针',desc:'unique_ptr、shared_ptr、weak_ptr',file:'smart-pointers.txt'},
+      {id:'mod-ce',title:'constexpr编程',desc:'编译期计算、if constexpr',file:'constexpr.txt'},
+      {id:'mod-conc',title:'Concepts (C++20)',desc:'约束、requires、概念库',file:'concepts.txt'},
+      {id:'mod-err',title:'错误处理',desc:'异常、expected、错误码',file:'error-handling.txt'},
+      {id:'mod-feat',title:'C++17/20新特性',desc:'结构化绑定、if constexpr、Ranges',file:'cpp17-20-features.txt'},
+      {id:'mod-mod',title:'Modules与协程',desc:'import/export、co_await',file:'modules-coroutines.txt'},
+      {id:'mod-proj',title:'🛠 实战：现代化重构',desc:'将旧代码迁移至现代C++',file:'project-modern.txt'},
+    ]
+  },
+  {
+    id:'memory', title:'内存管理', sub:'Memory', icon:'🧠', color:'#FF3B30', folder:'05-memory',
+    nodes:[
+      {id:'mem-stack',title:'栈与堆',desc:'内存区域、生命周期',file:'stack-heap.txt'},
+      {id:'mem-new',title:'new与delete',desc:'动态分配、malloc/free',file:'new-delete.txt'},
+      {id:'mem-align',title:'对齐与填充',desc:'alignof、alignas、缓存行',file:'alignment.txt'},
+      {id:'mem-safe',title:'内存安全',desc:'ASan、泄漏检测、最佳实践',file:'memory-safety.txt'},
+      {id:'mem-alloc',title:'分配器',desc:'std::allocator、自定义分配',file:'allocators.txt'},
+      {id:'mem-pool',title:'内存池',desc:'对象池、块分配',file:'memory-pool.txt'},
+      {id:'mem-proj',title:'🛠 实战：内存分配器',desc:'实现高性能内存池',file:'project-allocator.txt'},
+    ]
+  },
+  {
+    id:'templates', title:'模板与泛型', sub:'Templates', icon:'🧬', color:'#AF52DE', folder:'06-templates',
+    nodes:[
+      {id:'tmpl-func',title:'函数模板',desc:'模板参数、实例化、特化',file:'function-templates.txt'},
+      {id:'tmpl-class',title:'类模板',desc:'模板类、偏特化',file:'class-templates.txt'},
+      {id:'tmpl-var',title:'可变参数模板',desc:'折叠表达式、参数包展开',file:'variadic.txt'},
+      {id:'tmpl-sfinae',title:'SFINAE与类型萃取',desc:'enable_if、type_traits',file:'sfinae-traits.txt'},
+      {id:'tmpl-meta',title:'模板元编程',desc:'类型计算、编译期分派',file:'metaprogramming.txt'},
+      {id:'tmpl-proj',title:'🛠 实战：类型安全ECS',desc:'泛型实体组件系统',file:'project-ecs-typed.txt'},
+    ]
+  },
+  {
+    id:'concurrency', title:'并发编程', sub:'Concurrency', icon:'⚡', color:'#FF2D55', folder:'07-concurrency',
+    nodes:[
+      {id:'conc-thread',title:'线程基础',desc:'std::thread、jthread',file:'threads-basics.txt'},
+      {id:'conc-mutex',title:'互斥与锁',desc:'mutex、lock_guard、unique_lock',file:'mutex-locks.txt'},
+      {id:'conc-cond',title:'条件变量与同步',desc:'condition_variable、通知',file:'condvar-sync.txt'},
+      {id:'conc-atom',title:'原子操作',desc:'std::atomic、memory_order',file:'atomic.txt'},
+      {id:'conc-pat',title:'并发模式',desc:'生产者消费者、线程池',file:'patterns.txt'},
+      {id:'conc-pit',title:'并发陷阱',desc:'死锁、竞态、调试技巧',file:'pitfalls.txt'},
+      {id:'conc-proj',title:'🛠 实战：引擎多线程',desc:'实现多线程任务系统',file:'project-engine-threads.txt'},
+    ]
+  },
+  {
+    id:'patterns', title:'设计模式', sub:'Design Patterns', icon:'🏛', color:'#5AC8FA', folder:'08-design-patterns',
+    nodes:[
+      {id:'pat-create',title:'创建型模式',desc:'工厂、建造者、原型',file:'creational.txt'},
+      {id:'pat-struct',title:'结构型模式',desc:'适配器、装饰器、代理、外观',file:'structural.txt'},
+      {id:'pat-behav',title:'行为型模式',desc:'观察者、状态、策略、命令',file:'behavioral.txt'},
+      {id:'pat-game',title:'游戏专用模式',desc:'游戏循环、组件、对象池、事件队列',file:'game-patterns.txt'},
+      {id:'pat-mod',title:'现代C++模式',desc:'CRTP、类型擦除、Policy',file:'modern-cpp-patterns.txt'},
+      {id:'pat-proj',title:'🛠 实战：游戏框架',desc:'综合运用设计模式构建框架',file:'project-game-framework.txt'},
+    ]
+  },
+  {
+    id:'build', title:'构建与工具链', sub:'Build & CI', icon:'🔧', color:'#8E8E93', folder:'09-build-systems',
+    nodes:[
+      {id:'bld-comp',title:'编译模型',desc:'预处理、编译、链接',file:'compilation-model.txt'},
+      {id:'bld-cmake',title:'CMake',desc:'CMakeLists、target、FetchContent',file:'cmake.txt'},
+      {id:'bld-tool',title:'工具链',desc:'编译器选项、sanitizers、调试器',file:'toolchain.txt'},
+      {id:'bld-proj',title:'🛠 实战：完整构建',desc:'搭建专业级C++项目骨架',file:'project-build.txt'},
+    ]
+  },
+  {
+    id:'math', title:'游戏数学', sub:'Math', icon:'📐', color:'#FFCC00', folder:'10-math',
+    nodes:[
+      {id:'math-vec',title:'向量与点',desc:'2D/3D向量运算、点积叉积',file:'vectors.txt'},
+      {id:'math-mat',title:'矩阵',desc:'变换矩阵、MVP矩阵',file:'matrices.txt'},
+      {id:'math-quat',title:'四元数',desc:'旋转表示、Slerp插值',file:'quaternions.txt'},
+      {id:'math-trans',title:'变换系统',desc:'仿射变换、坐标系、场景图',file:'transforms.txt'},
+      {id:'math-col',title:'碰撞检测',desc:'AABB、射线、相交检测',file:'collision.txt'},
+      {id:'math-proj',title:'🛠 实战：数学库',desc:'实现GLM风格的游戏数学库',file:'project-mathlib.txt'},
+    ]
+  },
+  {
+    id:'physics', title:'物理引擎', sub:'Physics', icon:'🎱', color:'#FF6B35', folder:'11-physics',
+    nodes:[
+      {id:'phys-all',title:'物理引擎基础',desc:'刚体、碰撞、约束、空间分割',file:'physics.txt'},
+    ]
+  },
+  {
+    id:'graphics', title:'图形学', sub:'Graphics', icon:'🎨', color:'#00C7BE', folder:'12-graphics',
+    nodes:[
+      {id:'gfx-all',title:'图形学基础',desc:'渲染管线、着色器、光照',file:'graphics.txt'},
+    ]
+  },
+  {
+    id:'audio', title:'音频系统', sub:'Audio', icon:'🎵', color:'#BF5AF2', folder:'13-audio',
+    nodes:[
+      {id:'aud-all',title:'音频系统基础',desc:'数字音频、空间音效、DSP',file:'audio.txt'},
+    ]
+  },
+  {
+    id:'networking', title:'网络编程', sub:'Networking', icon:'🌐', color:'#32ADE6', folder:'14-networking',
+    nodes:[
+      {id:'net-all',title:'网络编程基础',desc:'Socket、协议、游戏网络',file:'networking.txt'},
+    ]
+  },
+  {
+    id:'engine', title:'引擎架构', sub:'Engine', icon:'⚙️', color:'#1C1C1E', folder:'15-engine-arch',
+    nodes:[
+      {id:'eng-all',title:'引擎架构设计',desc:'分层架构、ECS、资源管理',file:'engine-arch.txt'},
+    ]
+  },
+  {
+    id:'scripting', title:'脚本与热加载', sub:'Scripting', icon:'📜', color:'#64D2FF', folder:'16-scripting',
+    nodes:[
+      {id:'scr-all',title:'脚本系统',desc:'Lua集成、反射、热重载',file:'scripting.txt'},
+    ]
+  },
+  {
+    id:'tools', title:'专业工具与实践', sub:'Pro Tools', icon:'🛡', color:'#A2845E', folder:'17-tools',
+    nodes:[
+      {id:'tool-all',title:'工具与实践',desc:'Git、文档、跨平台、性能优化',file:'tools.txt'},
+    ]
+  },
+  {
+    id:'projects', title:'综合实战项目', sub:'Capstone', icon:'🏆', color:'#30D158', folder:'18-projects',
+    nodes:[
+      {id:'proj-all',title:'综合实战项目',desc:'2D/3D游戏与完整引擎开发',file:'final-project.txt'},
+    ]
+  },
+];
+
+/* =============================================
+   URL PARAMETER PARSING
+   ============================================= */
+function getParams() {
+  const p = new URLSearchParams(window.location.search);
+  return { folder: p.get('folder') || '', file: p.get('file') || '' };
+}
+
+function findNode(folder, file) {
+  for (const branch of TREE) {
+    if (branch.folder === folder) {
+      const ni = branch.nodes.findIndex(n => n.file === file);
+      if (ni !== -1) return { branch, node: branch.nodes[ni], nodeIndex: ni };
+    }
+  }
+  return null;
+}
+
+/* =============================================
+   NAVIGATION SETUP
+   ============================================= */
+function buildNav(branch, nodeIndex) {
+  const nodes = branch.nodes;
+  const prev = nodeIndex > 0 ? nodes[nodeIndex - 1] : null;
+  const next = nodeIndex < nodes.length - 1 ? nodes[nodeIndex + 1] : null;
+
+  const prevBtn = document.getElementById('prevBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const prevBtnBot = document.getElementById('prevBtnBottom');
+  const nextBtnBot = document.getElementById('nextBtnBottom');
+  const bottomNav = document.getElementById('bottomNav');
+
+  function chapterUrl(node) {
+    return `template.html?folder=${branch.folder}&file=${node.file}`;
+  }
+  // For chapter HTML files located in content/<folder>/, adjust path
+  // template.html is at root, so URL is relative from root
+  const rootPrefix = window.location.pathname.includes('/content/') ? '../../' : '';
+
+  if (prev) {
+    prevBtn.disabled = false;
+    prevBtn.onclick = () => { window.location.href = rootPrefix + `template.html?folder=${branch.folder}&file=${prev.file}`; };
+    prevBtnBot.href = rootPrefix + `template.html?folder=${branch.folder}&file=${prev.file}`;
+    document.getElementById('prevName').textContent = prev.title;
+  } else {
+    prevBtn.disabled = true;
+    prevBtnBot.style.visibility = 'hidden';
+  }
+
+  if (next) {
+    nextBtn.disabled = false;
+    nextBtn.onclick = () => { window.location.href = rootPrefix + `template.html?folder=${branch.folder}&file=${next.file}`; };
+    nextBtnBot.href = rootPrefix + `template.html?folder=${branch.folder}&file=${next.file}`;
+    document.getElementById('nextName').textContent = next.title;
+  } else {
+    nextBtn.disabled = true;
+    nextBtnBot.style.visibility = 'hidden';
+  }
+
+  bottomNav.style.display = 'flex';
+}
+
+/* =============================================
+   READING PROGRESS
+   ============================================= */
+window.addEventListener('scroll', () => {
+  const total = document.documentElement.scrollHeight - window.innerHeight;
+  const pct = total > 0 ? Math.round(window.scrollY / total * 100) : 0;
+  document.getElementById('progressFill').style.width = pct + '%';
+});
+
+/* =============================================
+   TABLE OF CONTENTS
+   ============================================= */
+function buildToc(body) {
+  const toc = document.getElementById('tocFloat');
+  const headers = body.querySelectorAll('.v-h2');
+  if (headers.length < 3) { toc.style.display = 'none'; return; }
+  toc.innerHTML = '';
+  headers.forEach((h, i) => {
+    h.id = 'section-' + i;
+    const item = document.createElement('div');
+    item.className = 'toc-item';
+    item.textContent = h.textContent.trim();
+    item.onclick = () => h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    toc.appendChild(item);
+  });
+
+  // Highlight active section on scroll
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        const idx = parseInt(e.target.id.replace('section-', ''));
+        toc.querySelectorAll('.toc-item').forEach((it, i) => it.classList.toggle('active', i === idx));
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+  headers.forEach(h => observer.observe(h));
+}
+
+/* =============================================
+   CONTENT PARSER
+   ============================================= */
+function parseContent(text) {
+  let html = ''; const lines = text.split('\n'); let i = 0, buf = '';
+  const flush = () => { if (buf.trim()) { html += `<p class="v-p">${inline(buf.trim())}</p>`; buf = ''; } };
+  while (i < lines.length) {
+    const L = lines[i];
+    if (L.startsWith('///')) { flush(); html += `<div class="v-h2">${inline(L.replace(/^\/\/\/\s*/, ''))}</div>`; i++; continue; }
+    if (L.startsWith('//')) { flush(); html += `<div class="v-h3">${inline(L.replace(/^\/\/\s*/, ''))}</div>`; i++; continue; }
+    const bm = L.match(/^\\(note|warning|danger|tip|code|table|compare|list|project|run|quiz|diagram|collapse|tabs|steps)\b/);
+    if (bm) { flush(); const r = parseBlock(lines, i, bm[1]); html += r.html; i = r.next; continue; }
+    if (L.trim() === '') { flush(); i++; continue; }
+    buf += (buf ? ' ' : '') + L; i++;
+  }
+  flush(); return html;
+}
+
+function parseBlock(lines, si, type) {
+  let content = '', i = si, depth = 0, started = false;
+  const fl = lines[si], fb = fl.indexOf('{');
+  if (fb === -1) return { html: '', next: si + 1 };
+  for (i = si; i < lines.length; i++) {
+    for (let c = 0; c < lines[i].length; c++) {
+      if (lines[i][c] === '{') { if (!started) started = true; depth++; }
+      else if (lines[i][c] === '}') {
+        depth--;
+        if (depth === 0) {
+          const parts = [];
+          if (si === i) { content = fl.substring(fb + 1, fl.lastIndexOf('}')); }
+          else { parts.push(fl.substring(fb + 1)); for (let j = si + 1; j < i; j++) parts.push(lines[j]); parts.push(lines[i].substring(0, c)); content = parts.join('\n'); }
+          i++; break;
+        }
+      }
+    }
+    if (depth === 0 && started) break;
+  }
+  content = content.trim(); let html = '';
+  switch (type) {
+    case 'note': html = `<div class="v-note">${inline(content)}</div>`; break;
+    case 'warning': html = `<div class="v-note warn">${inline(content)}</div>`; break;
+    case 'danger': html = `<div class="v-note danger">${inline(content)}</div>`; break;
+    case 'tip': html = `<div class="v-note tip">${inline(content)}</div>`; break;
+    case 'code': {
+      const lm = fl.match(/\\code\[([^\]]*)\]/); const lang = lm ? lm[1] : 'cpp';
+      html = `<div class="v-code"><span class="v-code-lang">${lang}</span><pre><code class="language-${lang}">${esc(content)}</code></pre></div>`; break;
+    }
+    case 'run': {
+      const lm = fl.match(/\\run\[([^\]]*)\]/); const lang = lm ? lm[1] : 'cpp';
+      const rid = 'r' + Math.random().toString(36).slice(2, 8);
+      let btns = `<button class="v-run-btn copy" onclick="copyRunCode('${rid}')" title="复制代码">📋 复制</button>`;
+      btns += `<button class="v-run-btn run" onclick="runCodeInline('${rid}')" title="内联运行">▶ 运行</button>`;
+      btns += `<button class="v-run-btn asm" onclick="openInCompiler('${rid}')" title="在 Godbolt 中查看汇编">ASM</button>`;
+      html = `<div class="v-run" data-rid="${rid}"><div class="v-run-btns">${btns}</div><div class="v-code"><span class="v-code-lang">${lang}</span><pre><code class="language-${lang}" id="code-${rid}">${esc(content)}</code></pre></div><div class="v-run-output" id="output-${rid}"></div></div>`; break;
+    }
+    case 'quiz': {
+      const qm = fl.match(/\\quiz\[([^\]]*)\]/); const qtype = qm ? qm[1] : 'choice';
+      const qlines = content.split('\n');
+      let q = '', opts = [], ans = '', exp = '';
+      for (const ql of qlines) {
+        const qt = ql.trim();
+        if (qt.startsWith('Q:')) q = qt.slice(2).trim();
+        else if (/^[A-D]:/.test(qt)) opts.push({ label: qt[0], text: qt.slice(2).trim() });
+        else if (qt.startsWith('ANS:')) ans = qt.slice(4).trim();
+        else if (qt.startsWith('ANSWER:')) ans = qt.slice(7).trim();
+        else if (qt.startsWith('EXP:')) exp = qt.slice(4).trim();
+        else if (qt.startsWith('EXPLAIN:')) exp = qt.slice(8).trim();
+      }
+      const qid = 'q' + Math.random().toString(36).slice(2, 8);
+      if (qtype === 'tf') {
+        html = `<div class="v-quiz" data-ans="${esc(ans)}" data-qid="${qid}">
+          <div class="v-quiz-q">❓ ${inline(q)}</div>
+          <div class="v-quiz-opts">
+            <div class="v-quiz-opt" data-val="T" onclick="checkQuiz('${qid}','T')"><span class="opt-label">T</span> 正确</div>
+            <div class="v-quiz-opt" data-val="F" onclick="checkQuiz('${qid}','F')"><span class="opt-label">F</span> 错误</div>
+          </div>
+          <div class="v-quiz-exp" id="exp-${qid}">${inline(exp)}</div>
+        </div>`;
+      } else {
+        let oh = '';
+        opts.forEach(o => { oh += `<div class="v-quiz-opt" data-val="${o.label}" onclick="checkQuiz('${qid}','${o.label}')"><span class="opt-label">${o.label}</span> ${inline(o.text)}</div>`; });
+        html = `<div class="v-quiz" data-ans="${esc(ans)}" data-qid="${qid}">
+          <div class="v-quiz-q">❓ ${inline(q)}</div>
+          <div class="v-quiz-opts">${oh}</div>
+          <div class="v-quiz-exp" id="exp-${qid}">${inline(exp)}</div>
+        </div>`;
+      }
+      break;
+    }
+    case 'diagram': {
+      const dm = fl.match(/\\diagram\[([^\]]*)\]/); const dtype = dm ? dm[1] : 'flow';
+      const arrowSvg = '<svg viewBox="0 0 20 12"><path d="M0 6h14M14 2l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      let body = '';
+      if (dtype === 'flow') {
+        const flines = content.split('\n').map(l => l.trim()).filter(Boolean);
+        let paths = '';
+        for (const line of flines) {
+          if (line === '---' || line.startsWith('---')) { paths += '<div class="dg-flow-sep"></div>'; continue; }
+          if (!line.includes('->') && !line.includes('→')) { paths += `<div class="dg-flow-title">${esc(line)}</div>`; continue; }
+          const segs = line.split(/\s*(--.*?-->|-[^->].*?->|-->|->|→)\s*/);
+          let pathH = '';
+          for (let k = 0; k < segs.length; k++) {
+            const s = segs[k].trim(); if (!s) continue;
+            if (s === '->' || s === '-->' || s === '→') {
+              pathH += `<span class="dg-flow-arrow">${arrowSvg}</span>`;
+            } else if (/^--(.+)-->$/.test(s)) {
+              const lbl = s.match(/^--(.+)-->$/)[1].trim();
+              pathH += `<span class="dg-flow-arrow"><span class="arrow-label">${esc(lbl)}</span>${arrowSvg}</span>`;
+            } else if (/^-(.+)->$/.test(s)) {
+              const lbl = s.match(/^-(.+)->$/)[1].trim();
+              pathH += `<span class="dg-flow-arrow"><span class="arrow-label">${esc(lbl)}</span>${arrowSvg}</span>`;
+            } else {
+              const cls = s.includes('?') ? 'dg-flow-node decision' : 'dg-flow-node';
+              pathH += `<span class="${cls}">${esc(s)}</span>`;
+            }
+          }
+          paths += `<div class="dg-flow-path">${pathH}</div>`;
+        }
+        body = paths;
+      } else if (dtype === 'memory') {
+        const mlines = content.split('\n');
+        let sections = [], curSec = null, arrows = [], notes = [];
+        for (const raw of mlines) {
+          const l = raw.trim(); if (!l) continue;
+          if (/^(stack|heap)\s*[:：]/i.test(l)) { curSec = { label: l.match(/^(stack|heap)/i)[0].toLowerCase(), rows: [] }; sections.push(curSec); continue; }
+          if (/^arrow\s*[:：]/i.test(l)) { arrows.push(l.replace(/^arrow\s*[:：]\s*/i, '')); continue; }
+          if (/^note\s*[:：]/i.test(l)) { notes.push(l.replace(/^note\s*[:：]\s*/i, '')); continue; }
+          if (l.startsWith('标注:') || l.startsWith('标注：')) { notes.push(l.replace(/^标注[:：]\s*/, '')); continue; }
+          if (!curSec) { curSec = { label: 'stack', rows: [] }; sections.push(curSec); }
+          if (l.startsWith('---')) { curSec.rows.push({ type: 'sep', text: l.replace(/^-+\s*/, '').replace(/\s*-+$/, '') }); continue; }
+          const am = l.match(/^\[([^\]]*)\]\s*(.*)/);
+          if (am) curSec.rows.push({ type: 'cell', addr: am[1], val: am[2] });
+          else curSec.rows.push({ type: 'cell', addr: '', val: l });
+        }
+        let sh = '';
+        for (const sec of sections) {
+          const lc = sec.label === 'heap' ? 'heap-label' : 'stack-label';
+          let rh = '';
+          for (const r of sec.rows) {
+            if (r.type === 'sep') rh += `<div class="dg-mem-row separator">${esc(r.text)}</div>`;
+            else rh += `<div class="dg-mem-row">${r.addr ? `<span class="mem-addr">${esc(r.addr)}</span>` : ''}  <span class="mem-val">${esc(r.val)}</span></div>`;
+          }
+          sh += `<div class="dg-mem-section"><div class="dg-mem-label ${lc}">${sec.label.toUpperCase()}</div>${rh}</div>`;
+        }
+        if (arrows.length) sh += arrows.map(a => `<div class="dg-mem-arrow">↗ ${esc(a)}</div>`).join('');
+        if (notes.length) sh += notes.map(n => `<div class="dg-mem-note">${esc(n)}</div>`).join('');
+        body = `<div class="dg-mem">${sh}</div>`;
+      } else if (dtype === 'tree') {
+        const tlines = content.split('\n');
+        function buildTree(tl, baseIndent) {
+          const tnodes = []; let ti = 0;
+          while (ti < tl.length) {
+            const raw = tl[ti]; const stripped = raw.replace(/^\s*/, '');
+            if (!stripped) { ti++; continue; }
+            const indent = raw.length - raw.trimStart().length;
+            if (indent < baseIndent && tnodes.length > 0) break;
+            const lbl = stripped.replace(/^(root|L|R|child)\s*[:：]\s*/i, '').trim();
+            const isRoot = /^root\s*[:：]/i.test(stripped);
+            const tnode = { label: lbl, children: [], isRoot };
+            ti++;
+            const childLines = [];
+            while (ti < tl.length) {
+              const nr = tl[ti]; const ns = nr.trimStart();
+              if (!ns) { ti++; continue; }
+              const ni = nr.length - nr.trimStart().length;
+              if (ni > indent) { childLines.push(tl[ti]); ti++; }
+              else break;
+            }
+            if (childLines.length) {
+              const ci = childLines[0].length - childLines[0].trimStart().length;
+              tnode.children = buildTree(childLines, ci);
+            }
+            tnodes.push(tnode);
+          }
+          return tnodes;
+        }
+        function renderTree(tnodes) {
+          if (!tnodes.length) return '';
+          let h = '<ul>';
+          for (const n of tnodes) {
+            const cls = n.isRoot ? 'tree-node root-node' : 'tree-node';
+            h += `<li><span class="${cls}">${esc(n.label)}</span>`;
+            if (n.children.length) h += renderTree(n.children);
+            h += '</li>';
+          }
+          return h + '</ul>';
+        }
+        const tree = buildTree(tlines, 0);
+        body = `<div class="dg-tree">${renderTree(tree)}</div>`;
+      } else if (dtype === 'compare') {
+        const clines = content.split('\n');
+        let lt = '', rt = '', lc = [], rc = [], hl = '', side = '';
+        for (const raw of clines) {
+          const l = raw.trim(); if (!l) continue;
+          if (/^left_title\s*[:：]/i.test(l)) { lt = l.replace(/^left_title\s*[:：]\s*/i, ''); side = ''; continue; }
+          if (/^right_title\s*[:：]/i.test(l)) { rt = l.replace(/^right_title\s*[:：]\s*/i, ''); side = ''; continue; }
+          if (/^left\s*[:：]/i.test(l)) { const v = l.replace(/^left\s*[:：]\s*/i, ''); side = 'left'; if (v) lc.push(v); continue; }
+          if (/^right\s*[:：]/i.test(l)) { const v = l.replace(/^right\s*[:：]\s*/i, ''); side = 'right'; if (v) rc.push(v); continue; }
+          if (/^highlight\s*[:：]/i.test(l)) { hl = l.replace(/^highlight\s*[:：]\s*/i, ''); continue; }
+          if (side === 'left') lc.push(l);
+          else if (side === 'right') rc.push(l);
+        }
+        function renderItems(items, highlight) {
+          const all = [];
+          for (const it of items) {
+            const brackets = it.match(/\[([^\]]+)\]/g);
+            if (brackets) brackets.forEach(b => { const v = b.slice(1, -1); all.push(v); });
+            else all.push(it);
+          }
+          return all.map(a => {
+            const isHl = highlight && a.toLowerCase().includes(highlight.toLowerCase());
+            return `<div class="dg-compare-item${isHl ? ' hl' : ''}">${esc(a)}</div>`;
+          }).join('');
+        }
+        const lHl = hl && lc.some(x => x.toLowerCase().includes(hl.toLowerCase()));
+        const rHl = hl && rc.some(x => x.toLowerCase().includes(hl.toLowerCase()));
+        body = `<div class="dg-compare"><div class="dg-compare-col${lHl ? ' highlight-col' : ''}"><div class="dg-compare-title">${esc(lt)}</div><div class="dg-compare-body">${renderItems(lc, hl)}</div></div><div class="dg-compare-col${rHl ? ' highlight-col' : ''}"><div class="dg-compare-title">${esc(rt)}</div><div class="dg-compare-body">${renderItems(rc, hl)}</div></div></div>`;
+      } else {
+        body = `<div>${inline(content)}</div>`;
+      }
+      html = `<div class="v-diagram"><div class="v-diagram-badge">📊 ${dtype.toUpperCase()}</div>${body}</div>`; break;
+    }
+    case 'collapse': {
+      const cm = fl.match(/\\collapse\[([^\]]*)\]/); const ctitle = cm ? cm[1] : '详情';
+      html = `<div class="v-collapse" onclick="this.classList.toggle('open')"><div class="v-collapse-hdr">${esc(ctitle)}</div><div class="v-collapse-body">${parseContent(content)}</div></div>`; break;
+    }
+    case 'tabs': {
+      const tabParts = []; let remaining = content; let tm;
+      while ((tm = remaining.match(/\\tab\[([^\]]*)\]\{/))) {
+        const tname = tm[1]; const si2 = tm.index + tm[0].length;
+        let d = 1, ci = si2;
+        while (ci < remaining.length && d > 0) { if (remaining[ci] === '{') d++; if (remaining[ci] === '}') d--; ci++; }
+        tabParts.push({ name: tname, content: remaining.slice(si2, ci - 1) });
+        remaining = remaining.slice(ci);
+      }
+      const tid = 't' + Math.random().toString(36).slice(2, 8);
+      let btns = '', panels = '';
+      tabParts.forEach((t, idx) => {
+        btns += `<button class="v-tab-btn ${idx === 0 ? 'active' : ''}" onclick="switchTab('${tid}',${idx})">${esc(t.name)}</button>`;
+        panels += `<div class="v-tab-panel ${idx === 0 ? 'active' : ''}" data-tid="${tid}" data-ti="${idx}">${parseContent(t.content)}</div>`;
+      });
+      html = `<div class="v-tabs"><div class="v-tab-btns">${btns}</div>${panels}</div>`; break;
+    }
+    case 'steps': {
+      const stepParts = []; let remaining = content; let sm;
+      while ((sm = remaining.match(/\\step\[([^\]]*)\]\{/))) {
+        const sname = sm[1]; const si2 = sm.index + sm[0].length;
+        let d = 1, ci = si2;
+        while (ci < remaining.length && d > 0) { if (remaining[ci] === '{') d++; if (remaining[ci] === '}') d--; ci++; }
+        stepParts.push({ name: sname, content: remaining.slice(si2, ci - 1) });
+        remaining = remaining.slice(ci);
+      }
+      let sh = '';
+      stepParts.forEach((s, idx) => {
+        sh += `<div class="v-step"><div class="v-step-hdr"><div class="v-step-num">${idx + 1}</div>${esc(s.name)}</div><div class="v-step-body">${parseContent(s.content)}</div></div>`;
+      });
+      html = `<div class="v-steps">${sh}</div>`; break;
+    }
+    case 'table': {
+      const rows = content.split('\n').filter(r => r.trim());
+      let t = '<table class="v-table">', hdr = true;
+      for (const row of rows) {
+        if (row.trim() === '---') { hdr = false; continue; }
+        const cells = row.split('|').map(c => c.trim());
+        if (hdr) { t += '<thead><tr>'; cells.forEach(c => t += `<th>${inline(c)}</th>`); t += '</tr></thead><tbody>'; }
+        else { t += '<tr>'; cells.forEach(c => t += `<td>${inline(c)}</td>`); t += '</tr>'; }
+      }
+      t += '</tbody></table>'; html = t; break;
+    }
+    case 'compare': {
+      const parts = content.split(/\bnew:/);
+      const old = parts[0].replace(/^old:\s*/i, '').trim();
+      const nw = parts[1] ? parts[1].trim() : '';
+      html = `<div class="v-cmp"><div class="v-cmp-side v-cmp-old"><div class="v-cmp-label">旧标准</div>${inline(old)}</div><div class="v-cmp-side v-cmp-new"><div class="v-cmp-label">新标准</div>${inline(nw)}</div></div>`; break;
+    }
+    case 'list': {
+      const items = content.split('\n').map(l => l.replace(/^[\s-]*/, '').trim()).filter(l => l);
+      html = '<ul class="v-list">'; items.forEach(it => html += `<li>${inline(it)}</li>`); html += '</ul>'; break;
+    }
+    case 'project': {
+      const tm = fl.match(/\\project\{([^}]*)\}/); const ttl = tm ? tm[1] : '实战项目';
+      html = `<div class="v-project"><div class="v-project-ttl">${ttl}</div><div class="v-p">${inline(content)}</div></div>`; break;
+    }
+  }
+  return { html, next: i };
+}
+
+function inline(t) {
+  if (!t) return '';
+  return t.replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, '<em>$1</em>')
+    .replace(/\n/g, '<br>');
+}
+function esc(t) { return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+/* =============================================
+   CODE EXECUTION
+   ============================================= */
+function getRunCode(rid) {
+  const el = document.getElementById('code-' + rid);
+  return el ? el.textContent : '';
+}
+function copyRunCode(rid) {
+  const code = getRunCode(rid);
+  navigator.clipboard.writeText(code).then(() => {
+    const btn = document.querySelector(`[data-rid="${rid}"] .v-run-btn.copy`);
+    if (btn) { btn.textContent = '✅ 已复制'; btn.classList.add('copied'); setTimeout(() => { btn.textContent = '📋 复制'; btn.classList.remove('copied'); }, 1500); }
+  });
+}
+async function runCodeInline(rid) {
+  const out = document.getElementById('output-' + rid);
+  if (!out) return;
+  const btn = document.querySelector(`[data-rid="${rid}"] .v-run-btn.run`);
+  out.classList.add('show');
+  out.innerHTML = '<span class="run-ok">⏳ 编译运行中…</span>';
+  if (btn) { btn.classList.add('running'); btn.textContent = '⏳ 运行中'; }
+  const code = getRunCode(rid);
+  try {
+    const resp = await fetch('https://godbolt.org/api/compiler/g141/compile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ source: code, options: { userArguments: '-std=c++20 -O2', executeParameters: { args: '', stdin: '' }, compilerOptions: { executorRequest: true }, filters: { execute: true } } })
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const d = await resp.json();
+    const getText = arr => (arr || []).map(x => x.text).join('\n');
+    let h = '';
+    if (d.buildResult && d.buildResult.code !== 0) {
+      h += '<span class="run-err">❌ 编译失败:</span>\n' + esc(getText(d.buildResult.stderr));
+    } else if (d.didExecute) {
+      const so = getText(d.stdout), se = getText(d.stderr);
+      if (so) h += esc(so);
+      if (se) h += (h ? '\n' : '') + '<span class="run-warn">' + esc(se) + '</span>';
+      if (!so && !se) h = '<span style="opacity:.5">(无输出)</span>';
+      if (d.code !== 0) h += '\n<span class="run-warn">(退出码: ' + d.code + ')</span>';
+    } else {
+      h = '<span class="run-err">❌ 执行失败</span>';
+      const ce = getText(d.buildResult && d.buildResult.stderr); if (ce) h += '\n' + esc(ce);
+    }
+    h += '\n<button class="run-fb" onclick="openInCompiler(\'' + rid + '\')" title="在 Godbolt 中打开">🔗 在 Godbolt 中打开</button>';
+    out.innerHTML = h;
+  } catch (e) {
+    out.innerHTML = '<span class="run-err">❌ ' + esc(e.message) + '</span>\n<button class="run-fb" onclick="openInCompiler(\'' + rid + '\')" title="在 Godbolt 中运行">🔗 改用 Godbolt 运行</button>';
+  } finally {
+    if (btn) { btn.classList.remove('running'); btn.textContent = '▶ 运行'; }
+  }
+}
+
+function _gbCfg(code) {
+  return { sessions: [{ id: 1, language: 'c++', source: code, compilers: [], executors: [{ id: 1, compiler: { id: 'g141', options: '-std=c++20 -O2' }, libs: [], options: { compileOnChange: true, argsPanelShown: true, compilationPanelShown: false } }] }] };
+}
+async function openInCompiler(rid) {
+  const code = getRunCode(rid);
+  try {
+    const r = await fetch('https://godbolt.org/api/shortener', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }, body: JSON.stringify(_gbCfg(code)) });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    window.open(d.url, '_blank');
+  } catch (e) {
+    window.open('https://godbolt.org/', '_blank');
+  }
+}
+
+function checkQuiz(qid, val) {
+  const el = document.querySelector(`.v-quiz[data-qid="${qid}"]`);
+  if (!el || el.dataset.done) return;
+  el.dataset.done = '1';
+  const ans = el.dataset.ans;
+  el.querySelectorAll('.v-quiz-opt').forEach(opt => {
+    if (opt.dataset.val === ans) opt.classList.add('correct');
+    else if (opt.dataset.val === val && val !== ans) opt.classList.add('wrong');
+    else opt.classList.add('disabled');
+  });
+  document.getElementById('exp-' + qid).classList.add('show');
+}
+
+function switchTab(tid, idx) {
+  const panels = document.querySelectorAll(`[data-tid="${tid}"]`);
+  panels.forEach((p, i) => p.classList.toggle('active', i === idx));
+  if (panels.length > 0) {
+    const tabsEl = panels[0].closest('.v-tabs');
+    if (tabsEl) tabsEl.querySelectorAll('.v-tab-btn').forEach((b, i) => b.classList.toggle('active', i === idx));
+  }
+}
+
+/* =============================================
+   MAIN INIT
+   ============================================= */
+async function init() {
+  const { folder, file } = getParams();
+
+  if (!folder || !file) {
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('errorState').style.display = 'flex';
+    document.getElementById('errorMsg').textContent = '未提供有效的 folder 和 file 参数。请从首页导航进入章节。';
+    return;
+  }
+
+  // Find in tree
+  const found = findNode(folder, file);
+
+  // Update breadcrumb & title
+  if (found) {
+    const { branch, node, nodeIndex } = found;
+    document.title = `${node.title} — C++ Mastery`;
+    document.getElementById('bcUnit').textContent = branch.icon + ' ' + branch.title;
+    document.getElementById('bcChapter').textContent = node.title;
+
+    // Chapter header
+    document.getElementById('unitTag').textContent = branch.icon + ' ' + branch.title;
+    document.getElementById('unitTag').style.cssText = `background:${branch.color}14;color:${branch.color}`;
+    document.getElementById('chapterTitle').textContent = node.title;
+    document.getElementById('chapterDesc').textContent = node.desc;
+    document.getElementById('chapterHeader').style.display = '';
+
+    // Navigation
+    buildNav(branch, nodeIndex);
+  }
+
+  // Determine content path
+  // template.html is at root; content is at content/{folder}/{file}
+  const contentPath = `content/${folder}/${file}`;
+
+  try {
+    const resp = await fetch(contentPath);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+
+    document.getElementById('loadingState').style.display = 'none';
+    const body = document.getElementById('chapterBody');
+    body.innerHTML = parseContent(text);
+    body.style.display = '';
+
+    // Syntax highlighting
+    body.querySelectorAll('pre code').forEach(el => hljs.highlightElement(el));
+
+    // TOC
+    buildToc(body);
+
+  } catch (e) {
+    document.getElementById('loadingState').style.display = 'none';
+    document.getElementById('errorState').style.display = 'flex';
+    document.getElementById('errorMsg').textContent = `无法加载 ${contentPath}：${e.message}`;
+  }
+}
+
+init();
+</script>
+</body>
+</html>

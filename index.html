@@ -365,6 +365,14 @@ body { font-family:var(--font); background:var(--bg); color:var(--text-1); overf
   transition:background 0.15s, color 0.15s;
 }
 .viewer-x:hover { background:rgba(118,118,128,0.16); color:var(--text-1); }
+.viewer-fullpage {
+  position:absolute; top:16px; right:56px;
+  width:30px; height:30px; border-radius:50%;
+  background:rgba(0,122,255,0.08); color:var(--blue);
+  display:flex; align-items:center; justify-content:center;
+  text-decoration:none; transition:background 0.15s;
+}
+.viewer-fullpage:hover { background:rgba(0,122,255,0.16); }
 
 .viewer-body { flex:1; overflow-y:auto; padding:24px 28px 48px; user-select:text; -webkit-user-select:text; cursor:auto; }
 /* Viewer: Node list inside branch */
@@ -963,6 +971,9 @@ code:not(.v-code code) { background:var(--bg); padding:1.5px 5px; border-radius:
       <button class="ws-open" id="wsOpenBtn" onclick="wsOpenPanel()" title="打开工作区" style="display:none">◀ 工作区</button>
       <div class="viewer-crumb" id="vCrumb"></div>
       <div class="viewer-ttl" id="vTitle"></div>
+      <a class="viewer-fullpage" id="vFullPage" href="#" target="_blank" title="在独立页面中打开" style="display:none">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+      </a>
     </div>
     <div class="viewer-body" id="vBody"></div>
   </aside>
@@ -1559,6 +1570,9 @@ async function openNode(branch, node) {
   vCrumb.textContent = `${branch.title} › ${node.title}`;
   vTitle.textContent = node.title;
   const path = `content/${branch.folder}/${node.file}`;
+  // Update full-page link
+  const fpLink = document.getElementById('vFullPage');
+  if (fpLink) { fpLink.href = `template.html?folder=${branch.folder}&file=${node.file}`; fpLink.style.display = 'flex'; }
   try {
     const resp = await fetch(path);
     if(resp.ok) { vBody.innerHTML = parseContent(await resp.text()); vBody.querySelectorAll('pre code').forEach(el=>hljs.highlightElement(el)); setTimeout(wsLoadDiagrams,0); }
